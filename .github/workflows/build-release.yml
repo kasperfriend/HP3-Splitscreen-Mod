@@ -1,0 +1,118 @@
+name: Build release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag to publish. Leave blank to auto-generate a unique tag,
+          e.g. v47-20260906-9876543210.
+        required: false
+        default: ""
+      title:
+        description: "Optional release title. Leave blank to use the tag."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release DLL + INI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install 32-bit MinGW-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-i686 zip
+
+      - name: Build d3d8.dll
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Assemble release package
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_TITLE: ${{ inputs.title }}
+        run: |
+          set -euo pipefail
+
+          # Let a manual run publish a custom tag/name, otherwise generate a
+          # unique one so repeated manual runs never collide.
+          if [ -n "${REQUESTED_TAG:-}" ]; then
+            RELEASE_TAG="${REQUESTED_TAG}"
+            if ! git check-ref-format "refs/tags/${RELEASE_TAG}"; then
+              echo "::error::Invalid release tag: ${RELEASE_TAG}"
+              exit 1
+            fi
+          else
+            VERSION_STRING="$(grep -m1 -oE 'build v[0-9]+' src/dllmain.cpp || true)"
+            [ -n "${VERSION_STRING}" ] || VERSION_STRING="v47"
+            RELEASE_TAG="${VERSION_STRING}-$(date +%Y%m%d)-${GITHUB_RUN_ID}"
+          fi
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_ENV"
+
+          if [ -n "${REQUESTED_TITLE:-}" ]; then
+            RELEASE_TITLE="${REQUESTED_TITLE}"
+          else
+            RELEASE_TITLE="HP3 Split-Screen ${RELEASE_TAG}"
+          fi
+          echo "RELEASE_TITLE=${RELEASE_TITLE}" >> "$GITHUB_ENV"
+
+          # Sanitize for the asset filename and artifact name only; the git tag
+          # keeps its value.
+          SAFE_TAG="$(echo "${RELEASE_TAG}" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "SAFE_TAG=${SAFE_TAG}" >> "$GITHUB_ENV"
+          ZIP_NAME="HP3-Splitscreen-${SAFE_TAG}.zip"
+
+          mkdir -p release/
+          cp dist/d3d8.dll release/d3d8.dll
+          cp src/hp3mod.ini release/hp3mod.ini
+
+          (
+            cd release
+            zip -r "../${ZIP_NAME}" d3d8.dll hp3mod.ini
+          )
+
+          echo "Package: ${ZIP_NAME}"
+          sha256sum "${ZIP_NAME}" release/d3d8.dll release/hp3mod.ini
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HP3-Splitscreen-${{ env.SAFE_TAG }}
+          path: |
+            HP3-Splitscreen-*.zip
+            release/d3d8.dll
+            release/hp3mod.ini
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          HP3 Split-Screen build for Harry Potter and the Prisoner of Azkaban.
+
+          - Commit: \`${{ github.sha }}\`
+          - Run ID: \`${{ github.run_id }}\`
+          - Trigger: Manual (workflow_dispatch)
+
+          Files:
+          - \`d3d8.dll\` - the proxy Direct3D8 DLL
+          - \`hp3mod.ini\` - default configuration
+          EOF
+
+          gh release create "${RELEASE_TAG}" \
+            HP3-Splitscreen-*.zip \
+            release/d3d8.dll \
+            release/hp3mod.ini \
+            --title "${RELEASE_TITLE}" \
+            --notes-file release-notes.md
