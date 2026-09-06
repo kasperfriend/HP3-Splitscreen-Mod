@@ -61,7 +61,10 @@ jobs:
               exit 1
             fi
           else
-            VERSION_STRING="$(grep -m1 -oE 'build v[0-9]+' src/dllmain.cpp || true)"
+            # Extract just the version number (e.g. "v47") from the MOD_STAMP;
+            # the raw match ("build v47") contains a space, which is not a
+            # valid git ref and would make `gh release create` fail.
+            VERSION_STRING="$(grep -m1 -oE 'build v[0-9]+' src/dllmain.cpp | sed 's/^build //' || true)"
             [ -n "${VERSION_STRING}" ] || VERSION_STRING="v47"
             RELEASE_TAG="${VERSION_STRING}-$(date +%Y%m%d)-${GITHUB_RUN_ID}"
           fi
@@ -102,6 +105,10 @@ jobs:
             release/hp3mod.ini
 
       - name: Create GitHub release
+        # The MSYS2 shell (job default) uses `path-type: minimal`, which does
+        # not expose the GitHub CLI on PATH. Git Bash inherits the full Windows
+        # PATH, so run this step with `bash` instead of `msys2`.
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
