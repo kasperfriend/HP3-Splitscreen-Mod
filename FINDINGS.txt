@@ -1,0 +1,267 @@
+===========================================================================
+ HP3-SPLITSCREEN - REVERSE-ENGINEERING FINDINGS
+ Accumulated while building the split-screen mod (v1 .. v47, 2026-08/09)
+ Everything below was verified in the running game unless marked otherwise.
+===========================================================================
+
+0. THE GAME
+-----------
+- Harry Potter and the Prisoner of Azkaban, PC (EA/KnowWonder, 2004).
+- Unreal Engine 2. Main modules: hppoa.exe, Engine.dll, Core.dll, D3DDrv.dll,
+  HGame.u (680 classes), KWGame.u (302), GamePlay.u (217).
+- All split-screen support is STRIPPED from the shipped binaries:
+  Engine.SplitScreen, GameInfo.AddPlayer/RemovePlayer, and every joystick-axis
+  symbol are absent. The UnrealScript compiler is unreachable at runtime
+  (no commandlet dispatch in hppoa.exe; "-make" fails; Editor.dll still
+  contains UMakeCommandlet/FScriptCompiler but nothing can reach them).
+- Game .u packages are source-stripped: only Engine.u/Core.u/Editor.u keep
+  ScriptText. HGame/KWGame/GamePlay expose names, flags and UProperty
+  metadata, but no script source.
+
+1. DEAD ENDS (do not retry)
+---------------------------
+- Recompile UnrealScript with -make: dead (see above).
+- Editing game .u packages: source-stripped, and the packaging format's
+  export table (v129) is only partially solved (~2000 layout guesses, 0
+  valid) - see tooling notes at the end.
+- Console route: no split-screen exec exists to call, even with a console.
+- Engine.Actor.Mesh is an asset reference, NEVER write it (the mod writes
+  DesiredRotation / RotationRate instead - see §7).
+- bHidden does not make a pawn invisible on real hardware (works only in
+  narrow Wine cases). Hardware honors Location writes, not bHidden.
+
+2. INJECTION
+------------
+- The mod is a proxy d3d8.dll. Windows (and Wine with
+  WINEDLLOVERRIDES="d3d8=n,b") loads the application-directory d3d8.dll
+  before the system one. hppoa.exe / D3DDrv.dll import "Direct3DCreate8"
+  undecorated - a .def alias entry is REQUIRED or the loader cannot
+  resolve the export (symptom: Wine "unimplemented function
+  d3d8.dll.Direct3DCreate8").
+- One export: Direct3DCreate8. The proxy wraps the real device, hooks
+  EndScene/Reset-level flow and the engine's per-view render call, and
+  runs all mod logic on the game thread from a PostRender-style hook.
+
+3. HOW THE SPLIT IS RENDERED
+----------------------------
+- The primitive is UCanvas::DrawPortal (native 480 in Engine.dll):
+  ?execDrawPortal@UCanvas@@QAEXAAUFFrame@@QAX@Z   (Engine.dll RVA 0x00BE6A)
+  It renders the scene from an arbitrary viewport+actor+eye+rotation+FOV
+  into a screen rect. Calling it once per player per frame IS split-screen.
+- It is a NATIVE, not reachable through script; call through FFrame/GNatives
+  or replicate FPlayerSceneNode directly:
+  ??0FPlayerSceneNode@@QAE@PAVUViewport@@PAVFRenderTarget@@PAVAActor@@VFVector@@VFRotator@@M@Z
+  ctor args: this=ecx, [esp+4]=Viewport, +8=RenderTarget, +0xC=Actor,
+             +0x10=FVector(12B), +0x1C=FRotator(12B), +0x28=float FOV.
+- UGameEngine::Draw (Engine.dll RVA 0x0035EE) is the per-viewport entry;
+  UInteractionMaster::MasterProcessPostRender (RVA 0x00B5E6) is the hook
+  point that already runs per frame with a UCanvas in hand.
+- Key derived facts: UViewport::SizeX/SizeY at +0x8C/+0x90;
+  UCanvas::ClipX/ClipY at +0x40/+0x44; UCanvas::SizeX/SizeY +0x64/+0x68;
+  UPlayer::Actor (the Pawn) at Viewport+0x34.
+- Splitting N ways: each strip = full height, width/N. The view count is
+  data (Players=N in hp3mod.ini), nothing in the renderer assumes two.
+- Measured cost of one extra DrawPortal view was small (tens of percent
+  frame time on 2004-era hardware); the split itself never crashed.
+
+4. REFLECTION - THE LOAD-BEARING TRICK
+--------------------------------------
+- UE2 keeps a live UProperty object for every script field, each carrying
+  its own byte Offset. Core.dll exports the global object table
+  (GObjObjects) and GetFullName, so ANY field can be found by its path
+  string ("Engine.Actor.Location") at runtime - zero hardcoded offsets.
+- The only unknown was where inside UProperty the Offset lives. Calibrate
+  at runtime against two independently-known fields:
+      Actor.Location  = +0x150
+      Actor.Rotation  = +0x15C
+  The one dword position that satisfies both is +0x4C  ==>  UProperty::Offset
+  sits at +0x4C in this build. Every other offset is then a name lookup.
+- UFunction parameter lists are recoverable the same way (parameters are
+  child objects named Package.Class.Function.Param; read each child's
+  class token + the dword at +0x4C). dumpFunctionSig() rebuilds call
+  frames byte-accurately with no source. Examples recovered:
+      hgame.HPCharacter.castSpell   +0x00 aTarget, +0x04 aTargetOffset,
+                                    +0x10 spellClass
+      hgame.HPPawn.SpawnSpell       +0x00 spellClass, +0x04 aTarget,
+                                    +0x08 ReturnValue
+- Verified offsets (this build):
+      AActor::Location +0x150   AActor::Rotation +0x15C
+      AActor::Velocity +0x168   AActor::Acceleration +0x174
+      AActor::Physics  +0x41    AActor::Owner +0x48   AActor::Level +0x9C
+      Engine.Pawn.Controller +0x3F8   Engine.Controller.Pawn +0x3F8
+      Engine.Pawn.GroundSpeed +0x470
+      Engine.PlayerController.Player +0x574  ViewTarget +0x5D8
+      hgame.HPCharacter.currentSpell +0x120C (ClassProperty)
+- Core.dll symbol notes:
+      ?ProcessEvent@UObject@@UAEXPAVUFunction@@PAX1@Z  (RVA 0x02B600)
+      GNatives 0x0DB6D8 ; appInit 0x038E60 ; StaticLoadClass 0x04A3E0 ;
+      StaticConstructObject 0x046D20 ;
+      globals: GIsEditor 0x0A6A4C, GIsScriptable 0x0A6A48, GIsRunning 0x0A6A6C
+- Calling engine natives: build an FFrame {vtable@0, Node@4, Object@8,
+  Code@0xC, Locals@0x10} or dispatch through ProcessEvent with a zeroed
+  oversized parameter block. ALWAYS call on the game thread.
+
+5. PLAYER 2 CONTROL
+-------------------
+- Movement: per-frame velocity override on the pawn (Acceleration/Velocity
+  writes) - collision and gravity behave normally; the pawn walked ~2150
+  units across a free-roam level, Z tracking floors down stairwells.
+- Jump: call the pawn's own KWGame.KWPawn.DoJump_Player through
+  ProcessEvent (so animation + sound stay consistent) - it alone moves
+  NOTHING because the jump path bails for AI-controlled pawns. The fix:
+  call the script AND write JumpZ into Velocity.Z with Physics=PHYS_Falling.
+  The engine then runs a real ballistic arc and lands by itself. Proven
+  frozen family: jump pin idle=0 / prep=1 / launch=2.
+- Ground physics: for a controlled companion, grounded PHYS 5/6 states
+  must be pinned back to 1 (Walking) every frame; physics-dependent
+  (PHYS_Projectile-family) holds are terrain-dependent and were dropped.
+- Spells: companions have currentSpell (+0x120C) == NULL (the game never
+  lets a player be a companion), so PressedFire alone does nothing. Give
+  the pawn a spell class, then run its own pipeline:
+      ChooseSpell(cls, bForce=1) -> canCast() -> StartCasting(cls,1.0)
+      -> castSpell(NULL,0,cls) -> SpawnSpell(cls,NULL)
+  Spell classes are ordinary loaded classes resolved by name:
+  hgame.RictusempraSpell, DepulsoSpell, SpongifySpell, LumosSpell,
+  AlohomoraSpell, GlaciusSpell, LapiforsSpell.
+  SpawnSpell returning a named live actor is the ground truth that a cast
+  really happened. The spell must be nudged out of the caster along the
+  camera direction (camDir*90 + 45Z worked) and given the camera yaw/
+  pitch as velocity, or it spawns inside the caster and dies.
+- Use/interact: KWGame.KWPawn.CanDoPickupActor() returns true for the
+  controlled pawn; then dispatch PickupActor / KWPawn.Trigger.
+- AI disown: "soft" release (clear the controller's rotation pull every
+  frame) is the default and is reversible; the hard UnPossess path also
+  works but is off by default.
+
+6. CAMERA
+---------
+- Rest camera tuned on hardware: Distance=125, Height=50 ("perfect" -
+  frozen), FOV uses the game's unsqueezed mode (FovMode=1).
+- Camera collision: slide along walls instead of clipping (line checks +
+  pull-in), described in docs/MANUAL.txt.
+- Vertical spell aim rides the camera pitch (approx +45/-70 deg range).
+- The companion pawn's MESH yaw is re-pulled by the companion AI every
+  tick whenever nothing pins it - a standing lock must re-write
+  DesiredRotation=(0, viewYaw, 0) + RotationRate=0 EVERY FRAME while the
+  player stands still, restoring the saved RotationRate on move/jump.
+  One-shot writes lose to the AI within a few ticks.
+
+7. THE CAST PIPELINE AND ITS ANIMATION (the hardest part)
+---------------------------------------------------------
+Timeline of one cast (measured in logs; hold = keydown->keyup intent):
+  keydown -> PressedFire -> StartCasting -> playCastAim (AIM phase;
+  glow actor appears at the aim target)  ... fire happens ~1.15s into
+  the HOLD (playCast -> castSpell -> Fire -> SpawnSpell -> finalizeSpell
+  -> ReleasedFire; keyup timing is irrelevant, ReleasedFire is part of
+  the fire sequence) ... the state exits (StateCasting.EndState ->
+  GotoDefaultGroundMovementState) ~1.3s after the fire.
+- StateCasting telemetry facts:
+    * StateCasting.BeginState is logged only ~50% of casts under Wine
+      (hardware logs it consistently). HPCharacter.StartCasting fires on
+      EVERY cast at aim start - use it as the reliable "a cast began"
+      stamp. (Suffix-match care: "HPCharacter.StartCasting" is 24 chars.)
+    * StateCasting.Tick stops right after the fire on Wine; on hardware
+      it keeps ticking ~1.7s into the wind-down. Tick-recency is NOT a
+      portable "cast still running" signal.
+    * Wine never emits StateCasting.AnimEnd (hardware does, ~650ms after
+      fire).
+- The post-cast problems and their fixes, in order of discovery:
+    * HOP: a fresh-spawn micro-fall at the cast exit dips below the floor
+      and the engine plays PlayFalling/PlayLandingAnimation - swallow
+      those two calls for ~1.5s after each exit. Hardware-proven 100%
+      swallow rate.
+    * STUCK POSES / WRONG MESH YAW after casts: the exit can leave the
+      mesh (animation) out of sync with the actor; walking away during
+      the wind-down used to miss the fix window entirely.
+    * The fix is ONE ChangeAnimation re-pick shortly after the cast
+      settles. v40-v46 tried polling designs (fixed window after the
+      exit, gated by cast-activity clocks). They failed in a specific,
+      reproducible way: rapid re-casts re-armed the window/clocks against
+      the WRONG cast, and the re-pick interrupted a fresh cast mid-aim -
+      on hardware this shipped as a regression (v45) and was pulled.
+    * v47 (final): EVENT-DRIVEN. The ProcessEvent detour watches for the
+      state's own StateCasting.EndState, arms ONE pending re-sync and
+      snapshots the arm context (arm time, current begin-stamp, current
+      fire-stamp). Every frame it executes only if, AT EXECUTION TIME:
+      >=1.2s and <6s since the arm, the player is standing still
+      (300ms stand-still debounce), NO new cast began since the arm
+      (begin-stamp unchanged - covers player aims AND the mod's own
+      cleanup re-cast), nothing fired since the arm (fire-stamp
+      unchanged), the aim glow is dead, and the cast state is quiet
+      300ms. Otherwise the need expires - a skipped re-sync is always
+      safer than a mis-timed one. Any newer cast simply gets its own
+      re-sync at its own exit.
+    * The aim glow (the game's own cursor actor) is the only reliable
+      live signal of the AIM phase: StateCasting does not Tick during
+      aiming on either platform, so an in-progress aim is invisible to
+      state-tick telemetry and is pre-fire on the fire stamp.
+    * The mod's OWN casts (the cleanup chain feature re-casts
+      ~0.7-1.1s after each exit by design) are invisible to engine
+      telemetry side-effects - stamp them at the call site and veto on
+      that clock (3000ms covers aim+fire+exit).
+- Engineering lessons, generalized:
+    * Compare against SNAPSHOTS taken when the need was armed, never
+      against live clocks: a "chain stamp" set at every exit is
+      re-stamped by later exits and makes stale-vs-new comparisons
+      meaningless (this defeated five veto variants).
+    * Judge fixes by measured ground truth (the log's raw value dumps),
+      not by grep heuristics over the log: the cleanup chain
+      legitimately logs a StartCasting line between a cast and its
+      re-sync, which looks exactly like a "misfire" to a grep.
+    * strncmp suffix matching: get the length right; a 29-vs-24 char
+      bug silently disabled a whole detection path for a day of runs.
+    * Single-variable discipline for animation changes; prefer reverting
+      to proven behavior over adding new gating.
+
+8. PHYSICS NOTES
+----------------
+- PHYS enum in play for pawns: 0 None, 1 Walking, 2 Falling,
+  5/6 grounded variants (spawn/level-load states), plus projectile states
+  during casts.
+- Hardware honors Location writes on pawns; bHidden is not real on
+  hardware. Never write Engine.Actor.Mesh (asset data).
+- A recurring far-hall crash has phys=5 as a harbinger (the pawn standing
+  in a 5/6 grounded state at the wrong spot). Pre-existing in the retail
+  game; the mod pins 5/6 -> 1 for controlled pawns which also removes it
+  on the paths it controls.
+
+9. WINE VS HARDWARE (portability notes)
+---------------------------------------
+- The mod ships for Windows; the whole test rig (Wine + Xvfb + a d3d8
+  native override + a one-byte Core.dll patch 0x595A3=E9->EB to skip a
+  launcher check) exists only to develop it headlessly. Never ship the
+  harness: a deliverable is d3d8.dll + hp3mod.ini + README only.
+- Behavioral differences that mattered (see §7): BeginState logging ~50%
+  on Wine, Tick stops at fire on Wine (~1.7s on hw), AnimEnd never on
+  Wine. A veto stack tuned on Wine alone can still be wrong on hardware;
+  the final design (event-driven + snapshots + own-cast clock) is
+  platform-neutral because it depends on none of the shaky signals.
+- Wine runs die silently late in long sessions every time - environment,
+  not the mod; judge by log completeness.
+
+10. TOOLING
+-----------
+- In-process telemetry through the same ProcessEvent detour that powers
+  the mod: named-event capture with per-pawn filtering (pelog), periodic
+  position samples (castwatch), actor-vs-view-vs-mesh yaw samples
+  (yawwatch). The engine names every step; reading a timeline beats
+  guessing. A [verdict] line per jump/cast round-trip makes regressions
+  greppable.
+- upkg2.py (package dumper): name tables and objects export fine after
+  stripping the first byte of package names; the v129 export table layout
+  is still unsolved (do not brute-force it).
+- Build rig: i686-w64-mingw32-g++ -O2 -shared, single TU, .def alias,
+  link winmm. See build.sh.
+
+11. OPEN ITEMS / BACKLOG
+------------------------
+- Far-hall crash (pre-existing; phys=5 harbinger) - root cause unknown.
+- The "D-hunt" (an unidentified object/field named D in early dumps).
+- Per-player HUD (the vanilla HUD is single-player aware only).
+- The tiny idle-restart stutter on CLEAN casts: the re-sync re-picks the
+  idle animation ~1.2s after every cast even when the exit settled
+  perfectly. Removing it needs need-gating built ON TOP of the v47
+  arm-snapshot design (the v45 attempt failed because it gated on live
+  clocks - see §7). Cast playback correctness outranks this cosmetic.
+- upkg2.py v129 export table.
+===========================================================================

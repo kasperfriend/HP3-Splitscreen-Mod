@@ -1,0 +1,5723 @@
+// ---------------------------------------------------------------------------
+// hp3mod - split-screen for Harry Potter and the Prisoner of Azkaban (UE2).
+//
+// Injection: hppoa.exe / D3DDrv.dll import Direct3DCreate8 from d3d8.dll.
+// A proxy d3d8.dll next to the exe wins the loader search order on Windows.
+//
+// PHASE C: N-way VERTICAL split-screen via UCanvas::DrawPortal.
+//
+//   * DrawPortal(X,Y,W,H, CamActor, CamLocation, CamRotation, FOV, ClearZ)
+//     is native(480) - it renders a complete, correctly-projected scene into
+//     an arbitrary sub-rect of the currently locked canvas. Covering the
+//     screen with N side-by-side portals therefore yields a true N-way
+//     vertical split with no engine-internal surgery, and generalises to any
+//     N by construction.
+//
+//   * It is a native, so it reads its arguments from UnrealScript bytecode
+//     via Stack.Step(). We synthesise a tiny bytecode buffer. The opcode
+//     numbers are NOT hardcoded: Core.dll exports every constant handler
+//     (execIntConst, execObjectConst, ...), so we scan the GNatives dispatch
+//     table for each handler's address and recover its real opcode byte.
+//
+// Verified layout facts (empirical, this build):
+//   UObject                 = 0x2C bytes
+//   UPlayer::Actor          = Viewport+0x34
+//   UViewport::SizeX/SizeY  = Viewport+0x8C / +0x90   (read 1280 / 720)
+//   AActor::Location        = Actor+0x150 (FVector)
+//   AActor::Rotation        = Actor+0x15C (FRotator)
+//   FFrame                  = { vtable@0, Node@4, Object@8, Code@0xC }
+//   GNatives dispatch       = Core.dll ?GNatives@@3PAP8UObject@@AEXAAUFFrame@@QAX@ZA
+// ---------------------------------------------------------------------------
+#include <windows.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <math.h>
+#include <mmsystem.h>
+
+// ------------------------------- config ------------------------------------
+// Number of split-screen views. Nothing below assumes 2.
+static int g_numPlayers = 2;
+static float g_camDist = 125.0f, g_camHeight = 50.0f;
+static int   g_camPitch = -1400;
+static BOOL  g_camCollide = TRUE;
+static BOOL  g_aimedCast  = TRUE;
+static int   g_glowSize   = 36;       // v24: -40% (was 60) by user request -
+static BOOL  g_aimSup[8];             // v24 body-clearance: glow hidden this frame
+                                      // the sparkle's original (hardware:
+                                      // "a bit big"; DrawScale did nothing)
+static int   g_glowStyle  = 6;        // v23: 6=sprite additive (default -
+                                      // the only variant PROVEN visible on
+                                      // the user's hardware; v22's borrowed
+                                      // SpellCursor rendered in Wine only),
+                                      // 0=borrow game cursor (hw-invisible),
+                                      // 8=v20 factory particle (hw-invisible)
+static BOOL  g_cleanupLight = FALSE;  // v21: light pose-cleanup chain (hop
+static int   g_cleanupChain = 0;      // v25 hop bisect: 0=full(v23 chain, hw
+                                      // pose-PROVEN) 1=noanimend(v24, hw HANG)
+                                      // 2=min 3=exitanim(exit+AnimEnd only)
+static int   g_cleanupDelay = 1200;   // v25: ms after release before the chain
+static int   g_cleanupSplit = 0;      // v33: back to 0 (v30 behavior). The v31
+                                      // hw pelog caught the stuck loop:
+                                      // StateCasting.Tick calls ChangeAnimation
+                                      // EVERY frame after release. New plan:
+                                      // v32 hw verdict: the state REFUSED to
+                                      // self-exit (safety net fired every cast),
+                                      // the window just held the cast pose LONGER
+                                      // and added a second small hop. v30's
+                                      // immediate exit stays the best behavior
+                                      // until the state's wait-condition is
+                                      // found (O-key property diff).
+                                      // v28/v29 hw verdict: the split made it
+                                      // WORSE - anim snap at A (blend start),
+                                      // dip+snap at B (exit), and the pose
+                                      // still stuck. The single-pass full
+                                      // chain (v23/v27) is the best hw state:
+                                      // pose exits, one hop. Keep the v29
+                                      // race fix (chain fires on schedule).
+static BOOL  g_hopGuard  = FALSE;     // v27: OFF - v26 hw proved the re-exit
+                                      // during the Falling dip does NOT stop
+                                      // the visible hop, and v26-full (guards
+                                      // on) HUNG where v23-full exited.
+static BOOL  g_reAssert  = FALSE;     // v27: OFF - same hw data point; the
+                                      // extra exit pair is hang-suspect #1.
+static BOOL  g_bodyClear = TRUE;      // v27 isolation knob (v24 delta)
+static BOOL  g_panePark  = TRUE;      // v27 isolation knob (v25/v26 delta)
+                                      // A/B for hardware)
+static BOOL  g_freeLook   = FALSE;  // v13: 0 (default) = right stick TURNS pawn+camera
+                                    // like the original player; 1 = free orbit camera
+static int   g_toggleKey  = VK_F10;
+static BOOL  g_fileToggle = FALSE;   // "split_on" file trigger: harness only
+static BOOL  g_strafeMode  = FALSE;  // 0 = left/right TURN like original player
+static float g_turnSpeed   = 180.0f; // deg/s at full deflection
+static float g_fovScale    = 1.0f;
+static int   g_fovMode     = 1;      // 1 = preserve vertical FOV (unsqueezed)
+static BOOL  g_padJump[8]  = {0};
+static BOOL  g_padCast[8]  = {0};
+static BOOL  g_padUse[8]   = {0};
+static BOOL  g_wasMoving[8] = {0};
+
+// Player 2..N key map. Defaults deliberately avoid every key the game already
+// binds in defuser.ini: the arrow keys are TURNLEFT/TURNRIGHT/aArrowUp and
+// therefore drive PLAYER ONE, which is why arrows appeared to "only control
+// Harry". The numpad is completely unbound in the shipped config, so player 2
+// lives there; player 3 uses I/J/K/L, also unbound.
+struct PlayerKeys {
+    int fwd, back, left, right, jump, cast, use, release, hard, inval;
+    // Second binding for the same action. Player 2 gets the numpad AND a
+    // letter cluster, because with NumLock OFF Windows reports the numpad as
+    // the arrow keys - which the game binds to player 1, making player 2 look
+    // dead while player 1 walks around.
+    int fwd2, back2, left2, right2, jump2, cast2, use2;
+    int turnL, turnR;
+};
+static PlayerKeys g_pk[8];
+
+static void initKeyDefaults(void)
+{
+    memset(g_pk, 0, sizeof(g_pk));
+    // player 2 -> numpad (requires NumLock ON, or Windows reports the arrows)
+    g_pk[1].fwd  = VK_NUMPAD8; g_pk[1].back  = VK_NUMPAD2;
+    g_pk[1].left = VK_NUMPAD4; g_pk[1].right = VK_NUMPAD6;
+    g_pk[1].jump = VK_NUMPAD0; g_pk[1].cast  = VK_DECIMAL;
+    g_pk[1].use  = VK_ADD;     g_pk[1].release = VK_SUBTRACT;
+    g_pk[1].hard = 'M';        g_pk[1].inval = 'N';
+    // NumLock-proof alternates for player 2 (all unbound in the shipped game)
+    g_pk[1].fwd2 = 'T'; g_pk[1].back2 = 'G';
+    g_pk[1].left2= 'F'; g_pk[1].right2= 'H';
+    g_pk[1].jump2= 'R'; g_pk[1].cast2 = 'Y'; g_pk[1].use2 = 'V';
+    g_pk[1].turnL = 'Q'; g_pk[1].turnR = 'E';        // deliberate turning only
+    // player 3 -> I / J / K / L cluster
+    g_pk[2].fwd  = 'I'; g_pk[2].back  = 'K';
+    g_pk[2].left = 'J'; g_pk[2].right = 'L';
+    g_pk[2].jump = 'U'; g_pk[2].cast  = 'O'; g_pk[2].use = 'P';
+}
+
+static int iniKey(const char *sect, const char *key, int def, const char *ini)
+{
+    int v = GetPrivateProfileIntA(sect, key, -1, ini);
+    return (v > 0 && v < 256) ? v : def;
+}
+
+
+static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+static BOOL g_splitOn = FALSE;   // runtime toggle (F9 / split_on file)
+
+// ------------------------------- logging -----------------------------------
+#define MOD_BUILD  "v11"
+#define MOD_STAMP   "build v47 - 2026-09-02 - EVENT-DRIVEN REALIGN: the v46 Wine runs caught the polling re-pick STILL straddling casts (a skipped chain + pending overwrites left stale per-cast state; one realign fired during the next cast's aim). v47 rebuilds it event-driven: the detour sees the state's own StateCasting.EndState (the actual exit) and only ARMS a need; driveePawn executes it next frames - and only while every guard holds AT EXECUTION TIME: standing + 300ms stand-still, no aim glow (aims do not tick StateCasting), casting state quiet, same-cast binding (no newer fire), no post-exit BeginState, 1.2s..6s after the exit. No per-cast clocks anywhere in the path"
+
+static FILE *g_log = NULL;
+static CRITICAL_SECTION g_logCs;
+static BOOL g_logCsInit = FALSE;
+
+static void logf_(const char *fmt, ...)
+{
+    if (!g_log) return;
+    if (g_logCsInit) EnterCriticalSection(&g_logCs);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_log); fflush(g_log);
+    if (g_logCsInit) LeaveCriticalSection(&g_logCs);
+}
+
+static void loadKeyMap(const char *ini)
+{
+    for (int i = 1; i < 8; i++) {
+        char sect[32]; sprintf(sect, "player%d", i + 1);
+        g_pk[i].fwd     = iniKey(sect, "Forward", g_pk[i].fwd,     ini);
+        g_pk[i].back    = iniKey(sect, "Back",    g_pk[i].back,    ini);
+        g_pk[i].left    = iniKey(sect, "Left",    g_pk[i].left,    ini);
+        g_pk[i].right   = iniKey(sect, "Right",   g_pk[i].right,   ini);
+        g_pk[i].jump    = iniKey(sect, "Jump",    g_pk[i].jump,    ini);
+        g_pk[i].cast    = iniKey(sect, "Cast",    g_pk[i].cast,    ini);
+        g_pk[i].use     = iniKey(sect, "Use",     g_pk[i].use,     ini);
+        g_pk[i].release = iniKey(sect, "Release", g_pk[i].release, ini);
+        g_pk[i].turnL   = iniKey(sect, "TurnLeft",  g_pk[i].turnL,  ini);
+        g_pk[i].turnR   = iniKey(sect, "TurnRight", g_pk[i].turnR,  ini);
+    }
+    logf_("[keys] p2 numpad fwd=0x%02X back=0x%02X left=0x%02X right=0x%02X "
+          "jump=0x%02X cast=0x%02X use=0x%02X",
+          g_pk[1].fwd, g_pk[1].back, g_pk[1].left, g_pk[1].right,
+          g_pk[1].jump, g_pk[1].cast, g_pk[1].use);
+    logf_("[keys] p2 alternates: T/G forward-back, F/H TURN (tank), Q/E turn, "
+          "R jump, Y cast, V use");
+}
+
+// --------------------- input interception (player 2..N) --------------------
+// The engine reads the keyboard from the window message queue (WinDrv imports
+// PeekMessage/DispatchMessage). Choosing "unbound" keys was not enough: with
+// NumLock OFF, Windows reports numpad 8 as VK_UP, which the game binds to
+// player 1 -- so pressing player 2's forward key walked Harry.
+//
+// The numpad and the dedicated arrow cluster are distinguishable: the arrow
+// keys set the "extended key" bit (bit 24) of lParam, the numpad does not.
+// So we can swallow a numpad-origin VK_UP while leaving the real arrow key
+// alone for player 1.
+static WNDPROC  g_origWndProc = NULL;
+static HWND     g_hookedWnd   = NULL;
+static volatile LONG g_numArrow[4] = {0,0,0,0};   // up, down, left, right
+
+static BOOL isPlayerKey(int vk)
+{
+    for (int i = 1; i < 8; i++) {
+        const PlayerKeys &k = g_pk[i];
+        if (!k.fwd && !k.fwd2) continue;
+        if (vk == k.fwd  || vk == k.back  || vk == k.left  || vk == k.right ||
+            vk == k.jump || vk == k.cast  || vk == k.use   || vk == k.release ||
+            vk == k.fwd2 || vk == k.back2 || vk == k.left2 || vk == k.right2 ||
+            vk == k.jump2|| vk == k.cast2 || vk == k.use2 ||
+            vk == k.turnL|| vk == k.turnR)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+volatile LONG *numArrowState(void) { return g_numArrow; }
+
+static LRESULT CALLBACK modWndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    if (g_splitOn &&
+        (msg == WM_KEYDOWN || msg == WM_KEYUP ||
+         msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)) {
+        int  vk       = (int)w;
+        BOOL extended = (l & (1L << 24)) != 0;
+        BOOL down     = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+
+        // A numpad key that Windows has folded into an arrow VK because
+        // NumLock is off. Claim it for player 2 and hide it from the game.
+        if (!extended) {
+            int slot = -1;
+            if      (vk == VK_UP)    slot = 0;
+            else if (vk == VK_DOWN)  slot = 1;
+            else if (vk == VK_LEFT)  slot = 2;
+            else if (vk == VK_RIGHT) slot = 3;
+            if (slot >= 0) {
+                InterlockedExchange(&g_numArrow[slot], down ? 1 : 0);
+                return 0;                      // swallowed
+            }
+        }
+        if (isPlayerKey(vk)) return 0;         // swallowed
+    }
+    return CallWindowProcA(g_origWndProc, h, msg, w, l);
+}
+
+static BOOL CALLBACK findWndCb(HWND h, LPARAM lp)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    if (!IsWindowVisible(h))          return TRUE;
+    if (GetWindow(h, GW_OWNER))       return TRUE;   // skip owned popups
+    RECT r; GetClientRect(h, &r);
+    if ((r.right - r.left) < 200 || (r.bottom - r.top) < 150) return TRUE;
+    *(HWND *)lp = h;
+    return FALSE;
+}
+
+static void hookGameWindow(void)
+{
+    if (g_origWndProc) return;
+    // GetActiveWindow() is per-THREAD: called from the render thread it
+    // returns NULL, so the hook silently never installed. Enumerate the
+    // process's own top-level windows instead.
+    static DWORD lastTry = 0;
+    DWORD now = GetTickCount();
+    if ((now - lastTry) < 1000) return;
+    lastTry = now;
+
+    HWND h = NULL;
+    EnumWindows(findWndCb, (LPARAM)&h);
+    if (!h) { h = GetActiveWindow(); if (!h) h = GetForegroundWindow(); }
+    if (!h) { logf_("[input] no game window found yet - retrying"); return; }
+
+    g_origWndProc = (WNDPROC)SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)modWndProc);
+    if (g_origWndProc) {
+        g_hookedWnd = h;
+        RECT r; GetClientRect(h, &r);
+        logf_("[input] SUBCLASSED window %p (%dx%d) - player 2 keys are now "
+              "hidden from the engine", h, r.right - r.left, r.bottom - r.top);
+    } else {
+        logf_("[input] !! SetWindowLongPtr FAILED on %p (err %lu) - player 2 keys "
+              "will ALSO reach player 1", h, GetLastError());
+    }
+}
+
+// ------------------------------ d3d8 proxy ---------------------------------
+static HMODULE g_realD3D8 = NULL;
+typedef void *(WINAPI *PFN_Direct3DCreate8)(UINT);
+static PFN_Direct3DCreate8 g_realCreate = NULL;
+
+// ------------------------------- hooking -----------------------------------
+struct Hook { BYTE *target; BYTE *tramp; };
+
+// Resolve an incremental-link thunk (E9 rel32) to the real function body.
+static BYTE *resolveThunk(BYTE *p)
+{
+    for (int i = 0; i < 4 && p && !IsBadReadPtr(p, 5) && p[0] == 0xE9; i++)
+        p = p + 5 + *(LONG *)(p + 1);
+    return p;
+}
+
+// Minimal MSVC-prologue length decoder: accumulate whole instructions until
+// we have >= 5 bytes to overwrite with a JMP rel32.
+static int prologueLen(const BYTE *p)
+{
+    int n = 0;
+    while (n < 5) {
+        BYTE o = p[n];
+        int  l;
+        if      (o == 0x55 || (o >= 0x50 && o <= 0x57)) l = 1;     // push r32
+        else if (o == 0x8B || o == 0x89) {                         // mov r/m,r32
+            BYTE m = p[n+1]; int mod = m >> 6, rm = m & 7;
+            if      (mod == 3) l = 2;
+            else if (mod == 0) l = (rm == 4) ? 3 : ((rm == 5) ? 6 : 2);
+            else if (mod == 1) l = (rm == 4) ? 4 : 3;
+            else               l = (rm == 4) ? 7 : 6;
+        }
+        else if (o == 0x6A)                             l = 2;     // push imm8
+        else if (o == 0x68)                             l = 5;     // push imm32
+        else if (o == 0x83 && p[n+1] == 0xEC)           l = 3;     // sub esp,imm8
+        else if (o == 0x81 && p[n+1] == 0xEC)           l = 6;     // sub esp,imm32
+        else if (o == 0x90)                             l = 1;     // nop
+        else return 0;                                             // unknown
+        n += l;
+    }
+    return n;
+}
+
+static BOOL installHook(Hook *h, BYTE *target, void *detour, const char *tag)
+{
+    if (!target || IsBadReadPtr(target, 16)) { logf_("  [%s] bad target", tag); return FALSE; }
+    int n = prologueLen(target);
+    logf_("  [%s] target=%p prologue=%02X %02X %02X %02X %02X %02X (len=%d)",
+          tag, target, target[0], target[1], target[2], target[3],
+          target[4], target[5], n);
+    if (n < 5) { logf_("  [%s] ABORT: undecodable prologue, not patching", tag); return FALSE; }
+
+    h->target = target;
+    h->tramp  = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_EXECUTE_READWRITE);
+    if (!h->tramp) { logf_("  [%s] ABORT: VirtualAlloc failed", tag); return FALSE; }
+
+    memcpy(h->tramp, target, n);
+    h->tramp[n] = 0xE9;
+    *(LONG *)(h->tramp + n + 1) = (LONG)(target + n) - (LONG)(h->tramp + n + 5);
+
+    DWORD old;
+    if (!VirtualProtect(target, n, PAGE_EXECUTE_READWRITE, &old)) {
+        logf_("  [%s] ABORT: VirtualProtect failed", tag); return FALSE;
+    }
+    memset(target, 0x90, n);
+    target[0] = 0xE9;
+    *(LONG *)(target + 1) = (LONG)detour - (LONG)(target + 5);
+    VirtualProtect(target, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, n);
+    logf_("  [%s] HOOKED, trampoline=%p", tag, h->tramp);
+    return TRUE;
+}
+
+// --------------------------- engine symbols --------------------------------
+#define SYM_DRAW      "?Draw@UGameEngine@@UAEXPAVUViewport@@HPAEPAH@Z"
+#define SYM_POSTREND  "?MasterProcessPostRender@UInteractionMaster@@QAEXPAVUCanvas@@@Z"
+#define SYM_PSNODE    "??0FPlayerSceneNode@@QAE@PAVUViewport@@PAVFRenderTarget@@PAVAActor@@VFVector@@VFRotator@@M@Z"
+#define SYM_DRAWPORT  "?execDrawPortal@UCanvas@@QAEXAAUFFrame@@QAX@Z"
+#define SYM_GNATIVES  "?GNatives@@3PAP8UObject@@AEXAAUFFrame@@QAX@ZA"
+
+static HMODULE g_core = NULL, g_engine = NULL;
+
+// --------------------- UnrealScript opcode discovery -----------------------
+struct OpDef { const char *sym; const char *name; int op; };
+static OpDef g_ops[] = {
+    { "?execIntConst@UObject@@QAEXAAUFFrame@@QAX@Z",      "IntConst",        -1 },
+    { "?execObjectConst@UObject@@QAEXAAUFFrame@@QAX@Z",   "ObjectConst",     -1 },
+    { "?execVectorConst@UObject@@QAEXAAUFFrame@@QAX@Z",   "VectorConst",     -1 },
+    { "?execRotationConst@UObject@@QAEXAAUFFrame@@QAX@Z", "RotationConst",   -1 },
+    { "?execTrue@UObject@@QAEXAAUFFrame@@QAX@Z",          "True",            -1 },
+    { "?execFalse@UObject@@QAEXAAUFFrame@@QAX@Z",         "False",           -1 },
+    { "?execEndFunctionParms@UObject@@QAEXAAUFFrame@@QAX@Z","EndFunctionParms",-1 },
+};
+enum { OP_INT = 0, OP_OBJ, OP_VEC, OP_ROT, OP_TRUE, OP_FALSE, OP_END, OP_COUNT };
+static int g_opNameConst = -1;   // optional execNameConst opcode (Spawn tag)
+
+static BOOL discoverOpcodes(void)
+{
+    void **tbl = (void **)GetProcAddress(g_core, SYM_GNATIVES);
+    logf_("GNatives table = %p", (void *)tbl);
+    if (!tbl || IsBadReadPtr(tbl, 256 * 4)) { logf_("  GNatives unreadable"); return FALSE; }
+
+    BOOL all = TRUE;
+    for (int i = 0; i < OP_COUNT; i++) {
+        BYTE *want = resolveThunk((BYTE *)GetProcAddress(g_core, g_ops[i].sym));
+        if (!want) { logf_("  %-17s EXPORT MISSING", g_ops[i].name); all = FALSE; continue; }
+        for (int op = 0; op < 256; op++) {
+            if (resolveThunk((BYTE *)tbl[op]) == want) { g_ops[i].op = op; break; }
+        }
+        if (g_ops[i].op < 0) { logf_("  %-17s NOT FOUND in GNatives (%p)", g_ops[i].name, want); all = FALSE; }
+        else logf_("  %-17s = opcode 0x%02X   (handler %p)", g_ops[i].name, g_ops[i].op, want);
+    }
+    // Optional token, NOT gating g_opsOK: NameConst feeds name parms (the
+    // Spawn tag). Without it the aim glow disables itself; everything else
+    // keeps working.
+    g_opNameConst = -1;
+    BYTE *nc = resolveThunk((BYTE *)GetProcAddress(g_core,
+                 "?execNameConst@UObject@@QAEXAAUFFrame@@QAX@Z"));
+    if (nc) {
+        for (int op = 0; op < 256; op++)
+            if (resolveThunk((BYTE *)tbl[op]) == nc) { g_opNameConst = op; break; }
+    }
+    logf_("  %-17s = %s", "NameConst(opt)",
+          g_opNameConst >= 0 ? "opcode found" : "NOT FOUND (aim glow off)");
+    return all;
+}
+
+// --------------------- object enumeration / naming -------------------------
+// Core.dll exports the global object table and the name helpers, so we can
+// walk every live UObject and print "Class Package.Name" without knowing the
+// UObject::Class field offset.
+#define SYM_GOBJ     "?GObjObjects@UObject@@0V?$TArray@PAVUObject@@@@A"
+#define SYM_FULLNAME "?GetFullName@UObject@@QBEPBGPAG@Z"
+#define SYM_GETNAME  "?GetName@UObject@@QBEPBGXZ"
+
+struct TArrayLite { void **Data; int Num; int Max; };
+
+typedef const wchar_t *(__fastcall *PFN_GetFullName)(void *self, void *edx, wchar_t *buf);
+typedef const wchar_t *(__fastcall *PFN_GetName)(void *self, void *edx);
+
+static TArrayLite      *g_objArray = NULL;
+static PFN_GetFullName  g_GetFullName = NULL;
+static PFN_GetName      g_GetName = NULL;
+
+// Copy a UObject's "Class Package.Name" into an ASCII buffer.
+static const char *objName(void *o, char *out, int cch)
+{
+    out[0] = 0;
+    if (!o || !g_GetFullName || IsBadReadPtr(o, 0x30)) { strcpy(out, "<null>"); return out; }
+    const wchar_t *w = g_GetFullName(o, NULL, NULL);
+    if (!w || IsBadReadPtr((void *)w, 2)) { strcpy(out, "<noname>"); return out; }
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cch, NULL, NULL);
+    out[cch - 1] = 0;
+    return out;
+}
+
+// True for UnrealScript reflection/metadata objects we never care about.
+static BOOL isReflection(const char *full)
+{
+    char cls[64]; int i = 0;
+    while (full[i] && full[i] != ' ' && i < 63) { cls[i] = full[i]; i++; }
+    cls[i] = 0;
+    int L = (int)strlen(cls);
+    if (L > 8 && !strcmp(cls + L - 8, "Property")) return TRUE;
+    static const char *skip[] = {
+        "Function", "State", "Class", "Enum", "ScriptStruct", "Struct", "Const",
+        "TextBuffer", "Package", "Field", "Texture", "Sound", "Palette", "Font",
+        "StaticMesh", "Mesh", "LodMesh", "SkeletalMesh", "Animation", "Shader",
+        "Material", "Combiner", "FinalBlend", "ConstantColor", "TexPanner",
+        "Model", "Polys", "Bitmap", "Modifier", "TexScaler", "TexRotator",
+        "MeshAnimation", "Cubemap", "TexOscillator", "ColorModifier", NULL
+    };
+    for (int k = 0; skip[k]; k++) if (!strcmp(cls, skip[k])) return TRUE;
+    return FALSE;
+}
+
+// Dump every live object whose full name matches one of the filters.
+static void dumpObjects(const char *const *filters)
+{
+    if (!g_objArray || IsBadReadPtr(g_objArray, sizeof(TArrayLite))) {
+        logf_("[objdump] GObjObjects unavailable"); return;
+    }
+    int n = g_objArray->Num;
+    logf_("[objdump] GObjObjects: %d slots @ %p", n, (void *)g_objArray->Data);
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+
+    char buf[512];
+    int shown = 0, live = 0;
+    for (int i = 0; i < n && shown < 1500; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        live++;
+        objName(o, buf, sizeof(buf));
+        if (isReflection(buf)) continue;
+        for (int f = 0; filters[f]; f++) {
+            if (strstr(buf, filters[f])) {
+                logf_("  [%6d] %p  %s", i, o, buf);
+                shown++;
+                break;
+            }
+        }
+    }
+    logf_("[objdump] %d live objects scanned, %d matched", live, shown);
+}
+
+// --------------------- per-player character binding ------------------------
+// Each split view follows a different character. View 0 keeps the engine's own
+// polished camera (HPCam); views 1..N-1 get a third-person camera anchored to
+// their own pawn. Class tokens come from the live object dump:
+//     harry HP3_Adv1Express.Harry0
+//     Hermione HP3_Adv1Express.Hermione2
+//     Ron HP3_Adv1Express.Ron1
+static const char *kCharClass[8] = {
+    "harry", "Hermione", "Ron", "harry", "Hermione", "Ron", "harry", "Hermione"
+};
+static void *g_pawn[8]     = {0};
+static char  g_pawnName[8][96];
+
+// Linear scan of the global object table for the first actor of a class.
+static void *findActorByClass(const char *cls)
+{
+    if (!g_objArray || IsBadReadPtr(g_objArray, sizeof(TArrayLite))) return NULL;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return NULL;
+    int L = (int)strlen(cls);
+    char buf[256];
+    for (int i = 0; i < n; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        if (!strncmp(buf, cls, L) && buf[L] == ' ') return o;
+    }
+    return NULL;
+}
+
+// Resolve (and cache) the pawn backing split view `i`.
+static void *getPawn(int i)
+{
+    if (i < 0 || i > 7) return NULL;
+    if (g_pawn[i]) return g_pawn[i];
+    void *o = findActorByClass(kCharClass[i]);
+    if (o) {
+        g_pawn[i] = o;
+        objName(o, g_pawnName[i], sizeof(g_pawnName[i]));
+        float *pl = (float *)((BYTE *)o + 0x150);
+        logf_("  player %d -> %s @ %p  loc=(%.0f %.0f %.0f)",
+              i, g_pawnName[i], o, pl[0], pl[1], pl[2]);
+    }
+    return o;
+}
+
+// Third-person camera behind a pawn, in UE rotator units (65536 = 360 deg).
+static BOOL g_opsOK = FALSE;
+
+struct FFrameLite {
+    void  *vtable;   // FOutputDevice
+    void  *Node;
+    void  *Object;
+    BYTE  *Code;
+    BYTE  *Locals;
+    DWORD  pad[12];
+};
+
+typedef void (__fastcall *PFN_execDrawPortal)(void *canvas, void *edx,
+                                              FFrameLite *stack, void *result);
+static PFN_execDrawPortal g_execDrawPortal = NULL;
+
+// Engine.Actor.FastTrace is a NATIVE. Natives read their arguments from the
+// bytecode stream, not from the ProcessEvent parms block, which is why calling
+// Engine.Actor.Trace through ProcessEvent silently returned nothing. Natives
+// must be driven the same way DrawPortal is: with a synthesized instruction
+// stream. FastTrace is ideal for this because it has no out-parameters --
+// only two vectors in and a bool out.
+typedef void (__fastcall *PFN_execFastTrace)(void *actor, void *edx,
+                                             FFrameLite *stack, void *result);
+static PFN_execFastTrace g_execFastTrace = NULL;
+
+// TRUE when the straight line start->end is unobstructed by world geometry.
+static BOOL fastTraceClear(void *actor, const float start[3], const float end[3])
+{
+    if (!g_execFastTrace || !g_opsOK || !actor) return TRUE;
+    BYTE bc[32]; int p = 0;
+    bc[p++] = (BYTE)g_ops[OP_VEC].op;
+    *(float *)(bc+p)=end[0];   p+=4; *(float *)(bc+p)=end[1];   p+=4; *(float *)(bc+p)=end[2];   p+=4;
+    bc[p++] = (BYTE)g_ops[OP_VEC].op;
+    *(float *)(bc+p)=start[0]; p+=4; *(float *)(bc+p)=start[1]; p+=4; *(float *)(bc+p)=start[2]; p+=4;
+    bc[p++] = (BYTE)g_ops[OP_END].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;      // guard
+
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = actor; st.Code = bc;
+    DWORD result = 0;
+    g_execFastTrace(actor, NULL, &st, &result);
+    return result != 0;
+}
+
+typedef void (__fastcall *PFN_ProcessEvent)(void *self, void *edx,
+                                            void *func, void *parms, void *result);
+static PFN_ProcessEvent g_ProcessEvent = NULL;
+
+// Engine.Actor.Spawn / Engine.Actor.Destroy, driven the same way FastTrace is:
+// natives read their parms as bytecode TOKENS from the FFrame, one const per
+// parm in declaration order. Calling them through ProcessEvent handed them a
+// parms block they never read - Spawn silently returned NULL every frame.
+// Spawn layout (runtime-dumped): class@0 owner@4 tag(Name,4B)@0x08 loc@0x0C
+// rot@0x18 ret@0x24. Tokens: OBJ, OBJ, NAME(index DWORD), VEC(12), ROT(12).
+typedef void (__fastcall *PFN_execActorFn)(void *actor, void *edx,
+                                           FFrameLite *stack, void *result);
+static PFN_execActorFn g_execSpawn = NULL, g_execDestroy = NULL;
+
+static void *spawnFX(void *actor, void *cls, void *owner,
+                     const float loc[3], const int rot[3])
+{
+    if (!g_execSpawn || !g_opsOK || g_opNameConst < 0 || !actor || !cls)
+        return NULL;
+    BYTE bc[64]; int p = 0;
+    bc[p++] = (BYTE)g_ops[OP_OBJ].op;  *(void **)(bc + p) = cls;   p += 4;
+    bc[p++] = (BYTE)g_ops[OP_OBJ].op;  *(void **)(bc + p) = owner; p += 4;
+    bc[p++] = (BYTE)g_opNameConst;     *(DWORD *)(bc + p) = 0;     p += 4; // NAME_None
+    bc[p++] = (BYTE)g_ops[OP_VEC].op;  memcpy(bc + p, loc, 12);    p += 12;
+    bc[p++] = (BYTE)g_ops[OP_ROT].op;  memcpy(bc + p, rot, 12);    p += 12;
+    bc[p++] = (BYTE)g_ops[OP_END].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;  // guard
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = actor; st.Code = bc;
+    void *result = NULL;
+    g_execSpawn(actor, NULL, &st, &result);
+    return result;
+}
+
+// Engine.Actor.Destroy has no parms - the frame only needs the END guard.
+// Returns Destroy()'s bool (FALSE when the actor refused to die).
+static BOOL destroyActorFX(void *fx)
+{
+    if (!g_execDestroy || !g_opsOK || !fx) return FALSE;
+    BYTE bc[4]; int p = 0;
+    bc[p++] = (BYTE)g_ops[OP_END].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;   // guard
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = fx; st.Code = bc;
+    DWORD result = 0;
+    g_execDestroy(fx, NULL, &st, &result);
+    return result != 0;
+}
+
+// Trailing camera for a driven pawn. The desired eye position is probed with
+// a series of FastTrace line checks and the camera settles at the furthest
+// unobstructed distance, so it slides in against walls instead of punching
+// through them in tight corridors.
+static float g_camDistCur[8] = {0};
+
+int playerViewYaw(int i);
+int playerCamYaw(int i);
+int playerCamPitch(int i);
+void resetViewYaw(void);
+static void thirdPersonCam(int idx, void *pawn, float outLoc[3], int outRot[3])
+{
+    const float DIST = g_camDist, HEIGHT = g_camHeight;
+    float *pl = (float *)((BYTE *)pawn + 0x150);
+
+    // Camera yaw comes from the player's view yaw, not the pawn's rotation.
+    int camYaw = playerCamYaw(idx);
+    int pitch  = playerCamPitch(idx);
+    outRot[0] = pitch; outRot[1] = camYaw; outRot[2] = 0;
+
+    // v14: the camera ORBITS the focus point by yaw AND pitch, like the
+    // original player's camera. v13 held the eye at a fixed height and only
+    // rotated the view, so pitching down just stared at the character's feet.
+    // Now pitching down swings the camera up overhead with the character
+    // centered in frame; pitching up drops the camera low behind.
+    float pivot[3] = { pl[0], pl[1], pl[2] + HEIGHT };
+    double ry = camYaw * (6.283185307179586 / 65536.0);
+    double rp = pitch  * (6.283185307179586 / 65536.0);
+    float cosp = (float)cos(rp);
+    // unit view direction (where the camera looks); the eye sits behind it
+    float vx = (float)cos(ry) * cosp, vy = (float)sin(ry) * cosp, vz = (float)sin(rp);
+
+    static const float frac[] = { 1.00f, 0.80f, 0.62f, 0.46f, 0.32f, 0.18f };
+    const int NFRAC = (int)(sizeof(frac) / sizeof(frac[0]));
+    float want = DIST;
+
+    if (g_camCollide && g_execFastTrace) {
+        // Never collapse the camera into the character's head: if even the
+        // closest probe is blocked, accept the closest one and let it clip a
+        // little rather than putting the eye inside the pawn.
+        want = DIST * frac[NFRAC - 1];
+        for (int k = 0; k < NFRAC; k++) {
+            float d = DIST * frac[k];
+            float cand[3] = { pivot[0] - vx * d, pivot[1] - vy * d,
+                              pivot[2] - vz * d };
+            if (fastTraceClear(pawn, pivot, cand)) { want = d; break; }
+        }
+    }
+
+    // Temporal smoothing: snap inwards so walls never clip through, but ease
+    // back out, or the view jitters as the probe result flips frame to frame.
+    if (idx < 0 || idx >= 8) idx = 0;
+    float cur = g_camDistCur[idx];
+    if (cur <= 0.0f)      cur = want;
+    else if (want < cur)  cur = want;                       // pull in at once
+    else                  cur += (want - cur) * 0.10f;      // ease back out (less shake)
+    g_camDistCur[idx] = cur;
+
+    static int camLog = 0;
+    if (cur < DIST - 0.5f && (camLog++ % 12) == 0)
+        logf_("  [cam] p%d obstructed - %.0f -> %.0f units (target %.0f)",
+              idx, DIST, cur, want);
+
+    // When the camera cannot get behind the character at all, sitting at the
+    // pivot would put the eye inside its head and the character would vanish
+    // from its own view. Instead, lift the camera and steepen the pitch so it
+    // looks down over the shoulder - the view stays usable in tight corners.
+    // (v15: steepen only while looking level/down; steepening while the player
+    // holds look-UP would yank the view back down mid-aim.)
+    float t = cur / (DIST > 1.0f ? DIST : 1.0f);        // 1 = fully extended
+    float lift = 0.0f;
+    if (t < 0.55f) {
+        float k = (0.55f - t) / 0.55f;                  // 0 at t=0.55, 1 at t=0
+        lift  = k * 35.0f;
+        if (pitch <= 0) {
+            pitch += (int)(k * -5000.0f);
+            if (pitch < -16000) pitch = -16000;
+            outRot[0] = pitch;
+        }
+    }
+    outLoc[0] = pivot[0] - vx * cur;
+    outLoc[1] = pivot[1] - vy * cur;
+    outLoc[2] = pivot[2] - vz * cur + lift;
+}
+
+
+// Find an object by its path ("Engine.Actor.Location"), ignoring the leading
+// class token that GetFullName prepends.
+static void *findObjectByPath(const char *path)
+{
+    if (!g_objArray || IsBadReadPtr(g_objArray, sizeof(TArrayLite))) return NULL;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return NULL;
+    char buf[256];
+    for (int i = 0; i < n; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        const char *sp = strchr(buf, ' ');
+        if (sp && !strcmp(sp + 1, path)) return o;
+    }
+    return NULL;
+}
+
+// Locate UProperty::Offset once, using fields whose offsets we already know
+// for certain (Actor.Location = 0x150, Actor.Rotation = 0x15C). After this,
+// ANY field offset can be looked up by name instead of guessed.
+static int g_propOffsetField = -1;
+
+static void calibratePropertyOffset(void)
+{
+    struct { const char *path; DWORD known; } probe[] = {
+        { "Engine.Actor.Location", 0x150 },
+        { "Engine.Actor.Rotation", 0x15C },
+    };
+    int cand[2][32]; int ncand[2] = {0, 0};
+
+    for (int k = 0; k < 2; k++) {
+        void *p = findObjectByPath(probe[k].path);
+        logf_("  %s -> %p", probe[k].path, p);
+        if (!p || IsBadReadPtr(p, 0x80)) continue;
+        for (int off = 0; off + 4 <= 0x80; off += 4)
+            if (*(DWORD *)((BYTE *)p + off) == probe[k].known && ncand[k] < 32)
+                cand[k][ncand[k]++] = off;
+        char line[256]; int c = sprintf(line, "    dwords==0x%lX at:", probe[k].known);
+        for (int j = 0; j < ncand[k]; j++) c += sprintf(line + c, " +0x%X", cand[k][j]);
+        logf_("%s", line);
+    }
+    // The one offset that works for BOTH probes is UProperty::Offset.
+    for (int a = 0; a < ncand[0]; a++)
+        for (int b = 0; b < ncand[1]; b++)
+            if (cand[0][a] == cand[1][b]) { g_propOffsetField = cand[0][a]; }
+    logf_("  ==> UProperty::Offset field = +0x%X", g_propOffsetField);
+}
+
+// Resolve a script field's byte offset within its object, by name.
+static int propOffset(const char *path)
+{
+    if (g_propOffsetField < 0) return -1;
+    void *p = findObjectByPath(path);
+    if (!p || IsBadReadPtr(p, g_propOffsetField + 4)) return -1;
+    return (int)*(DWORD *)((BYTE *)p + g_propOffsetField);
+}
+
+// List the script functions available on the hero pawn classes, so player 2's
+// actions can be driven through UObject::ProcessEvent instead of poking fields.
+static void dumpHeroFunctions(void)
+{
+    if (!g_objArray || IsBadReadPtr(g_objArray, sizeof(TArrayLite))) return;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+
+    static const char *want[] = {
+        ".harry.", ".Hermione.", ".Ron.", ".HPHeroPawn.", ".HPCharacter.",
+        ".HPPawn.", ".KWPawn.", "Engine.Pawn.",
+        ".HarryController.", ".HPHeroController.", ".KWHeroController.",
+        ".HPCompanionController.", ".HPAIController.", NULL
+    };
+    char buf[300];
+    int shown = 0;
+    logf_("--- hero pawn script functions ---");
+    for (int i = 0; i < n && shown < 900; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        if (strncmp(buf, "Function ", 9)) continue;
+        // only top-level functions (Package.Class.Func), not their locals
+        int dots = 0;
+        for (const char *c = buf; *c; c++) if (*c == '.') dots++;
+        if (dots != 2) continue;
+        for (int w = 0; want[w]; w++) {
+            if (strstr(buf, want[w])) { logf_("    %p  %s", o, buf); shown++; break; }
+        }
+    }
+    logf_("--- %d hero functions ---", shown);
+}
+
+// Dump one script function's real signature. HGame.u is source-stripped, but
+// a UFunction's parameters and locals are themselves objects in GObjObjects,
+// named "Pkg.Class.Func.Param". Their class token gives the type and the
+// dword at UProperty::Offset gives their position in the parms block, so a
+// call frame can be built exactly without any source.
+static void dumpFunctionSig(const char *path)
+{
+    if (!g_objArray || g_propOffsetField < 0) return;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000) return;
+    size_t plen = strlen(path);
+    char buf[300];
+    void *fn = findObjectByPath(path);
+    logf_("  fn %s @ %p", path, fn);
+    if (!fn) return;
+
+    struct { int off; char txt[160]; } ent[48]; int ne = 0;
+    for (int i = 0; i < n && ne < 48; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        const char *sp = strchr(buf, ' ');
+        if (!sp) continue;
+        const char *full = sp + 1;
+        if (strncmp(full, path, plen) || full[plen] != '.') continue;
+        if (strchr(full + plen + 1, '.')) continue;         // direct children only
+        if (IsBadReadPtr(o, g_propOffsetField + 4)) continue;
+        int off = (int)*(DWORD *)((BYTE *)o + g_propOffsetField);
+        *(char *)sp = 0;                                     // split class token
+        ent[ne].off = off;
+        _snprintf(ent[ne].txt, sizeof(ent[ne].txt) - 1, "+0x%02X  %-16s %s",
+                  off, buf, full + plen + 1);
+        ent[ne].txt[sizeof(ent[ne].txt) - 1] = 0;
+        ne++;
+    }
+    for (int a = 0; a < ne; a++)                             // sort by frame offset
+        for (int b = a + 1; b < ne; b++)
+            if (ent[b].off < ent[a].off) { char t[160]; int x = ent[a].off;
+                ent[a].off = ent[b].off; ent[b].off = x;
+                memcpy(t, ent[a].txt, 160); memcpy(ent[a].txt, ent[b].txt, 160);
+                memcpy(ent[b].txt, t, 160); }
+    if (!ne) logf_("      (no params -- void call)");
+    for (int a = 0; a < ne; a++) logf_("      %s", ent[a].txt);
+}
+
+// Every property whose name contains a keyword, on the hero classes: this is
+// how the "which spell is selected" state field gets found.
+static void dumpPropsMatching(const char *keyword)
+{
+    if (!g_objArray || g_propOffsetField < 0) return;
+    int n = g_objArray->Num; if (n <= 0 || n > 400000) return;
+    char buf[300]; int shown = 0;
+    logf_("--- properties matching '%s' ---", keyword);
+    for (int i = 0; i < n && shown < 120; i++) {
+        void *o = g_objArray->Data[i]; if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        if (!strstr(buf, "Property ")) continue;
+        int dots = 0; for (const char *c = buf; *c; c++) if (*c == '.') dots++;
+        if (dots != 2) continue;                             // Pkg.Class.Field
+        if (!strstr(buf, keyword)) continue;
+        if (!(strstr(buf, ".HPCharacter.") || strstr(buf, ".HPHeroPawn.") ||
+              strstr(buf, ".HPPawn.")      || strstr(buf, ".KWPawn.")     ||
+              strstr(buf, ".HPHeroController.") || strstr(buf, ".HPAIController.")))
+            continue;
+        if (IsBadReadPtr(o, g_propOffsetField + 4)) continue;
+        logf_("    +0x%03X  %s", (int)*(DWORD *)((BYTE *)o + g_propOffsetField), buf);
+        shown++;
+    }
+    logf_("--- %d matches ---", shown);
+}
+
+// Enumerate loaded Classes whose name contains a fragment. castSpell takes a
+// ClassProperty, so an actual spell class pointer is required.
+static void dumpClassesMatching(const char *frag)
+{
+    if (!g_objArray) return;
+    int n = g_objArray->Num; if (n <= 0 || n > 400000) return;
+    char buf[300]; int shown = 0;
+    logf_("--- Class objects containing '%s' ---", frag);
+    for (int i = 0; i < n && shown < 200; i++) {
+        void *o = g_objArray->Data[i]; if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        if (strncmp(buf, "Class ", 6)) continue;
+        if (!strstr(buf, frag)) continue;
+        logf_("    %p  %s", o, buf); shown++;
+    }
+    logf_("--- %d spell classes ---", shown);
+}
+
+// ALL direct properties of one exact class (any package), sorted by offset.
+static void dumpClassPropsFull(const char *classPath)
+{
+    if (!g_objArray || g_propOffsetField < 0) return;
+    int n = g_objArray->Num; if (n <= 0 || n > 400000) return;
+    size_t plen = strlen(classPath);
+    char buf[300];
+    struct { int off; char txt[200]; } ent[128]; int ne = 0;
+    logf_("--- all props of %s ---", classPath);
+    for (int i = 0; i < n && ne < 128; i++) {
+        void *o = g_objArray->Data[i]; if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        const char *sp = strchr(buf, ' '); if (!sp) continue;
+        if (!strstr(buf, "Property ")) continue;         // any *Property type
+        const char *full = sp + 1;
+        if (strncmp(full, classPath, plen) || full[plen] != '.') continue;
+        if (strchr(full + plen + 1, '.')) continue;       // direct children only
+        if (IsBadReadPtr(o, g_propOffsetField + 4)) continue;
+        int off = (int)*(DWORD *)((BYTE *)o + g_propOffsetField);
+        _snprintf(ent[ne].txt, sizeof(ent[ne].txt) - 1, "+0x%03X  %-14s %s",
+                  off, buf, full + plen + 1);   // buf = "ObjectProperty" etc
+        ent[ne].txt[sizeof(ent[ne].txt) - 1] = 0;
+        ent[ne].off = off; ne++;
+    }
+    for (int a = 0; a < ne; a++)
+        for (int b = a + 1; b < ne; b++)
+            if (ent[b].off < ent[a].off) {
+                int x = ent[a].off; ent[a].off = ent[b].off; ent[b].off = x;
+                char t[200]; memcpy(t, ent[a].txt, 200);
+                memcpy(ent[a].txt, ent[b].txt, 200); memcpy(ent[b].txt, t, 200);
+            }
+    if (!ne) logf_("    (no properties found)");
+    for (int a = 0; a < ne; a++) logf_("    %s", ent[a].txt);
+}
+
+// Properties matching a keyword on ANY class (dumpPropsMatching is hero-only).
+static void dumpPropsAny(const char *keyword)
+{
+    if (!g_objArray || g_propOffsetField < 0) return;
+    int n = g_objArray->Num; if (n <= 0 || n > 400000) return;
+    char buf[300]; int shown = 0;
+    logf_("--- any-class props matching '%s' ---", keyword);
+    for (int i = 0; i < n && shown < 120; i++) {
+        void *o = g_objArray->Data[i]; if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        if (!strstr(buf, "Property ")) continue;
+        if (!strstr(buf, keyword)) continue;
+        if (IsBadReadPtr(o, g_propOffsetField + 4)) continue;
+        logf_("    +0x%03X  %s", (int)*(DWORD *)((BYTE *)o + g_propOffsetField), buf);
+        shown++;
+    }
+    logf_("--- %d matches ---", shown);
+}
+
+// The signatures player 2 needs: casting, pickup/use, and AI disown.
+static void dumpActionSigs(void)
+{
+    static const char *sigs[] = {
+        "hgame.HPCharacter.castSpell",     "hgame.HPCharacter.ChooseSpell",
+        "hgame.HPCharacter.HasSpell",      "hgame.HPCharacter.canCast",
+        "hgame.HPCharacter.StartCasting",  "hgame.HPCharacter.StopCasting",
+        "hgame.HPCharacter.finalizeSpell", "hgame.HPCharacter.playCast",
+        "hgame.HPCharacter.Fire",          "hgame.HPPawn.SpawnSpell",
+        "hgame.HPPawn.SpawnSpellEx",       "hgame.HPPawn.HandleSpell",
+        "hgame.HPHeroController.Fire",     "hgame.HPHeroPawn.canCast",
+        "KWGame.KWPawn.PickupActor",       "KWGame.KWPawn.CanDoPickupActor",
+        "KWGame.KWPawn.ObjectPickup",      "Engine.Pawn.HandlePickup",
+        "Engine.Controller.UnPossess",     "Engine.Controller.Possess",
+        "Engine.Pawn.SetAnimAction",       "KWGame.KWPawn.Trigger",
+        "Engine.Pawn.Trigger",             "KWGame.KWHeroController.SwitchControlToPawn",
+        "KWGame.KWHeroController.SwitchToPawn", "KWGame.KWHeroController.SwapPawn",
+        "KWGame.KWHeroController.UnPossess","KWGame.KWPawn.CanDoPickupActor",
+        "hgame.HPCharacter.IsAimingOrCasting",
+        "Engine.Actor.Trace",              "Engine.Actor.FastTrace",
+        "Engine.Actor.TraceActors",        "hgame.HPCharacter.playCastAim",
+        "hgame.HPCharacter.CanCastAim",    "hgame.HPCharacter.SetupCastingAnimation",
+        "KWGame.KWPawn.SetTargetLocations","Engine.Actor.SetRotation",
+        "hgame.HPCharacter.GetSpellSound", "hgame.HPPawn.OnHandleSpell",
+        "Engine.Actor.Spawn",              "Engine.Actor.Destroy",
+        NULL
+    };
+    logf_("--- action signatures ---");
+    for (int i = 0; sigs[i]; i++) dumpFunctionSig(sigs[i]);
+    dumpClassesMatching("pell");
+    dumpPropsMatching("Spell");
+    dumpPropsMatching("Target");
+    dumpPropsMatching("Collision");
+    dumpPropsMatching("spell");
+    logf_("--- end signatures ---");
+}
+
+// ---- player 2..N actions, driven through the engine's own script VM --------
+// Movement is a field override, but real actions (jump, spellcast) must run
+// the pawn's UnrealScript so animation/sound/state all stay consistent.
+
+static void *g_fnJump = NULL, *g_fnFire = NULL, *g_fnFireRel = NULL;
+static void *g_fnCast = NULL, *g_fnChoose = NULL, *g_fnStartCast = NULL;
+static void *g_fnStopCast = NULL, *g_fnCharFire = NULL, *g_fnCanCast = NULL;
+static void *g_fnTrigger = NULL, *g_fnPickup = NULL, *g_fnCanPickup = NULL;
+static void *g_fnUnPossess = NULL, *g_fnUnPossessAI = NULL, *g_fnPossessAI = NULL;
+static void *g_fnStopTrail = NULL, *g_fnIdleWander = NULL, *g_fnRandIdle = NULL;
+static void *g_fnStopTrailKW = NULL, *g_fnDropTrail = NULL;
+static int   g_offFollowRadius = -1;  // KWAIController.TrailCharFollowRadius
+static int   g_offLeadChar = -1;      // KWAIController.LeadChar
+static int   g_offUseDistLead = -1;   // bUseDistFromLeadCharForMovement
+static DWORD g_maskUseDistLead = 0;
+static int   g_offTrailingChar = -1;  // KWPawn.TrailingChar (on the lead)
+static int   g_offCurrentSpell = -1, g_offSpellTarget = -1;
+static int   g_offProjSpeed = -1, g_offProjMaxSpeed = -1; // Engine.Projectile
+static void *g_defaultSpell = NULL, *g_fnSpawnSpell = NULL, *g_fnHasSpell = NULL;
+static void *g_fnPlayCast = NULL, *g_fnPlayCastAim = NULL, *g_fnFinalize = NULL;
+static void *g_fnBlendOut = NULL, *g_fnIsAiming = NULL, *g_fnShowWeapon = NULL;
+static void *g_fnCharRelFire = NULL, *g_fnChangeAnim = NULL, *g_fnPlayJump = NULL;
+static void *g_fnAnimEnd = NULL, *g_fnPlayIdle = NULL;
+static void *g_fnGotoGround = NULL;   // KWPawn.GotoDefaultGroundMovementState
+static void *g_fnPlayWaiting = NULL, *g_fnSwitchFight = NULL, *g_fnSwitchNormal = NULL;
+// v15 aim glow: the original player's sparkle-at-the-aim-point effect.
+// Spawn/Destroy are NATIVES: they must be driven through synthesized FFrame
+// bytecode (see spawnFX/destroyActorFX) - ProcessEvent cannot feed natives
+// their parms in this engine, which is why the first attempt always got NULL.
+static void *g_clsAimFX      = NULL;    // hgame.SpellCursorEmitter class
+static void *g_texAimFX      = NULL;   // hgame.HP_FX.Particles.Sparkle_3
+static void *g_texAimFXFr[8] = { 0 };  // sparkle frames for the cycling glow
+static int   g_nAimFXFr      = 0;      // how many frames resolved
+static int   g_offTexAimFX   = -1;     // Engine.Actor.Texture
+static int   g_offStyleAimFX = -1;     // Engine.Actor.Style (byte enum)
+static int   g_offDTAimFX    = -1;     // Engine.Actor.DrawType (byte enum)
+static int   g_offScaleAimFX = -1;     // Engine.Actor.DrawScale (float)
+static int   g_offUnlitAimFX = -1;     // Engine.Actor.bUnlit
+static int   g_offEmbAimFX   = -1;     // Engine.Emitter.Emitters (TArray)
+static int   g_offSSPAimFX   = -1;     // Engine.ParticleEmitter.StartSizeRange
+static int   g_offOpaAimFX   = -1;     // Engine.ParticleEmitter.Opacity
+static DWORD g_maskUnlitAimFX = 0;
+static BOOL  g_aimDiag      = FALSE;   // dump_objects run: probe FX classes
+static float g_dbgGlowScale = -1.0f;   // K-key A/B probe; <0 = normal pulse
+static BOOL  g_aimDiagDone  = FALSE;
+static int   g_offDeleteMe   = -1;      // Engine.Actor.bDeleteMe
+static DWORD g_maskDeleteMe  = 0;
+static int   g_offCtrlAnims = -1;     // Controller.bControlAnimations
+static DWORD g_maskCtrlAnims = 0;    // bit inside that dword
+static int   g_offDontPossess = -1;  // Pawn.bDontPossess
+static DWORD g_maskDontPossess = 0;
+static BOOL  g_fnResolved = FALSE;
+
+// Set a UE2 packed bool. BitMask is recovered from the UBoolProperty object.
+static BOOL setBoolProp(void *obj, int offset, DWORD mask, BOOL val)
+{
+    if (!obj || offset < 0 || !mask) return FALSE;
+    if (IsBadReadPtr(obj, offset + 4) || IsBadWritePtr((BYTE *)obj + offset, 4))
+        return FALSE;
+    DWORD *slot = (DWORD *)((BYTE *)obj + (offset & ~3));
+    if (val) *slot |= mask;
+    else     *slot &= ~mask;
+    return TRUE;
+}
+
+static DWORD boolBitMask(const char *path)
+{
+    void *p = findObjectByPath(path);
+    if (!p || g_propOffsetField < 0 || IsBadReadPtr(p, g_propOffsetField + 0x40))
+        return 0;
+    // UBoolProperty::BitMask sits after UProperty::Offset. Scan for a power of two.
+    for (int d = 4; d <= 0x38; d += 4) {
+        DWORD m = *(DWORD *)((BYTE *)p + g_propOffsetField + d);
+        if (m && (m & (m - 1)) == 0) return m;
+    }
+    return 1;
+}
+
+// What the renderer sees for an actor: bHidden, DrawType, Texture, DrawScale
+// and the Emitter particle array. "Alive but invisible" is exactly the
+// failure mode of a cursor emitter whose defaults carry no particles.
+static void dumpActorVisuals(void *a, const char *tag)
+{
+    static int offHidden = -2, offDrawType = -2, offTexture = -2,
+               offScale = -2, offEmitters = -2, offStyle = -2,
+               offUnlit = -2, offLoc = -2;
+    static DWORD maskHidden = 0, maskUnlit = 0;
+    if (offHidden == -2) {
+        offHidden   = propOffset("Engine.Actor.bHidden");
+        maskHidden  = boolBitMask("Engine.Actor.bHidden");
+        offDrawType = propOffset("Engine.Actor.DrawType");
+        offTexture  = propOffset("Engine.Actor.Texture");
+        offScale    = propOffset("Engine.Actor.DrawScale");
+        offEmitters = propOffset("Engine.Emitter.Emitters");
+        offStyle    = propOffset("Engine.Actor.Style");
+        offUnlit    = propOffset("Engine.Actor.bUnlit");
+        maskUnlit   = boolBitMask("Engine.Actor.bUnlit");
+        offLoc      = propOffset("Engine.Actor.Location");
+    }
+    char b[160];
+    if (!a || IsBadReadPtr(a, 0x100)) { logf_("    %-24s <unreadable>", tag); return; }
+    objName(a, b, sizeof(b));
+    logf_("    %-24s %s", tag, b);
+    if (offHidden > 0 && maskHidden && !IsBadReadPtr(a, offHidden + 4))
+        logf_("      bHidden=%d",
+              (*(DWORD *)((BYTE *)a + (offHidden & ~3)) & maskHidden) != 0);
+    if (offStyle > 0 && !IsBadReadPtr(a, offStyle + 4))
+        logf_("      Style=%d", *(int *)((BYTE *)a + offStyle));
+    if (offUnlit > 0 && maskUnlit && !IsBadReadPtr(a, offUnlit + 4))
+        logf_("      bUnlit=%d",
+              (*(DWORD *)((BYTE *)a + (offUnlit & ~3)) & maskUnlit) != 0);
+    if (offLoc > 0 && !IsBadReadPtr(a, offLoc + 12)) {
+        float *al = (float *)((BYTE *)a + offLoc);
+        logf_("      Location=(%.0f %.0f %.0f)", al[0], al[1], al[2]);
+    }
+    if (offDrawType > 0 && !IsBadReadPtr(a, offDrawType + 4))
+        logf_("      DrawType=%d", *(int *)((BYTE *)a + offDrawType));
+    if (offTexture > 0 && !IsBadReadPtr(a, offTexture + 4)) {
+        void *tex = *(void **)((BYTE *)a + offTexture);
+        logf_("      Texture=%s", tex ? objName(tex, b, sizeof(b)) : "(none)");
+    }
+    if (offScale > 0 && !IsBadReadPtr(a, offScale + 4))
+        logf_("      DrawScale=%.2f", *(float *)((BYTE *)a + offScale));
+    static int offCursorParts = -2, offParticleType = -2,
+               offCtrlCursor = -2, offCtrlKCursor = -2;
+    if (offCursorParts == -2) {
+        offCursorParts   = propOffset("hgame.SpellCursor.CursorParticles");
+        offParticleType  = propOffset("hgame.SpellCursor.particleType");
+        offCtrlCursor    = propOffset("KWGame.KWHeroController.Cursor");
+        offCtrlKCursor   = propOffset("KWGame.KWHeroController.KCursor");
+    }
+    if (offEmitters > 0 && !IsBadReadPtr(a, offEmitters + 12)) {
+        void **data = *(void ***)((BYTE *)a + offEmitters);
+        int num = *(int *)((BYTE *)a + offEmitters + 4);
+        int max = *(int *)((BYTE *)a + offEmitters + 8);
+        // Only trust the array when it looks like one: a non-Emitter actor
+        // read at the Emitters offset yields garbage Num/Max, and walking
+        // that Data pointer hangs GetFullName (froze two diag runs).
+        if (num > 0 && num <= 64 && max > 0 && max <= 64) {
+            logf_("      Emitters: Data=%p Num=%d Max=%d", (void *)data, num, max);
+            for (int e = 0; e < num && e < 3; e++)
+                if (data && !IsBadReadPtr(data, 4 * (e + 1)) && data[e])
+                    logf_("        [%d] %s", e, objName(data[e], b, sizeof(b)));
+        } else {
+            logf_("      Emitters: (not an Emitter: Num=%d Max=%d)", num, max);
+        }
+    }
+    // SpellCursor-family fields - only meaningful on SpellCursor actors
+    // (class token is objName's first word), so gate on it.
+    {
+        const char *spc = strchr(b, ' ');
+        size_t clt = spc ? (size_t)(spc - b) : 0;
+        BOOL isSpellCursor = (clt == 11 && !strncmp(b, "SpellCursor", 11));
+        BOOL isController  = (clt > 10 && strstr(b + clt - 10, "Controller") == b + clt - 10);
+        if (isSpellCursor && offCursorParts > 0 &&
+            !IsBadReadPtr(a, offCursorParts + 4)) {
+            void *cp = *(void **)((BYTE *)a + offCursorParts);
+            logf_("      CursorParticles=%p%s", cp,
+                  (cp && !IsBadReadPtr(cp, 8)) ? objName(cp, b, sizeof(b)) : "");
+        }
+        if (isSpellCursor && offParticleType > 0 &&
+            !IsBadReadPtr(a, offParticleType + 4)) {
+            void *pt = *(void **)((BYTE *)a + offParticleType);
+            logf_("      particleType=%p%s", pt,
+                  (pt && !IsBadReadPtr(pt, 8)) ? objName(pt, b, sizeof(b)) : "");
+        }
+        if (isController && offCtrlCursor > 0 &&
+            !IsBadReadPtr(a, offCtrlCursor + 4)) {
+            void *cc = *(void **)((BYTE *)a + offCtrlCursor);
+            logf_("      ctrl.Cursor=%p%s", cc,
+                  (cc && !IsBadReadPtr(cc, 8)) ? objName(cc, b, sizeof(b)) : "");
+        }
+    }
+    if (g_offDeleteMe > 0 && g_maskDeleteMe &&
+        !IsBadReadPtr(a, g_offDeleteMe + 4))
+        logf_("      bDeleteMe=%d",
+              (*(DWORD *)((BYTE *)a + (g_offDeleteMe & ~3)) & g_maskDeleteMe) != 0);
+}
+
+// Live cursor ACTORS (first objName token = class name): does the game keep
+// a persistent cursor actor we could learn from (or reuse)? Matching on the
+// class token keeps States/Structs/Properties out of the visual dump.
+static void dumpCursorInstances(void)
+{
+    if (!g_objArray) return;
+    int n = g_objArray->Num; if (n <= 0 || n > 400000) return;
+    char buf[300]; int shown = 0;
+    logf_("--- live cursor-ish objects ---");
+    for (int i = 0; i < n && shown < 24; i++) {
+        void *o = g_objArray->Data[i]; if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        const char *sp = strchr(buf, ' '); if (!sp) continue;
+        size_t cl = sp - buf;
+        if (!(cl == 11 && !strncmp(buf, "SpellCursor", 11)) &&
+            !(cl == 17 && !strncmp(buf, "SpellCursorEmitter", 17)) &&
+            !(cl == 12 && !strncmp(buf, "SelectCursor", 12)) &&
+            !(cl == 8  && !strncmp(buf, "KWCursor", 8)) &&
+            !(cl == 7  && !strncmp(buf, "HCursor", 7)) &&
+            !(cl == 17 && !strncmp(buf, "KWHeroController", 17)) &&
+            !(cl == 17 && !strncmp(buf, "HPHeroController", 17)) &&
+            !(cl == 18 && !strncmp(buf, "HPPlayerController", 18))) continue;
+        dumpActorVisuals(o, buf);
+        shown++;
+    }
+    logf_("--- %d live cursor objects ---", shown);
+}
+
+// Cursor/emitter knowledge for the aim glow: classes, full property lists of
+// the cursor classes and of Engine.Emitter, and any cursor-named property.
+static void dumpCursorSigs(void)
+{
+    logf_("--- cursor/emitter diagnostics ---");
+    dumpClassesMatching("Cursor");
+    dumpFunctionSig("KWGame.KWHeroController.makeCursor");
+    dumpClassPropsFull("hgame.SpellCursorEmitter");
+    dumpClassPropsFull("hgame.SpellCursor");
+    dumpClassPropsFull("hgame.HCursor");
+    dumpClassPropsFull("KWGame.HCursor");
+    dumpClassPropsFull("Engine.Emitter");
+    dumpPropsAny("Cursor");
+    dumpCursorInstances();
+    logf_("--- cursor diagnostics end ---");
+}
+
+static void resolveActions(void)
+{
+    if (g_fnResolved) return;
+    g_fnResolved = TRUE;
+    g_fnJump    = findObjectByPath("KWGame.KWPawn.DoJump_Player");
+    if (!g_fnJump) g_fnJump = findObjectByPath("Engine.Pawn.DoJump");
+    g_fnFire    = findObjectByPath("KWGame.KWPawn.PressedFire");
+    g_fnFireRel = findObjectByPath("KWGame.KWPawn.ReleasedFire");
+    g_fnCast      = findObjectByPath("hgame.HPCharacter.castSpell");
+    g_fnChoose    = findObjectByPath("hgame.HPCharacter.ChooseSpell");
+    g_fnStartCast = findObjectByPath("hgame.HPCharacter.StartCasting");
+    g_fnStopCast  = findObjectByPath("hgame.HPCharacter.StopCasting");
+    g_fnCharFire  = findObjectByPath("hgame.HPCharacter.Fire");
+    g_fnCanCast   = findObjectByPath("hgame.HPCharacter.canCast");
+    g_fnTrigger   = findObjectByPath("KWGame.KWPawn.Trigger");
+    if (!g_fnTrigger) g_fnTrigger = findObjectByPath("Engine.Pawn.Trigger");
+    g_fnPickup    = findObjectByPath("KWGame.KWPawn.PickupActor");
+    g_fnCanPickup = findObjectByPath("KWGame.KWPawn.CanDoPickupActor");
+    g_fnUnPossess = findObjectByPath("Engine.Controller.UnPossess");
+    // The companion's controller OVERRIDES UnPossess. ProcessEvent dispatches
+    // exactly the UFunction it is handed, so calling the base version runs a
+    // partial teardown - always prefer the most-derived override.
+    g_fnUnPossessAI = findObjectByPath("hgame.HPCompanionController.UnPossess");
+    if (!g_fnUnPossessAI)
+        g_fnUnPossessAI = findObjectByPath("hgame.HPAIController.UnPossess");
+    g_fnPossessAI   = findObjectByPath("hgame.HPAIController.Possess");
+    g_fnStopTrail   = findObjectByPath("hgame.HPCompanionController.OnStopTrailingLeadChar");
+    g_fnStopTrailKW = findObjectByPath("KWGame.KWAIController.StopTrailingLeadChar");
+    if (!g_fnStopTrailKW)
+        g_fnStopTrailKW = findObjectByPath("KWGame.KWAIController.OnStopTrailingLeadChar");
+    g_fnDropTrail   = findObjectByPath("KWGame.KWPawn.DropTrailingChar");
+    g_offFollowRadius = propOffset("KWGame.KWAIController.TrailCharFollowRadius");
+    g_offLeadChar     = propOffset("KWGame.KWAIController.LeadChar");
+    g_offUseDistLead  = propOffset("KWGame.KWAIController.bUseDistFromLeadCharForMovement");
+    g_maskUseDistLead = boolBitMask("KWGame.KWAIController.bUseDistFromLeadCharForMovement");
+    g_offTrailingChar = propOffset("KWGame.KWPawn.TrailingChar");
+    logf_("[leash] StopTrailKW=%p DropTrail=%p FollowRadius=+0x%X LeadChar=+0x%X "
+          "UseDistLead=+0x%X mask=0x%lX TrailingChar=+0x%X",
+          g_fnStopTrailKW, g_fnDropTrail, g_offFollowRadius, g_offLeadChar,
+          g_offUseDistLead, (unsigned long)g_maskUseDistLead, g_offTrailingChar);
+    g_fnIdleWander  = findObjectByPath("hgame.HPAIController.GotoIdleWanderStateFromTrailLeadChar");
+    g_fnRandIdle    = findObjectByPath("hgame.HPAIController.GotoStateRandomIdleAnim");
+    g_fnSpawnSpell = findObjectByPath("hgame.HPPawn.SpawnSpell");
+    g_fnHasSpell   = findObjectByPath("hgame.HPCharacter.HasSpell");
+    g_fnPlayCast     = findObjectByPath("hgame.HPCharacter.playCast");
+    g_fnPlayCastAim  = findObjectByPath("hgame.HPCharacter.playCastAim");
+    g_fnFinalize     = findObjectByPath("hgame.HPCharacter.finalizeSpell");
+    g_fnBlendOut     = findObjectByPath("hgame.HPCharacter.blendOutCast");
+    g_fnIsAiming     = findObjectByPath("hgame.HPCharacter.IsAimingOrCasting");
+    g_fnShowWeapon   = findObjectByPath("hgame.HPCharacter.ShowWeapon");
+    g_fnCharRelFire  = findObjectByPath("hgame.HPCharacter.ReleasedFire");
+    g_fnChangeAnim   = findObjectByPath("KWGame.KWPawn.ChangeAnimation");
+    g_fnAnimEnd      = findObjectByPath("hgame.HPCharacter.AnimEnd");
+    g_fnPlayIdle     = findObjectByPath("KWGame.KWPawn.PlayIdle");
+    g_fnGotoGround   = findObjectByPath("KWGame.KWPawn.GotoDefaultGroundMovementState");
+    g_fnPlayJump     = findObjectByPath("KWGame.KWPawn.PlayJump");
+    g_fnPlayWaiting  = findObjectByPath("KWGame.KWPawn.PlayWaiting");
+    g_fnSwitchFight  = findObjectByPath("hgame.HPCharacter.SwitchToFightStanceAnims");
+    g_fnSwitchNormal = findObjectByPath("hgame.HPCharacter.SwitchToNormalStanceAnims");
+    g_offCurrentSpell = propOffset("hgame.HPCharacter.currentSpell");
+    g_offSpellTarget  = propOffset("hgame.HPCharacter.spellTarget");
+    g_offProjSpeed    = propOffset("Engine.Projectile.Speed");
+    g_offProjMaxSpeed = propOffset("Engine.Projectile.MaxSpeed");
+    g_offCtrlAnims    = propOffset("Engine.Controller.bControlAnimations");
+    g_maskCtrlAnims   = boolBitMask("Engine.Controller.bControlAnimations");
+    g_offDontPossess  = propOffset("Engine.Pawn.bDontPossess");
+    g_maskDontPossess = boolBitMask("Engine.Pawn.bDontPossess");
+    g_clsAimFX      = findObjectByPath("hgame.SpellCursorEmitter");
+    // v16: the particle path (DrawType=10) never showed on hardware even
+    // with a configured SpriteEmitter - this build's GameFX rendering seems
+    // to need game-side registration. Render the glow as a plain sprite
+    // instead (the same path the game's own hidden SpellCursor0 uses):
+    // the game's own sparkle texture, translucent, unlit, softly pulsing.
+    g_texAimFX      = findObjectByPath("hgame.HP_FX.Particles.Sparkle_3");
+    // v17: sparkle frames - cycle them while aiming so the marker actually
+    // sparkles instead of sitting as one flat image.
+    for (int s = 1; s <= 8; s++) {
+        char path[80];
+        _snprintf(path, sizeof(path), "hgame.HP_FX.Particles.Sparkle_%d", s);
+        void *t = findObjectByPath(path);
+        if (t && g_nAimFXFr < 8) {
+            g_texAimFXFr[g_nAimFXFr++] = t;
+            char tb[160];
+            logf_("[aimfx] sparkle frame: %s", objName(t, tb, sizeof(tb)));
+        }
+    }
+    if (!g_nAimFXFr && g_texAimFX) g_texAimFXFr[g_nAimFXFr++] = g_texAimFX;
+    g_offTexAimFX   = propOffset("Engine.Actor.Texture");
+    g_offStyleAimFX = propOffset("Engine.Actor.Style");
+    g_offDTAimFX    = propOffset("Engine.Actor.DrawType");
+    g_offScaleAimFX = propOffset("Engine.Actor.DrawScale");
+    g_offUnlitAimFX = propOffset("Engine.Actor.bUnlit");
+    g_offEmbAimFX   = propOffset("Engine.Emitter.Emitters");
+    g_offSSPAimFX   = propOffset("Engine.ParticleEmitter.StartSizeRange");
+    g_offOpaAimFX   = propOffset("Engine.ParticleEmitter.Opacity");
+    g_maskUnlitAimFX = boolBitMask("Engine.Actor.bUnlit");
+    g_offDeleteMe   = propOffset("Engine.Actor.bDeleteMe");
+    g_maskDeleteMe  = boolBitMask("Engine.Actor.bDeleteMe");
+    logf_("[actions] playCast=%p playCastAim=%p finalize=%p blendOut=%p "
+          "IsAiming=%p ShowWeapon=%p ChangeAnim=%p PlayJump=%p",
+          g_fnPlayCast, g_fnPlayCastAim, g_fnFinalize, g_fnBlendOut,
+          g_fnIsAiming, g_fnShowWeapon, g_fnChangeAnim, g_fnPlayJump);
+    logf_("[actions] bControlAnimations offset=+0x%X mask=0x%lX "
+          "bDontPossess offset=+0x%X mask=0x%lX",
+          g_offCtrlAnims, (unsigned long)g_maskCtrlAnims,
+          g_offDontPossess, (unsigned long)g_maskDontPossess);
+    logf_("[actions] DoJump=%p PressedFire=%p ReleasedFire=%p ProcessEvent=%p",
+          g_fnJump, g_fnFire, g_fnFireRel, (void *)g_ProcessEvent);
+    logf_("[actions] aimfx: execSpawn=%p execDestroy=%p NameConst=%d "
+          "SpellCursorEmitter=%p bDeleteMe=+0x%X/0x%lX",
+          (void *)g_execSpawn, (void *)g_execDestroy, g_opNameConst, g_clsAimFX,
+          g_offDeleteMe, (unsigned long)g_maskDeleteMe);
+    {
+        char tb[160];
+        logf_("[actions] aimfx sparkle frames=%d AnimEnd=%p PlayIdle=%p GotoGround=%p",
+              g_nAimFXFr, g_fnAnimEnd, g_fnPlayIdle, g_fnGotoGround);
+        logf_("[actions] aimfx visual: tex=%s texOff=+0x%X styleOff=+0x%X "
+              "dtOff=+0x%X scaleOff=+0x%X unlit=+0x%X/0x%lX",
+              g_texAimFX ? objName(g_texAimFX, tb, sizeof(tb)) : "<MISSING>",
+              g_offTexAimFX, g_offStyleAimFX, g_offDTAimFX, g_offScaleAimFX,
+              g_offUnlitAimFX, (unsigned long)g_maskUnlitAimFX);
+    }
+    logf_("[actions] castSpell=%p ChooseSpell=%p StartCasting=%p StopCasting=%p "
+          "HPChar.Fire=%p canCast=%p", g_fnCast, g_fnChoose, g_fnStartCast,
+          g_fnStopCast, g_fnCharFire, g_fnCanCast);
+    {   // castSpell takes a ClassProperty, so a real spell class is required.
+        // Companions start with currentSpell == NULL, which is precisely why
+        // PressedFire produced no visible effect.
+        static const char *spells[] = {
+            "hgame.RictusempraSpell", "hgame.DepulsoSpell", "hgame.SpongifySpell",
+            "hgame.LumosSpell", "hgame.AlohomoraSpell", "hgame.GlaciusSpell",
+            "hgame.IncendioSpell", "hgame.LapiforsSpell", "hgame.baseSpell", NULL };
+        char b[160];
+        for (int i = 0; spells[i]; i++) {
+            void *c = findObjectByPath(spells[i]);
+            logf_("    spell class %-26s -> %p", spells[i], c);
+            if (c && !g_defaultSpell) g_defaultSpell = c;
+        }
+        // Whatever the lead character currently has selected beats our guess.
+        void *lead = findActorByClass("harry");
+        if (lead && g_offCurrentSpell > 0 && !IsBadReadPtr(lead, g_offCurrentSpell + 4)) {
+            void *cs = *(void **)((BYTE *)lead + g_offCurrentSpell);
+            logf_("    lead(harry) currentSpell = %s",
+                  cs ? objName(cs, b, sizeof(b)) : "<null>");
+            if (cs) g_defaultSpell = cs;
+        }
+        logf_("    ==> default spell class = %s",
+              g_defaultSpell ? objName(g_defaultSpell, b, sizeof(b)) : "<NONE>");
+    }
+    logf_("[actions] UnPossess(base)=%p UnPossess(HPAIController)=%p "
+          "StopTrailing=%p IdleWander=%p RandomIdle=%p", g_fnUnPossess,
+          g_fnUnPossessAI, g_fnStopTrail, g_fnIdleWander, g_fnRandIdle);
+    logf_("[actions] Trigger=%p PickupActor=%p CanDoPickup=%p UnPossess=%p "
+          "currentSpell=+0x%X spellTarget=+0x%X", g_fnTrigger, g_fnPickup,
+          g_fnCanPickup, g_fnUnPossess, g_offCurrentSpell, g_offSpellTarget);
+}
+
+// Invoke a script function on a pawn. Params block is zeroed and generously
+// oversized so any small signature is satisfied safely.
+static void callFn(void *obj, void *fn, const char *tag)
+{
+    if (!obj || !fn || !g_ProcessEvent) return;
+    BYTE parms[256];
+    memset(parms, 0, sizeof(parms));
+    logf_("    -> ProcessEvent %s", tag);
+    g_ProcessEvent(obj, NULL, fn, parms, NULL);
+}
+
+// Script field offsets, all resolved BY NAME via UProperty::Offset.
+static struct {
+    BOOL ok;
+    int  Location, Rotation, Velocity, Acceleration, Physics;
+    int  PawnController;      // Pawn.Controller
+    int  ControllerPawn;      // Controller.Pawn
+    int  GroundSpeed, JumpZ, AccelRate;
+    int  LifeSpan, Base;
+    int  DesiredRotation, RotationRate;   // v12: pin during standing jump
+} F = { FALSE };
+
+// Same, but with a caller-supplied parameter block (and it reports the block
+// back, so return values can be read out of it).
+static void callFnP(void *obj, void *fn, void *parms, int size, const char *tag)
+{
+    if (!obj || !fn || !g_ProcessEvent) { logf_("    !! %s unavailable", tag); return; }
+    g_ProcessEvent(obj, NULL, fn, parms, NULL);
+    char h[128]; int c = 0;
+    for (int i = 0; i < size && i < 24 && c < 100; i++)
+        c += sprintf(h + c, "%02X ", ((BYTE *)parms)[i]);
+    logf_("    -> %s  parms[%s]", tag, h);
+}
+
+// Pick something worth casting at. A companion's natural targets in this game
+// are the level's spell triggers (HP3_InsideHub ships eight of them), so the
+// aim search walks the object table for those, keeps the ones inside a forward
+// cone and within reach, and confirms line of sight with a FastTrace.
+// A spell target is either one of the level's cast triggers or another
+// character. Self is never a candidate.
+static BOOL isAimCandidate(const char *fullName, void *o, void *self)
+{
+    if (o == self) return FALSE;
+    if (strstr(fullName, "SpellTrigger ")) return TRUE;
+    for (int c = 0; c < 8 && kCharClass[c]; c++) {
+        size_t L = strlen(kCharClass[c]);
+        if (!strncmp(fullName, kCharClass[c], L) && fullName[L] == ' ') return TRUE;
+    }
+    return FALSE;
+}
+
+// v18: exclude the OTHER players' pawns from the auto-aim cone - in split
+// screen they are always within reach of each other and the cone happily
+// locked onto Ron/Harry instead of what the caster is looking at.
+static void *findAimTarget(void *pawn, float *outDist, BOOL verbose)
+{
+    if (!g_objArray || F.Location <= 0) return NULL;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000) return NULL;
+
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    int   *pr = (int *)  ((BYTE *)pawn + F.Rotation);
+    double yaw = pr[1] * (6.283185307179586 / 65536.0);
+    float fx = (float)cos(yaw), fy = (float)sin(yaw);
+    float chest[3] = { pl[0], pl[1], pl[2] + 40.0f };
+
+    const float REACH = 3000.0f, MINDOT = 0.5f;   // ~60 degree cone
+    void *best = NULL; float bestScore = -1.0f, bestDist = 0.0f;
+    char buf[300];
+
+    for (int i = 0; i < n; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        BOOL isPlayer = FALSE;
+        for (int p = 0; p < 8; p++) if (g_pawn[p] && g_pawn[p] == o) { isPlayer = TRUE; break; }
+        if (isPlayer) continue;
+        objName(o, buf, sizeof(buf));
+        if (!isAimCandidate(buf, o, pawn)) continue;
+        if (IsBadReadPtr(o, F.Location + 12)) continue;
+        float *tl = (float *)((BYTE *)o + F.Location);
+        float dx = tl[0] - pl[0], dy = tl[1] - pl[1], dz = tl[2] - pl[2];
+        float d = (float)sqrt(dx * dx + dy * dy + dz * dz);
+        if (d < 1.0f || d > REACH) continue;
+        float dot = (dx * fx + dy * fy) / d;               // forward cone test
+        if (dot < MINDOT) continue;
+        float tgt[3] = { tl[0], tl[1], tl[2] };
+        if (!fastTraceClear(pawn, chest, tgt)) continue;   // needs line of sight
+        float score = dot - d / (REACH * 4.0f);            // straight ahead & near
+        if (score > bestScore) { bestScore = score; best = o; bestDist = d; }
+    }
+    // Nothing in the cone: report the nearest candidate anyway, so a run that
+    // finds no target can be told apart from a level that simply has none.
+    if (!best && verbose) {
+        void *nearestTrig = NULL; float nd = 1e9f; int seen = 0;
+        for (int i = 0; i < n; i++) {
+            void *o = g_objArray->Data[i]; if (!o) continue;
+            objName(o, buf, sizeof(buf));
+            if (!strstr(buf, "SpellTrigger ")) continue;
+            if (IsBadReadPtr(o, F.Location + 12)) continue;
+            seen++;
+            float *tl = (float *)((BYTE *)o + F.Location);
+            float dx = tl[0]-pl[0], dy = tl[1]-pl[1], dz = tl[2]-pl[2];
+            float d = (float)sqrt(dx*dx + dy*dy + dz*dz);
+            if (d < nd) { nd = d; nearestTrig = o; }
+        }
+        if (nearestTrig) logf_("    aim: %d spell triggers in level, nearest %s at %.0f units",
+                        seen, objName(nearestTrig, buf, sizeof(buf)), nd);
+        else      logf_("    aim: no spell triggers in this level at all");
+    }
+    if (outDist) *outDist = bestDist;
+    return best;
+}
+
+// A companion pawn has no spell selected, which is exactly why PressedFire
+// produced no effect. Borrow the lead character's currentSpell class (or any
+// spell class we found) and select it on this pawn first.
+static void *spellClassFor(void *pawn)
+{
+    if (g_offCurrentSpell <= 0 || !pawn) return NULL;
+    void *cls = *(void **)((BYTE *)pawn + g_offCurrentSpell);
+    if (cls) return cls;
+    if (g_pawn[0] && !IsBadReadPtr(g_pawn[0], g_offCurrentSpell + 4)) {
+        cls = *(void **)((BYTE *)g_pawn[0] + g_offCurrentSpell);
+        if (cls) return cls;
+    }
+    return g_defaultSpell;
+}
+
+// Player 2..N spellcast, through the pawn's own script so animation, sound and
+// the spell actor all spawn the way the game intends.
+// A cast that is started but never ended leaves its effect actor attached to
+// the caster -- the "bright red light stuck under player 2". The game normally
+// ends the cast from its own state machine, which companions do not run while
+// we are driving them, so we close it ourselves a beat later.
+static DWORD g_castPending[8] = {0};
+static float g_restZ[8]  = {0};        // v35: last healthy standing height
+static float g_restXY[8][2];           // v35: where that height was sampled
+static float g_restRing[8][8][3];      // v36 [player][slot] x,y,z samples
+static BYTE   g_restRingPost[8][8];    // v37: slot sampled AFTER a cast
+                                       // settled = the TRUE physics-rest Z
+                                       // (standing-idle Z reads ~0.25 high;
+                                       // the v36 hw "already level" cast
+                                       // STILL fell 2.25u and bounced)
+static int    g_restRingN[8];           // v36: fills per healthy frame, wraps
+static BOOL   g_postPush[8];            // v37: post-exit sample latch/cast
+// v38 HOPKILL: per-pawn suppress window. Armed every time OUR cleanup chain
+// fires for that pawn (single-pass exit / phase B / retry / flap-retry /
+// rescue); the PERMANENT pelogDetour then swallows the engine's
+// PlayFalling + PlayLandingAnimation storm for this pawn until the stamp
+// expires. The v37 hw log proved the storm IS the visible hop
+// (BaseChange -> PlayFalling +15ms -> landing x4 in 31ms; height acquitted:
+// "already level" casts still fell). Window 1500ms covers
+// exit(+0) -> PlayFalling(+15) -> landing storm(+100..300) with margin.
+static DWORD g_suppressLandUntil[8] = {0}; // GetTickCount()+1500 at arm
+static DWORD g_hopkillT0[8]         = {0}; // log base: the chain-fire moment
+// v39 state telemetry, harvested from the SAME permanent detour (the state
+// pointer lives in a heap frame - pawn scan useless on hw - but the state's
+// own script events are all visible here; this is the InState()-style API
+// the handoff called the future one):
+static DWORD g_animEndAt[8]   = {0}; // first post-release StateCasting.AnimEnd
+static BOOL  g_settleAlign[8] = {0}; // v40: one anim re-pick per cast
+static DWORD g_chainAbsAt[8]  = {0}; // v46: ABSOLUTE tick of the last exit
+                                     // attempt (stamped in armHopKill); the
+                                     // re-pick runs on this, never on the
+                                     // pending clock a re-cast resets
+static DWORD g_chainFireAt[8] = {0}; // v46: the pending stamp this exit
+                                     // belongs to; a newer fire vetoes
+static BOOL  g_realignNeed[8] = {0}; // v47: ARMED by the detour when it sees
+                                     // OUR StateCasting.EndState; executed by
+                                     // driveePawn when every guard holds
+static DWORD g_ownCastAt[8] = {0};  // v47: tick of the mod's OWN beginCast()
+                                     // (the cleanup chain re-cast). The
+                                     // settle re-sync must never run during
+                                     // one of OUR casts - this clock is
+                                     // written by the caller itself, so it
+                                     // needs no engine telemetry at all.
+static DWORD g_needAt[8]    = {0};  // v47: ARM-TIME binding of the need - the
+static DWORD g_needBegin[8] = {0};  // need belongs to ONE exit; chainAbs can
+static DWORD g_needBind[8]  = {0};  // be re-stamped by a later chain, so the
+                                     // executor compares against THESE, never
+                                     // against the live clocks.
+static DWORD g_lastMoveAt[8]  = {0}; // v46: last tick with movement input
+static int   g_castExitAdj    = 90;  // v40: AnimEnd->exit gap (ini CastExitAdj)
+static int   g_meshOff        = -2;  // v41: Engine.Actor.Mesh property offset
+static int   g_viewYaw[8]     = {0}; // (moved up from driveePawn for v41)
+static DWORD g_lastAirAt[8]   = {0}; // v42: last tick the pawn was airborne
+                                     // (phys==2); forced exits need a 1.2s
+                                     // clearance after the last air frame
+static DWORD g_holdWalkUntil[8] = {0}; // v43: preemptive Walking hold window
+static BOOL  g_holdArmed[8]     = {0}; // v43: a 5/6 cluster is being held
+static BOOL  g_holdResync[8]    = {0}; // v43: anim re-sync done for cluster
+
+// v41: mesh component yaw minus actor yaw, wrapped to -32768..32767.
+// -99999 = unreadable (mesh prop unresolved / bad pointer).
+static int meshYawDelta(void *pawn, int actorYaw)
+{
+    if (g_meshOff <= 0 || F.Rotation <= 0 || !pawn ||
+        IsBadReadPtr(pawn, g_meshOff + 4))
+        return -99999;
+    void *mesh = *(void **)((BYTE *)pawn + g_meshOff);
+    if (!mesh || IsBadReadPtr(mesh, F.Rotation + 12))
+        return -99999;
+    int my = *(int *)((BYTE *)mesh + F.Rotation + 4);
+    int d = (my - actorYaw) & 65535;
+    if (d > 32767) d -= 65536;
+    return d;
+}
+static DWORD g_castTickAt[8]  = {0}; // last StateCasting.Tick seen (alive = stuck)
+static DWORD g_beginCastAt[8] = {0}; // last StateCasting.BeginState (fresh cast)
+static void armHopKill(int i)
+{
+    if (i < 0 || i >= 8) return;
+    DWORD now = GetTickCount();
+    g_suppressLandUntil[i] = now + 1500;
+    g_hopkillT0[i]         = now;
+    g_chainAbsAt[i]        = now;   // v46: re-pick + late re-sync base
+    g_chainFireAt[i]       = g_castPending[i];   // v46: exit<-cast binding
+}
+static void *g_castActor[8]   = {NULL};
+static float g_castSpawnLoc[8][3];
+static BYTE  g_castPhys0[8]   = {0};    // v20: phys at fire time (blip guard)
+static BOOL  g_castLoggedFly[8] = {0};
+extern volatile LONG g_p2Moving[8];   // set per frame by driveePawn (below)
+static BOOL aimGlowAlive(int i);      // fwd: glow actor alive == aiming now
+static DWORD g_aimFXAt[8] = {0};      // v29: glow spawn tick (race fix:
+                                      // only THIS cast's glow may block the
+                                      // cleanup chain - a newer one is the
+                                      // next aim and must not)
+static float g_aimLast[8][3];         // v26: real aim point (pane restore)
+
+// v35: PRE-EXIT FLOOR SETTLE - the hop, decoded from the v34 hw log:
+//   frozen in cast at Z=874.8 (phys=0, cast pose holds her ~1 unit up)
+//   -> exit re-engages physics -> she FALLS to 873.8 in one frame
+//   -> floor snaps her back up to 874.5. That dip-and-bounce IS the
+//   visible hop. Restoring her last healthy standing height BEFORE the
+//   exit makes the floor check pass on frame one: no fall, no snap.
+//   A bounded Location write (the one class hardware honors), once per
+//   cast - physics itself is never touched (v21 lesson).
+static void settleBeforeExit(int i, void *pawn)
+{
+    if (i < 0 || i >= 8 || !pawn) return;
+    if (F.Location <= 0 || IsBadWritePtr((BYTE *)pawn + F.Location, 12))
+        return;
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    // v36: pick the NEAREST standing sample (ring of last 8) - the v35
+    // single-sample version silently skipped on hardware because the
+    // user walks stairs/ramps and the last sample went stale or out of
+    // range (zero [settle] lines in the whole hw log).
+    int   best = -1, bestPost = -1;
+    float bestD = 1e30f, bestPostD = 1e30f;
+    if (g_restRingN[i] > 0) {
+        for (int k = 0; k < 8; k++) {
+            int slot = (g_restRingN[i] - 1 - k + 64) % 8;
+            float dx = pl[0] - g_restRing[i][slot][0];
+            float dy = pl[1] - g_restRing[i][slot][1];
+            float d2 = dx*dx + dy*dy;
+            if (d2 < bestD) { bestD = d2; best = slot; }
+            if (g_restRingPost[i][slot] && d2 < bestPostD)
+                { bestPostD = d2; bestPost = slot; }
+        }
+    }
+    // v37: a post-exit sample IS the physics-rest height at that spot -
+    // prefer it (the engine itself settled there after the last cast).
+    BOOL bestIsPost = FALSE;                 // v38: damper flag
+    if (bestPost >= 0 && bestPostD <= 450.0f*450.0f) {
+        best  = bestPost;
+        bestD = bestPostD;
+        bestIsPost = TRUE;
+    }
+    if (best < 0) {
+        logf_("    [settle] p%d skip: no standing samples yet "
+              "(exitZ=%.2f)", i, pl[2]);
+        return;
+    }
+    if (bestD > 450.0f*450.0f) {
+        logf_("    [settle] p%d skip: nearest sample %.0f units away "
+              "(exitZ=%.2f)", i, sqrtf(bestD), pl[2]);
+        return;
+    }
+    // v38 damper (HANDOFF item 2): at exit sit a hair (0.1u) BELOW the
+    // physics-rest sample so the state exit's forced Falling frame
+    // re-glues to the floor almost instantly (smaller raw oscillation).
+    // Suppression ([hopkill]) is the primary fix; this only shrinks the
+    // raw dip that remains visible before/around the swallowed frames.
+    float targetZ = g_restRing[i][best][2];
+    if (bestIsPost) targetZ -= 0.1f;
+    float oldZ = pl[2];
+    float dz = oldZ - targetZ;
+    if (dz < -4.0f || dz > 4.0f) {
+        logf_("    [settle] p%d skip: dz=%.2f out of sanity range "
+              "(sample %.2f vs now %.2f)", i, dz,
+              g_restRing[i][best][2], oldZ);
+        return;   // v45: need-flag stays TRUE -> re-pick will cover it
+    }
+    if (fabsf(dz) < 0.05f) {
+        logf_("    [settle] p%d already level (%.2f)", i, oldZ);
+        return;
+    }
+    pl[2] = targetZ;
+    logf_("    [settle] p%d Z %.2f -> %.2f (pre-exit floor settle%s, "
+          "%.2f to drop, sample %.0fu away)", i, oldZ, pl[2],
+          bestIsPost ? ", damper -0.1" : "", dz,
+          sqrtf(bestD));
+}
+
+// v34: the chain fired but the state did not leave (v33 hw log: stuck
+// with chain=full delay=1200 present). Same chain, different boots,
+// different outcomes - the exit lands on varying anim/state phases. Fix:
+// READ the pawn's current-state pointer and retry the exit until it
+// actually leaves StateCasting (verification, not blind extra exits -
+// v26 proved blind extra exits hang). Discovery: find the StateCasting
+// state object, scan the pawn for a pointer to it (also try the ground
+// state; states may live in a heap frame instead - then we fall back).
+static void *s_stateCasting = NULL;
+static void *s_stateGround  = NULL;
+static int   s_stateOff     = -2;   // -2 undiscovered, -1 not found
+
+static void discoverStateField(void *pawn)
+{
+    if (s_stateOff != -2 || !pawn) return;
+    s_stateCasting = findObjectByPath("hgame.HPCharacter.StateCasting");
+    s_stateGround  = findObjectByPath("KWGame.KWPawn.StateGroundMovement");
+    if (!s_stateCasting && !s_stateGround) {
+        s_stateOff = -1;
+        logf_("[castverify] state objects not found - verify off");
+        return;
+    }
+    for (int pass = 0; pass < 2 && s_stateOff < 0; pass++) {
+        void *want = pass ? s_stateGround : s_stateCasting;
+        if (!want) continue;
+        for (int off = 0x40; off < 0x1800; off += 4) {
+            if (IsBadReadPtr((BYTE *)pawn + off, 4)) break;
+            if (*(void **)((BYTE *)pawn + off) == want) {
+                s_stateOff = off;
+                logf_("[castverify] state field at +%#x (%s now)",
+                      off, pass ? "ground" : "StateCasting");
+                return;
+            }
+        }
+    }
+    s_stateOff = -1;
+    logf_("[castverify] state pointer not in pawn memory - verify off "
+          "(state lives in a heap frame; next step would be InState())");
+}
+
+static void finishPendingCasts(void)
+{
+    DWORD now = GetTickCount();
+    for (int i = 1; i < 8; i++) {
+        if (!g_castPending[i]) continue;
+        void *pawn = g_pawn[i];
+        DWORD age = now - g_castPending[i];
+
+        // v20: watch the caster for ~1.6s after every cast - the v19
+        // hardware report was "she plays a slight jump animation, as if she
+        // falls through the ground for a second", and the hw log carried a
+        // phys=2 (Falling) blip with vz=-31 right at the +1.2s cleanup
+        // moment. Sample every 100ms so the next hardware log shows the
+        // whole story even at 2s telemetry granularity.
+        if (pawn && F.Location > 0 && age < 3000 &&
+            !IsBadReadPtr(pawn, F.Location + 12)) {
+            static DWORD sWAt[8] = { 0 };
+            // v20 continuous Falling-blip guard: any moment in the 1.6s
+            // window where she goes Falling with a small downward vz while
+            // nobody is jumping (and she was NOT Falling when the spell
+            // left) gets put straight back - covers both the cast script's
+            // own state exit and the +1.2s cleanup chain.
+            BYTE cgPh = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+            BOOL jumping = keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) ||
+                           g_padJump[i];
+            // v22: no phys intervention here (see the guard-removal note in
+            // the cleanup chain) - the watch below only RECORDS.
+            (void)cgPh; (void)jumping;
+            if (now - sWAt[i] >= 100) {
+                sWAt[i] = now;
+                float *wl = (float *)((BYTE *)pawn + F.Location);
+                float wv = (F.Velocity > 0 &&
+                            !IsBadReadPtr(pawn, F.Velocity + 12))
+                         ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
+                BYTE wph = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+                logf_("  [castwatch] p%d +%lums loc=(%.0f %.0f Z=%.1f) "
+                      "vz=%.0f phys=%d", i, (unsigned long)age,
+                      wl[0], wl[1], wl[2], wv, wph);
+            }
+        }
+
+        // Prove the projectile actually left the caster: log location 400ms later.
+        void *sa = g_castActor[i];
+        if (sa && !g_castLoggedFly[i] && age >= 400 && F.Location > 0 &&
+            !IsBadReadPtr(sa, F.Location + 12)) {
+            float *sl = (float *)((BYTE *)sa + F.Location);
+            float dx = sl[0] - g_castSpawnLoc[i][0];
+            float dy = sl[1] - g_castSpawnLoc[i][1];
+            float dz = sl[2] - g_castSpawnLoc[i][2];
+            float d  = sqrtf(dx * dx + dy * dy + dz * dz);
+            logf_("    [spell] p%d actor flew %.0f units in %lums (now=(%.0f %.0f %.0f))",
+                  i, d, (unsigned long)age, sl[0], sl[1], sl[2]);
+            g_castLoggedFly[i] = TRUE;
+        }
+
+        // Only end the caster's AIM POSE. Never reap the projectile - that was
+        // why casts "just played an animation and died".
+        // If the player is ALREADY aiming again (glow alive), defer: the state
+        // exit would interrupt the fresh cast-hold.
+        // v29 RACE FIX: was `if (aimGlowAlive(i)) continue;` - that asked
+        // for 1200ms of GLOW-FREE time after every cast, but re-aiming
+        // within the window spawns the NEXT cast's glow, so a rapid
+        // caster NEVER got a glow-free moment -> the cleanup chain never
+        // fired -> pose stuck (v28 hw log: chain fired once in 5 casts;
+        // castwatch ran past +1579ms with no chain line). Only block
+        // while the glow of THIS cast (spawned before this fire) lives;
+        // a NEWER glow (next aim already held) must not block.
+        if (aimGlowAlive(i) && g_aimFXAt[i] != 0 &&
+            g_aimFXAt[i] < g_castPending[i]) continue;
+        // v39 ANIMEND-TIMED EXIT: fire the chain right after the state's
+        // own AnimEnd instead of a fixed 1200ms past the release. The v38
+        // hw log showed the natural AnimEnd at release+~650ms and our exit
+        // at release+1200 - the 550ms gap on a frozen cast pose IS the
+        // residual hop (the snap) now that the storm is swallowed. Exiting
+        // at the anim boundary = nothing to snap from. Fallback: the
+        // configured delay (unchanged) when no AnimEnd is observed.
+        DWORD effDelay = (DWORD)g_cleanupDelay;
+        if (g_animEndAt[i] > g_castPending[i]) {
+            DWORD endAge = (g_animEndAt[i] - g_castPending[i])
+                         + (DWORD)g_castExitAdj;
+            if (endAge >= 400 && endAge < effDelay) effDelay = endAge;
+        }
+        if (age < effDelay) continue;
+        if (!pawn || IsBadReadPtr(pawn, 0x200)) {
+            g_castPending[i] = 0;
+            continue;
+        }
+        // v21: run the chain ONCE, then keep re-asserting the idle anim
+        // until +1.6s. v20 hardware: phys never blipped (castwatch proved
+        // Z/vz/phys constant), yet the user still saw a hop - it is the
+        // ANIMATION layer: the engine re-picks ChangeAnimation->PlayWaiting
+        // right after our chain and the transition churn reads as a dip.
+        // A steady idle re-assert settles it; Cleanup=light (ini) also
+        // skips the two state-exit calls in case they carry the dip.
+        {
+            static BOOL  sPhaseA[8]   = { FALSE };
+            static BOOL  sPhaseB[8]   = { FALSE };
+            static DWORD sChainAt[8]  = { 0 };
+            static BOOL  sReExit[8]   = { FALSE };
+            static BOOL  sReAssert[8] = { FALSE };
+            int   mode  = g_cleanupChain;
+            DWORD split = (mode == 0 && !g_cleanupLight)
+                        ? (DWORD)g_cleanupSplit : 0;
+            BYTE  p[8]; memset(p, 0, sizeof(p));
+            if (!sPhaseA[i]) {
+                sPhaseA[i] = TRUE;
+                if (split > 0) {
+                    // v28 PHASE A - start the blend while she is STILL in
+                    // the cast state. v27 hardware: delay moves the hop in
+                    // time; no hop = stuck pose; the Z dip is only ~0.5
+                    // units (invisible). The visible hop is the pose SNAP
+                    // of the state exit cutting the cast pose mid-anim.
+                    // Blending first and exiting ~250ms later lands the
+                    // state change on an already-faded pose.
+                    if (g_fnBlendOut)
+                        callFnP(pawn, g_fnBlendOut, p, 4,
+                                "blendOutCast() [A]");
+                    if (g_fnStopCast)
+                        callFnP(pawn, g_fnStopCast, p, 4,
+                                "StopCasting() [A]");
+                    logf_("    [castclean] p%d chain=full split-A: blend "
+                          "started (+%lums, exit in %dms)", i,
+                          (unsigned long)age, g_cleanupSplit);
+                } else {
+                sChainAt[i] = age;
+                if (effDelay < (DWORD)g_cleanupDelay)
+                    logf_("    [castclean] p%d AnimEnd-timed exit (+%lums; "
+                          "natural AnimEnd at +%lums, exit = AnimEnd+%d)",
+                          i, (unsigned long)age,
+                          (unsigned long)(g_animEndAt[i] - g_castPending[i]),
+                          g_castExitAdj);
+                armHopKill(i);               // v38: swallow the landing storm
+                settleBeforeExit(i, pawn);   // v35: kill the exit micro-fall
+                if (!g_cleanupLight && g_fnGotoGround)
+                    callFn(pawn, g_fnGotoGround,
+                           "GotoDefaultGroundMovementState()");
+                // v25 CleanupChain modes (hw data: full = the ONLY chain
+                // that exits; every reduction hung - noanimend v24,
+                // exitanim v25, light v22):
+                //   full(0) exit+blendOut+StopCasting+Switch+AnimEnd
+                //   noanimend(1)/min(2)/exitanim(3) = hang-bait tests
+                if (!g_cleanupLight && g_fnBlendOut && mode != 3)
+                    callFnP(pawn, g_fnBlendOut, p, 4, "blendOutCast()");
+                if (g_fnStopCast && mode != 3)
+                    callFnP(pawn, g_fnStopCast, p, 4, "StopCasting()");
+                if (g_fnSwitchNormal && mode == 0)
+                    callFnP(pawn, g_fnSwitchNormal, p, 4,
+                            "SwitchToNormalStanceAnims()");
+                if (g_fnAnimEnd && (mode == 0 || mode == 3))
+                    callFn(pawn, g_fnAnimEnd, "AnimEnd");
+                if (g_cleanupLight)
+                    logf_("    [castclean] p%d light cleanup (no "
+                          "GotoDefault/blendOut)", i);
+                else
+                    logf_("    [castclean] p%d chain=%s delay=%dms", i,
+                          g_cleanupChain == 0 ? "full" :
+                          (g_cleanupChain == 1 ? "noanimend" :
+                          (g_cleanupChain == 2 ? "min" : "exitanim")),
+                          g_cleanupDelay);
+                }
+            }
+            if (split > 0 && !sPhaseB[i] &&
+                age >= (DWORD)g_cleanupDelay + split) {
+                // v28 PHASE B - the state exit (plus the stance/anim end
+                // bookkeeping) lands AFTER the blend had time to fade the
+                // cast pose. Same five calls as the proven full chain,
+                // just phased in time - the call SET is unchanged.
+                sPhaseB[i]  = TRUE;
+                sChainAt[i] = age;
+                armHopKill(i);               // v38: the state exit is here
+                if (g_fnGotoGround)
+                    callFn(pawn, g_fnGotoGround,
+                           "GotoDefaultGroundMovementState() [B]");
+                if (g_fnSwitchNormal)
+                    callFnP(pawn, g_fnSwitchNormal, p, 4,
+                            "SwitchToNormalStanceAnims() [B]");
+                if (g_fnAnimEnd)
+                    callFn(pawn, g_fnAnimEnd, "AnimEnd [B]");
+                logf_("    [castclean] p%d chain=full split-B: state "
+                      "exited (+%lums)", i, (unsigned long)age);
+            }
+            // v21: idle re-assert REMOVED (v22): on hardware it stacked a
+            // second anim on top of the engine's own post-cast churn and
+            // contributed to the stuck "flying" pose. LESS interference is
+            // more: the chain above runs once, then we leave her alone.
+            // v26 HOPGUARD: the v25 hw log finally caught the hop - the
+            // state exit drops her through a brief PHYS_Falling dip
+            // (phys=2, vz=-14..-44, ~1 unit, ~100ms) right after the chain
+            // fires. If that blip appears, re-fire the state exit ONCE to
+            // settle her straight into ground movement instead of letting
+            // the fall+land play out on screen. (Physics itself is never
+            // touched - v21 proved patching it freezes her.)
+            if (g_hopGuard && sChainAt[i] && !sReExit[i] &&
+                age >= sChainAt[i] + 40 && age <= sChainAt[i] + 2000 &&
+                F.Physics > 0 && F.Velocity > 0 &&
+                !IsBadReadPtr(pawn, F.Velocity + 12)) {
+                BYTE ph = *((BYTE *)pawn + F.Physics);
+                float vz = ((float *)((BYTE *)pawn + F.Velocity))[2];
+                BOOL jumping = keyDown(g_pk[i].jump) ||
+                               keyDown(g_pk[i].jump2) || g_padJump[i];
+                if (ph == 2 && vz > -250.0f && vz < 0.0f && !jumping &&
+                    g_fnGotoGround) {
+                    callFn(pawn, g_fnGotoGround,
+                           "GotoDefaultGroundMovementState() [hop re-exit]");
+                    sReExit[i] = TRUE;
+                    logf_("    [hop] p%d Falling blip after chain (vz=%.0f)"
+                          " - re-exited state", i, vz);
+                }
+            }
+            // v26 hang insurance: re-assert the exit pair once more, well
+            // after the chain. v27: OFF by default - v26 hardware hung WITH
+            // full chain + this re-assert (v23-full exited), making the
+            // guard itself the prime suspect. ReAssert=1 in the ini to
+            // re-enable the experiment.
+            if (g_reAssert && sChainAt[i] && !sReAssert[i] && age >= sChainAt[i] + 1400) {
+                sReAssert[i] = TRUE;
+                if (g_fnGotoGround)
+                    callFn(pawn, g_fnGotoGround,
+                           "GotoDefaultGroundMovementState() [re-assert]");
+                if (g_fnAnimEnd)
+                    callFn(pawn, g_fnAnimEnd, "AnimEnd [re-assert]");
+                logf_("    [castclean] p%d re-asserted exit pair at +%lums"
+                      " (hang insurance)", i, (unsigned long)age);
+            }
+            // v34 VERIFIED RETRY: check the state pointer after the chain;
+            // retry the SAME exit until StateCasting is actually gone.
+            {
+                static BOOL sVerified[8] = { FALSE };
+                static int  sRetries[8]  = { 0 };
+                BOOL verdict = FALSE;
+                if (s_stateOff >= 0 && sChainAt[i] && !sVerified[i] &&
+                    age >= sChainAt[i] + 400 &&
+                    !IsBadReadPtr((BYTE *)pawn + s_stateOff, 4)) {
+                    void *st = *(void **)((BYTE *)pawn + s_stateOff);
+                    verdict = (st == s_stateCasting);
+                    if (verdict && g_beginCastAt[i] >
+                                   g_castPending[i] + (DWORD)sChainAt[i]) {
+                        // v39: a NEW cast began after our chain - never rip
+                        // it out (the cast-3 hw pattern: re-cast at +409ms).
+                        sVerified[i] = TRUE;
+                        logf_("    [castverify] p%d new cast began - "
+                              "standing down (+%lums)", i,
+                              (unsigned long)age);
+                    } else if (verdict) {
+                        if (sRetries[i] < 3 &&
+                            now - g_lastAirAt[i] >= 1200) {
+                            sRetries[i]++;
+                            logf_("    [castverify] p%d STILL StateCasting "
+                                  "(+%lums) - retry %d", i,
+                                  (unsigned long)age, sRetries[i]);
+                            armHopKill(i);       // v38: a retry re-storms
+                            BYTE rp[8]; memset(rp, 0, sizeof(rp));
+                            if (g_fnGotoGround)
+                                callFn(pawn, g_fnGotoGround,
+                                       "GotoDefaultGroundMovementState() "
+                                       "[retry]");
+                            if (g_fnSwitchNormal)
+                                callFnP(pawn, g_fnSwitchNormal, rp, 4,
+                                        "SwitchToNormalStanceAnims() [retry]");
+                            if (g_fnAnimEnd)
+                                callFn(pawn, g_fnAnimEnd, "AnimEnd [retry]");
+                        } else {
+                            sVerified[i] = TRUE;
+                            logf_("    [castverify] p%d gave up after 3 "
+                                  "retries (state stuck deep)", i);
+                        }
+                    } else {
+                        sVerified[i] = TRUE;
+                        logf_("    [castverify] p%d state LEFT ok (+%lums)%s",
+                              i, (unsigned long)age,
+                              sRetries[i] ? " (after retries)" : "");
+                    }
+                } else if (s_stateOff < 0 && sChainAt[i] && !sVerified[i] &&
+                           age >= sChainAt[i] + 400 &&
+                           F.Physics > 0 && !g_hopGuard) {
+                    // v34 FALLBACK verification: the v33 hw log showed the
+                    // stuck state FLAPS physics 0<->2 at idle (the visible
+                    // quiver). Healthy exits never flap. Count flips; two
+                    // within the window = still stuck -> retry the exit.
+                    static BYTE sLastPh[8] = { 0 };
+                    static int  sFlips[8]  = { 0 };
+                    BYTE ph = *((BYTE *)pawn + F.Physics);
+                    BOOL jumping = keyDown(g_pk[i].jump) ||
+                                   keyDown(g_pk[i].jump2) || g_padJump[i] ||
+                                   (now - g_lastAirAt[i] < 1200);
+                    if (sLastPh[i] && sLastPh[i] != ph &&
+                        ((sLastPh[i] == 2) != (ph == 2)) && !jumping)
+                        sFlips[i]++;
+                    sLastPh[i] = ph;
+                    if (sFlips[i] >= 2 && now - g_lastAirAt[i] < 1200) {
+                        // v42: flips during/just after a jump are the JUMP,
+                        // not a stuck quiver (v41 hw proof: mid-air forced
+                        // exit stranded the pawn in PHYS_Rotating). Drop them.
+                        sFlips[i] = 0;
+                    }
+                    if (sFlips[i] >= 2) {
+                        sFlips[i] = 0;
+                        if (g_beginCastAt[i] >
+                            g_castPending[i] + (DWORD)sChainAt[i]) {
+                            // v39: fresh cast - stand down (see tick-retry)
+                            sVerified[i] = TRUE;
+                            logf_("    [castverify] p%d new cast began - "
+                                  "standing down (+%lums)", i,
+                                  (unsigned long)age);
+                        } else if (sRetries[i] < 3) {
+                            sRetries[i]++;
+                            logf_("    [castverify] p%d physics flap x2 "
+                                  "(stuck quiver, +%lums) - retry %d", i,
+                                  (unsigned long)age, sRetries[i]);
+                            armHopKill(i);       // v38: retry re-storms
+                            settleBeforeExit(i, pawn);   // v35
+                            BYTE rp[8]; memset(rp, 0, sizeof(rp));
+                            if (g_fnGotoGround)
+                                callFn(pawn, g_fnGotoGround,
+                                       "GotoDefaultGroundMovementState() "
+                                       "[flap retry]");
+                            if (g_fnSwitchNormal)
+                                callFnP(pawn, g_fnSwitchNormal, rp, 4,
+                                        "SwitchToNormalStanceAnims() [flap "
+                                        "retry]");
+                            if (g_fnAnimEnd)
+                                callFn(pawn, g_fnAnimEnd, "AnimEnd [flap "
+                                       "retry]");
+                        } else {
+                            sVerified[i] = TRUE;
+                            logf_("    [castverify] p%d flaps persist after 3"
+                                  " retries", i);
+                        }
+                    }
+                    if (age >= 3000) {
+                        sLastPh[i] = 0;
+                        sFlips[i]  = 0;
+                    }
+                }
+                // v39 TICK-ALIVE verification (hw-proof): s_stateOff is -1
+                // on hardware (state ptr lives in a heap frame) and the v34
+                // flap heuristic never fired there - but the detour SEES the
+                // state's own Tick. Tick still flowing 500ms after our chain
+                // = the state never left (v31: it ignores its own AnimEnd).
+                // Two bounded re-exits, then a loud log line. When the ticks
+                // STOP we finally have a real "state LEFT ok" verdict.
+                {
+                    static BOOL   sTickVerdict[8]    = { 0 };
+                    static int    sTickRetries[8]    = { 0 };
+                    static DWORD  sLastTickRetry[8]  = { 0 };
+                    if (sChainAt[i] && !sTickVerdict[i] &&
+                        age >= sChainAt[i] + 500 &&
+                        age <= sChainAt[i] + 2600) {
+                        DWORD chainAbs = g_castPending[i] + (DWORD)sChainAt[i];
+                        BOOL  fresh    = (g_beginCastAt[i] > chainAbs);
+                        BOOL  alive    = (g_castTickAt[i] &&
+                                          now - g_castTickAt[i] < 250);
+                        if (alive && !fresh &&
+                            now - g_lastAirAt[i] >= 1200) {
+                            // v42: never force exits while airborne/recent
+                            if (sTickRetries[i] < 2 &&
+                                now - sLastTickRetry[i] > 700) {
+                                sTickRetries[i]++;
+                                sLastTickRetry[i] = now;
+                                logf_("    [castverify] p%d StateCasting."
+                                      "Tick STILL ALIVE (+%lums) - tick-"
+                                      "retry %d", i, (unsigned long)age,
+                                      sTickRetries[i]);
+                                armHopKill(i);   // a retry re-storms
+                                settleBeforeExit(i, pawn);
+                                BYTE rp[8]; memset(rp, 0, sizeof(rp));
+                                if (g_fnGotoGround)
+                                    callFn(pawn, g_fnGotoGround,
+                                           "GotoDefaultGroundMovementState()"
+                                           " [tick retry]");
+                                if (g_fnSwitchNormal)
+                                    callFnP(pawn, g_fnSwitchNormal, rp, 4,
+                                            "SwitchToNormalStanceAnims() "
+                                            "[tick retry]");
+                                if (g_fnAnimEnd)
+                                    callFn(pawn, g_fnAnimEnd,
+                                           "AnimEnd [tick retry]");
+                            }
+                        } else if (!alive &&
+                                   g_castTickAt[i] >= g_castPending[i]) {
+                            // ticks WERE seen during this cast (the state was
+                            // alive post-fire) and have now stopped = it left.
+                            // (The last tick always lands just BEFORE the
+                            // chain - ticks stop at the exit itself.)
+                            sTickVerdict[i] = TRUE;
+                            logf_("    [castverify] p%d state LEFT ok "
+                                  "(StateCasting.Tick stopped, +%lums)%s",
+                                  i, (unsigned long)age,
+                                  sTickRetries[i] ? " (after tick-retry)" : "");
+                        }
+                    }
+                    // v40 SETTLE RE-ALIGN: the v39 hw report (hop GONE,
+                    // user-confirmed) left "weird pose, standing in
+                    // incorrect yaw, shaking" after casts. Actor data is
+                    // clean (camera yaw == pawn yaw, state verdicts ok,
+                    // storms swallowed) - the residue is MESH-level: the
+                    // early exit settles the anim system mid-transition
+                    // (landing blend -> idle) and nothing re-picks it (the
+                    // v23 re-pick removal). The v12 lesson: ChangeAnimation
+                    // is the SAFE re-pick (PlayWaiting was the yaw swinger).
+                    // Once per cast, after the landing blend has finished
+                    // (~exit+450ms) and ONLY if the pawn is standing and no
+                    // new cast owns it.
+                    // v47: the settle re-pick moved to driveePawn
+                    // (event-driven, see g_realignNeed). The yaw watch
+                    // stays here.
+                    // v41 YAW WATCH: actor vs view vs mesh yaw through
+                    // the post-cast window (~8 samples/s, cast ages
+                    // 200..3400). Plus the AUTO-FIX: while STANDING and the
+                    // mesh yaw is stuck >~5.5 deg away from the actor yaw,
+                    // write the actor yaw into the mesh (max 2 per cast).
+                    // Bounded + fully logged; if the engine fights the
+                    // write, the log will show the delta snapping back.
+                    {
+                        static DWORD sLastYawLog[8] = { 0 };
+                        if (age >= 200 && age <= 3400 &&
+                            now - sLastYawLog[i] >= 120 &&
+                            F.Rotation > 0 &&
+                            !IsBadReadPtr(pawn, F.Rotation + 12)) {
+                            sLastYawLog[i] = now;
+                            int ay = *(int *)((BYTE *)pawn + F.Rotation + 4);
+                            int md = meshYawDelta(pawn, ay);
+                            if (md != -99999)
+                                logf_("  [yawwatch] p%d +%lums actor=%d "
+                                      "view=%d mesh=%d delta=%d",
+                                      i, (unsigned long)age, ay & 65535,
+                                      g_viewYaw[i] & 65535,
+                                      (ay + md) & 65535, md);
+                        }
+                        // (v41 note: the mesh auto-write was removed
+                        // before shipping - Engine.Actor.Mesh in UE2 is the
+                        // ASSET reference, not a transform component; its
+                        // "rotation" bytes are asset data. Wine proved it:
+                        // mesh yaw reads constant 0 there. NEVER write it.)
+                    }
+                    // v41 POST-CAST ROTATION PIN: while standing in the
+                    // post-cast window, hold DesiredRotation on the view
+                    // yaw and zero RotationRate, so a trailing-AI
+                    // FaceRotation pull cannot swing the actor away from
+                    // where the user left it (the same bounded pattern the
+                    // v12 standing-jump pin uses). Saved RotationRate is
+                    // restored when the window ends or movement resumes.
+                    {
+                        static BYTE sYawPinOn[8]   = { 0 };
+                        static int  sSavedRR[8][3] = {{0}};
+                        BOOL wantPin = (sChainAt[i] &&
+                                        age >= sChainAt[i] + 400 &&
+                                        age <= sChainAt[i] + 2400 &&
+                                        g_p2Moving[i] == 0 &&
+                                        F.DesiredRotation > 0 &&
+                                        F.RotationRate > 0 &&
+                                        !IsBadReadPtr(pawn, F.RotationRate + 12) &&
+                                        !IsBadWritePtr(pawn, F.RotationRate + 12));
+                        if (wantPin && !sYawPinOn[i]) {
+                            int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                            sSavedRR[i][0] = rr[0];
+                            sSavedRR[i][1] = rr[1];
+                            sSavedRR[i][2] = rr[2];
+                            sYawPinOn[i] = TRUE;
+                            logf_("  [yawpin] p%d engaged (+%lums)",
+                                  i, (unsigned long)age);
+                        }
+                        if (sYawPinOn[i]) {
+                            if (wantPin) {
+                                int *dr = (int *)((BYTE *)pawn +
+                                                  F.DesiredRotation);
+                                dr[0] = 0; dr[1] = g_viewYaw[i]; dr[2] = 0;
+                                int *rr = (int *)((BYTE *)pawn +
+                                                  F.RotationRate);
+                                rr[0] = 0; rr[1] = 0; rr[2] = 0;
+                            } else {
+                                sYawPinOn[i] = FALSE;
+                                if (F.RotationRate > 0 &&
+                                    !IsBadWritePtr(pawn, F.RotationRate + 12)) {
+                                    int *rr = (int *)((BYTE *)pawn +
+                                                      F.RotationRate);
+                                    rr[0] = sSavedRR[i][0];
+                                    rr[1] = sSavedRR[i][1];
+                                    rr[2] = sSavedRR[i][2];
+                                }
+                                logf_("  [yawpin] p%d released (+%lums)",
+                                      i, (unsigned long)age);
+                            }
+                        }
+                        if (age >= 3000 && sYawPinOn[i]) {
+                            sYawPinOn[i] = FALSE;
+                            if (F.RotationRate > 0 &&
+                                !IsBadWritePtr(pawn, F.RotationRate + 12)) {
+                                int *rr = (int *)((BYTE *)pawn +
+                                                  F.RotationRate);
+                                rr[0] = sSavedRR[i][0];
+                                rr[1] = sSavedRR[i][1];
+                                rr[2] = sSavedRR[i][2];
+                            }
+                            logf_("  [yawpin] p%d released (window end)",
+                                  i);
+                        }
+                    }
+                    if (age >= 3000) {
+                        sTickVerdict[i]   = FALSE;
+                        sTickRetries[i]   = 0;
+                        sLastTickRetry[i] = 0;
+                    }
+                }
+                if (age >= 3000) {
+                    sVerified[i] = FALSE;
+                    sRetries[i]  = 0;
+                }
+            }
+            // v37: after the exit has settled (~2.3s), record the TRUE
+            // physics-rest Z here - the next cast at this spot settles to
+            // exactly this height (no fall, no landing anim, no hop).
+            if (!g_postPush[i] && age >= 2300 && age <= 2600 &&
+                F.Physics > 0 && !IsBadReadPtr(pawn, F.Physics + 1)) {
+                BYTE php = *((BYTE *)pawn + F.Physics);
+                if ((php == 0 || php == 1) && F.Location > 0 &&
+                    !IsBadReadPtr(pawn, F.Location + 12)) {
+                    float *pl = (float *)((BYTE *)pawn + F.Location);
+                    int slot = g_restRingN[i] % 8;
+                    g_restRing[i][slot][0] = pl[0];
+                    g_restRing[i][slot][1] = pl[1];
+                    g_restRing[i][slot][2] = pl[2];
+                    g_restRingPost[i][slot] = 1;       // physics-rest truth
+                    g_restRingN[i]++;
+                    g_postPush[i] = TRUE;
+                    logf_("    [settle] p%d physics-rest sample Z=%.2f "
+                          "recorded (+%lums)", i, pl[2], (unsigned long)age);
+                }
+            }
+            if (age >= 4000) {
+                // v29 RESCUE: if the chain never completed (rapid casts,
+                // odd glow lifetimes, anything), fire it NOW in one
+                // condensed pass - the pose must never be left parked.
+                {
+                    BOOL aRan = sPhaseA[i];
+                    BOOL bRan = (g_cleanupSplit > 0) ? sPhaseB[i]
+                                                     : sPhaseA[i];
+                    if (!g_cleanupLight && (!aRan || !bRan) &&
+                        g_beginCastAt[i] >
+                        g_castPending[i] + (DWORD)sChainAt[i]) {
+                        // v39: a new cast owns the pawn - its own chain will
+                        // clean up; forcing this exit would murder it.
+                        logf_("    [castclean] p%d rescue skipped: new cast "
+                              "owns the pawn (+%lums)", i,
+                              (unsigned long)age);
+                    } else if (!g_cleanupLight && (!aRan || !bRan)) {
+                        armHopKill(i);       // v38: rescue exits re-storm too
+                        BYTE rp[8]; memset(rp, 0, sizeof(rp));
+                        if (!aRan) {
+                            if (g_fnBlendOut)
+                                callFnP(pawn, g_fnBlendOut, rp, 4,
+                                        "blendOutCast() [rescue]");
+                            if (g_fnStopCast)
+                                callFnP(pawn, g_fnStopCast, rp, 4,
+                                        "StopCasting() [rescue]");
+                        }
+                        if (g_fnGotoGround)
+                            callFn(pawn, g_fnGotoGround,
+                                   "GotoDefaultGroundMovementState() "
+                                   "[rescue]");
+                        if (g_fnSwitchNormal)
+                            callFnP(pawn, g_fnSwitchNormal, rp, 4,
+                                    "SwitchToNormalStanceAnims() [rescue]");
+                        if (g_fnAnimEnd)
+                            callFn(pawn, g_fnAnimEnd, "AnimEnd [rescue]");
+                        logf_("    [castclean] p%d RESCUE: chain completed "
+                              "at watch end (+%lums)", i,
+                              (unsigned long)age);
+                    }
+                }
+                g_castPending[i] = 0;
+                g_castActor[i]   = NULL;
+                sPhaseA[i]       = FALSE;
+                sPhaseB[i]       = FALSE;
+                sChainAt[i]      = 0;
+                sReExit[i]       = FALSE;
+                sReAssert[i]     = FALSE;
+            }
+        }
+        // currentSpell stays selected, like player 1 - so the next cast just works.
+    }
+}
+
+// ------------------------------ aim glow (v15) ------------------------------
+// The original player sees a sparkle effect at the aim point while holding
+// the cast button. That effect is hgame.SpellCursorEmitter ("spell cursor" -
+// the game's own aim indicator). While P2 holds cast we spawn the same
+// emitter at the point the camera is aiming at and move it every frame, so
+// the player can SEE where the spell will go. Destroyed on release.
+static void *g_aimFX[8]   = {0};
+static float g_aimDSmooth[8] = { 0 };   // v20: aim-distance hysteresis per player
+
+// v22: the game's OWN cursor actor, borrowed for P2 while aiming. The level
+// ships a dormant SpellCursor0 (bHidden=1) whose particles are exactly the
+// original player's aim marker - same look, size and surface behavior by
+// construction, on the game's own render path (proven visible on the
+// user's hardware, unlike our bare v20 emitter). We unhide it, take
+// ownership, drive its Location to the aim point each frame, and hide it
+// again on release. Nothing is spawned or destroyed.
+static void *g_origCursor        = NULL;
+static BOOL  g_origCursorChecked = FALSE;
+static void *g_origCursorOwner   = NULL;
+static BOOL  g_origActive[8]     = { FALSE };
+
+static void *findOrigCursor(void)
+{
+    if (g_origCursorChecked) return g_origCursor;
+    g_origCursorChecked = TRUE;
+    if (!g_objArray) return NULL;
+    char nb[160];
+    for (int i = 0; i < g_objArray->Num; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o || IsBadReadPtr(o, 0x100)) continue;
+        objName(o, nb, sizeof(nb));
+        if (strncmp(nb, "SpellCursor ", 12) != 0) continue;
+        if (strstr(nb, "Emitter")) continue;         // SpellCursorEmitter
+        if (!strstr(nb, ".SpellCursor")) continue;   // full path form
+        g_origCursor = o;
+        break;
+    }
+    logf_("  [aimfx] original SpellCursor actor: %p%s", g_origCursor,
+          g_origCursor ? " (will borrow for aiming)" :
+          " NOT FOUND - falling back to sprite glow");
+    return g_origCursor;
+}
+
+// v23: hardware hunt for the REAL P1 aim marker. The user sees player 1's
+// own marker render fine on hardware while everything we drove so far
+// (bare factory emitter v20, the borrowed level SpellCursor v22) shows
+// only under Wine. So: while P1 holds a real mouse AIM, tap D -> dump
+// every live cursor/emitter-ish ACTOR with full renderer fields + owner.
+// Whatever is visible-and-moving there, IS the original marker path.
+static void diagDumpAimHunt(void)
+{
+    logf_("[aimhunt] === live cursor/emitter actors (D pressed) ===");
+    if (!g_objArray) { logf_("[aimhunt] no object table"); return; }
+    static int sOffOwner = -2;
+    if (sOffOwner == -2) sOffOwner = propOffset("Engine.Actor.Owner");
+    char b[300], b2[160];
+    int shown = 0;
+    int n = g_objArray->Num;
+    for (int i = 0; i < n && shown < 40; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o || IsBadReadPtr(o, 0x100)) continue;
+        objName(o, b, sizeof(b));
+        // actor INSTANCE names are "ClassName Package.Path.Instance" -
+        // only hunt those (metadata prints "Class ...", "Function ...",
+        // "Texture ...", "Struct ...", "*Property ..." etc.)
+        {
+            static const char *pre[] = { "SpellCursor ", "SpellCursorEmitter ",
+                                         "SpellFlyEmitter ", "SpriteEmitter ",
+                                         "ParticleEmitter ", "Emitter ",
+                                         "HCursor ", "KWCursor ",
+                                         "SelectCursor ", NULL };
+            int match = 0;
+            for (int p = 0; pre[p]; p++)
+                if (!strncmp(b, pre[p], strlen(pre[p]))) { match = 1; break; }
+            if (!match) continue;
+            // class-default archetypes live inside script packages
+            // ("... hgame.BeanPickup.SpriteEmitter2"); live actors live in
+            // map packages ("HP3_INSIDEHUB.SpriteEmitter56", "Save0....").
+            const char *path = strchr(b, ' ');
+            if (path && (strncmp(path + 1, "hgame.", 6) == 0 ||
+                         strncmp(path + 1, "KWGame.", 7) == 0 ||
+                         strncmp(path + 1, "kwGame.", 7) == 0 ||
+                         strncmp(path + 1, "Engine.", 7) == 0 ||
+                         strncmp(path + 1, "HP_FX", 5) == 0)) continue;
+        }
+        dumpActorVisuals(o, b);
+        if (sOffOwner > 0 && !IsBadReadPtr((BYTE *)o + sOffOwner, 4)) {
+            void *ow = *(void **)((BYTE *)o + sOffOwner);
+            logf_("      Owner=%s",
+                  (ow && !IsBadReadPtr(ow, 8)) ? objName(ow, b2, sizeof(b2))
+                                               : "(null)");
+        }
+        shown++;
+    }
+    logf_("[aimhunt] %d objects dumped", shown);
+
+    // v25 section 2: the v24 hw dump found NO cursor/emitter actor that
+    // could be P1's visible marker - so either it is canvas/HUD-drawn, or
+    // it is named something else. Dump EVERY live drawable actor near P1
+    // (bHidden=0, sprite/particle DrawType, within 2500 units of P1's
+    // pawn, excluding our own aim emitters) - whatever P1's marker is, it
+    // must be in THIS list while his aim is on screen.
+    {
+        void *p1 = g_pawn[0];
+        if (!p1) p1 = findActorByClass("harry");
+        float p1l[3] = { 0, 0, 0 };
+        BOOL  haveP1 = (p1 && F.Location > 0 &&
+                        !IsBadReadPtr(p1, F.Location + 12));
+        if (haveP1)
+            memcpy(p1l, (BYTE *)p1 + F.Location, 12);
+        logf_("[aimhunt2] === drawable actors near P1 (%s at %.0f %.0f %.0f) ===",
+              (g_pawn[0] && g_pawnName[0][0]) ? g_pawnName[0] : "harry/p1",
+              p1l[0], p1l[1], p1l[2]);
+        if (!haveP1) {
+            logf_("[aimhunt2] no P1 pawn - skipped");
+            return;
+        }
+        static int  sOffHid = -2, sOffDel = -2;
+        static DWORD mHid = 0, mDel = 0;
+        if (sOffHid == -2) {
+            sOffHid = propOffset("Engine.Actor.bHidden");
+            mHid    = boolBitMask("Engine.Actor.bHidden");
+            sOffDel = propOffset("Engine.Actor.bDeleteMe");
+            mDel    = boolBitMask("Engine.Actor.bDeleteMe");
+        }
+        int shown2 = 0;
+        for (int i2 = 0; i2 < n && shown2 < 40; i2++) {
+            void *o = g_objArray->Data[i2];
+            if (!o || IsBadReadPtr(o, 0x300)) continue;
+            objName(o, b, sizeof(b));
+            const char *path = strchr(b, ' ');
+            if (!path) continue;                     // metadata: no instance
+            if (strncmp(path + 1, "hgame.", 6) == 0 ||
+                strncmp(path + 1, "KWGame.", 7) == 0 ||
+                strncmp(path + 1, "kwGame.", 7) == 0 ||
+                strncmp(path + 1, "Engine.", 7) == 0 ||
+                strncmp(path + 1, "HP_FX", 5) == 0) continue;  // archetypes
+            // metadata objects also read "Kind Package.Path" - their
+            // "DrawScale"/"DrawType" land inside foreign data. A visible
+            // sprite/particle actor has a real scale > 0; garbage reads
+            // gave 0.00 for every metadata leak in the first hw dump.
+            if (!strncmp(b, "Class ", 6) || !strncmp(b, "Function ", 9) ||
+                !strncmp(b, "Texture ", 8) || !strncmp(b, "Sound ", 6) ||
+                !strncmp(b, "Package ", 8) || !strncmp(b, "Struct ", 7) ||
+                !strncmp(b, "State ", 6) || !strncmp(b, "Enum ", 5) ||
+                !strncmp(b, "Font ", 5) || !strncmp(b, "Model ", 6) ||
+                !strncmp(b, "Mesh ", 5)) continue;
+            if (!strncmp(b, "SpellCursorEmitter ", 19)) continue;  // ours
+            if (F.Location <= 0 || IsBadReadPtr(o, F.Location + 12)) continue;
+            float *al = (float *)((BYTE *)o + F.Location);
+            if (al[0] == 0.0f && al[1] == 0.0f && al[2] == 0.0f) continue;
+            if (*(float *)((BYTE *)o + 0x268) < 0.05f) continue; // scale junk
+            float hd = (float)sqrt((al[0]-p1l[0])*(al[0]-p1l[0]) +
+                                   (al[1]-p1l[1])*(al[1]-p1l[1]));
+            if (hd > 2500.0f) continue;
+            if (mHid && sOffHid > 0 &&
+                (*(DWORD *)((BYTE *)o + (sOffHid & ~3)) & mHid)) continue;
+            if (mDel && sOffDel > 0 &&
+                (*(DWORD *)((BYTE *)o + (sOffDel & ~3)) & mDel)) continue;
+            BYTE dt = *(BYTE *)((BYTE *)o + 0x42);   // Engine.Actor.DrawType
+            if (dt != 1 && dt != 8 && dt != 10) continue;  // sprite/particle
+            if (!*(void **)((BYTE *)o + 0x25C)) continue;  // no texture
+            logf_("    [aimhunt2] %s  DT=%d dP1=%.0f loc=(%.0f %.0f %.0f) "
+                  "style=%d scale=%.2f",
+                  b, dt, hd, al[0], al[1], al[2],
+                  (int)*(BYTE *)((BYTE *)o + 0x2BC),
+                  *(float *)((BYTE *)o + 0x268));
+            shown2++;
+        }
+        logf_("[aimhunt2] %d drawable actors near P1", shown2);
+        if (shown2 == 0)
+            logf_("[aimhunt2] NOTHING drawable near P1 -> his cursor is "
+                  "canvas/HUD-drawn, not an actor (v26: draw P2's glow the "
+                  "same way)");
+    }
+}
+
+// Returns TRUE if the original cursor handled this frame (borrow or return).
+static BOOL origCursorDrive(int i, void *pawn, BOOL held, const float aim[3])
+{
+    static int sOffHidden = -2, sOffOwner = -2;
+    static DWORD sMaskHidden = 0;
+    if (sOffHidden == -2) {
+        sOffHidden   = propOffset("Engine.Actor.bHidden");
+        sMaskHidden  = boolBitMask("Engine.Actor.bHidden");
+        sOffOwner    = propOffset("Engine.Actor.Owner");
+    }
+    void *cur = findOrigCursor();
+    if (!cur || sOffHidden < 0 || !sMaskHidden || sOffOwner < 0 ||
+        IsBadWritePtr(cur, 0x200)) return FALSE;
+
+    if (!held) {
+        if (g_origActive[i]) {
+            DWORD *slot = (DWORD *)((BYTE *)cur + (sOffHidden & ~3));
+            *slot |= sMaskHidden;                       // hide again
+            *(void **)((BYTE *)cur + sOffOwner) = g_origCursorOwner;
+            g_origActive[i] = FALSE;
+            logf_("  [aimfx] p%d original cursor returned (hidden)", i);
+        }
+        return TRUE;                                    // handled either way
+    }
+
+    if (!g_origActive[i]) {
+        g_origActive[i]    = TRUE;
+        g_origCursorOwner  = *(void **)((BYTE *)cur + sOffOwner);
+        void *ctrl = (F.PawnController > 0 &&
+                      !IsBadReadPtr((BYTE *)pawn + F.PawnController, 4))
+                   ? *(void **)((BYTE *)pawn + F.PawnController) : pawn;
+        if (ctrl) *(void **)((BYTE *)cur + sOffOwner) = ctrl;
+        DWORD *slot = (DWORD *)((BYTE *)cur + (sOffHidden & ~3));
+        *slot &= ~sMaskHidden;                          // show
+        char b[160], b2[160];
+        void *parts = NULL;
+        int offParts = propOffset("hgame.SpellCursor.CursorParticles");
+        if (offParts > 0 && !IsBadReadPtr((BYTE *)cur + offParts, 4))
+            parts = *(void **)((BYTE *)cur + offParts);
+        logf_("  [aimfx] p%d ORIGINAL cursor borrowed: %s owner=%s "
+              "CursorParticles=%s", i, objName(cur, b, sizeof(b)),
+              ctrl ? objName(ctrl, b2, sizeof(b2)) : "(pawn)",
+              parts ? objName(parts, b2, sizeof(b2)) : "(none)");
+    }
+    if (F.Location > 0 && !IsBadWritePtr((BYTE *)cur + F.Location, 12)) {
+        float *cl = (float *)((BYTE *)cur + F.Location);
+        cl[0] = aim[0]; cl[1] = aim[1]; cl[2] = aim[2] + 30.0f;
+    }
+    return TRUE;
+}
+static BOOL aimGlowAlive(int i)
+{
+    return i >= 0 && i < 8 && g_aimFX[i] != NULL;
+}
+static DWORD g_aimFXAtDummy[1];       // (real g_aimFXAt defined above the
+                                      // castwatch loop for the v29 race fix)
+static float g_aimLastDummy[1];
+
+static BOOL destroyAimFX(int i)
+{
+    if (!g_aimFX[i]) return FALSE;
+    void *fx = g_aimFX[i];
+    g_aimFX[i] = NULL;
+    if (IsBadReadPtr(fx, 0x10)) return FALSE;
+    return destroyActorFX(fx);
+}
+
+static void aimFXDiagnose(void *pawn, void *fx, const float at[3]);
+
+// Force the glow to render as a full-bright translucent sprite with the
+// game's own sparkle texture, and breathe the scale so the marker feels
+// alive. Plain sprite drawing (DrawType=1) is the same path the game's own
+// cursor actor uses - it does not depend on the GameFX particle pipeline.
+// v18: where SpawnSpell actually puts the spell actor, in PAWN-LOCAL space
+// (learned at each fire, applied to the aim glow so the glow rides the exact
+// line the spell will fly). Measured: RictusempraSpell spawns at the pawn
+// ORIGIN (local 0,0,0) - the glow ray starts exactly there; other spells
+// re-learn their own offset after the first cast.
+static float g_spellOffLocal[3] = { 0.0f, 0.0f, 0.0f };
+static BOOL  g_spellOffLearned  = FALSE;
+
+static void rotYaw(float *v, double yawRad)
+{
+    float c = (float)cos(yawRad), s = (float)sin(yawRad);
+    float x = v[0] * c - v[1] * s, y = v[0] * s + v[1] * c;
+    v[0] = x; v[1] = y;
+}
+
+// ---------------- v31: ProcessEvent capture (E key) -----------------------
+// The hop is engine-side and every chain variant is mapped (see HANDOFF);
+// the missing piece is DATA: what the engine ITSELF calls when a cast ends
+// naturally (player 1's own cast never hops). E taps an 8-second window in
+// which UObject::ProcessEvent (Core.dll export, already resolved as
+// g_ProcessEvent) is hot-patched with a logging detour. Every script event
+// fired on ANY player pawn is logged (consecutive dupes collapsed). Cast
+// with P1 (natural) and P2 (ours) inside the window; the log then holds
+// both exit sequences for a diff. Patch is removed when the window ends.
+static BOOL  g_pelogOn    = FALSE;
+static DWORD g_pelogEnd   = 0;
+static DWORD g_pelogT0    = 0;      // v36: timestamp base (cast fire)
+static int   g_pelogCount = 0;
+static DWORD g_pelogLastTick[8] = {0};
+static BYTE  sPEsaved[8]  = {0};
+static BYTE *sPEtarget    = NULL;
+static BYTE *sPEtramp     = NULL;
+
+static void pelogStop(void)
+{
+    if (!g_pelogOn) return;
+    g_pelogOn = FALSE;
+    if (sPEtarget) {
+        DWORD op = 0;
+        VirtualProtect(sPEtarget, 8, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(sPEtarget, sPEsaved, 8);
+        VirtualProtect(sPEtarget, 8, op, &op);
+        FlushInstructionCache(GetCurrentProcess(), sPEtarget, 8);
+    }
+    logf_("[pelog] === END (%d pawn events logged) ===", g_pelogCount);
+}
+
+static void __fastcall pelogDetour(void *self, void *edx, void *func,
+                                   void *parms, void *result)
+{
+    if (g_pelogOn) {
+        if (GetTickCount() >= g_pelogEnd) {
+            pelogStop();
+        } else if (func && !IsBadReadPtr(func, 8) && g_pelogCount < 600) {
+            static BOOL sPinged = FALSE;
+            if (!sPinged) {
+                sPinged = TRUE;
+                logf_("[pelog] capture active - events flowing");
+            }
+            for (int p = 0; p < 8; p++) {
+                if (!g_pawn[p] || g_pawn[p] != self) continue;
+                char nb[120];
+                objName(func, nb, sizeof(nb));
+                // v36: timestamps since the window base (cast fire for
+                // auto windows); Ticks throttled to 1/s, all else always.
+                BOOL isTick = (strstr(nb, ".Tick") != NULL);
+                DWORD now2 = GetTickCount();
+                if (isTick) {
+                    if (now2 - g_pelogLastTick[p] < 1000) break;
+                    g_pelogLastTick[p] = now2;
+                }
+                logf_("[pelog] p%d @+%lums %s", p,
+                      (unsigned long)(now2 - g_pelogT0), nb);
+                g_pelogCount++;
+                break;
+            }
+        }
+    }
+    // v38 HOPKILL - the hop fix (HANDOFF). Runs on the PERMANENT detour
+    // for EVERY event, deliberately NOT gated on g_pelogOn. Pawn match +
+    // window check first (a handful of compares); only inside an armed
+    // window do we pay for the name lookup. Exact DOT-SUFFIX match on the
+    // engine names from the v37 hw log: "KWGame.KWPawn.PlayFalling",
+    // "Engine.Pawn.PlayLandingAnimation". Swallowed = RETURN WITHOUT the
+    // trampoline: the animation player simply never runs, the state exit
+    // itself is untouched. Accepted cost: a REAL jump within 1.5s of a
+    // cast exit loses its falling/landing anim (cosmetic, rare).
+    if (func && !IsBadReadPtr(func, 8)) {
+        DWORD nowS = GetTickCount();
+        for (int p = 0; p < 8; p++) {
+            if (!g_pawn[p] || g_pawn[p] != self) continue;
+            // v39: the swallow window (1.5s per chain) plus a per-cast
+            // "interest" window (fire .. +4.2s) in which the state's own
+            // events are harvested. Outside both: zero name lookups.
+            BOOL suppress = (nowS < g_suppressLandUntil[p]);
+            BOOL interest = (g_castPending[p] &&
+                             nowS < g_castPending[p] + 4200);
+            if (suppress || interest) {
+                char nb[120];
+                objName(func, nb, sizeof(nb));
+                int L = (int)strlen(nb);
+                if (suppress) {
+                    BOOL hopAnim =
+                        (L >= 12 && !strncmp(nb + L - 12,
+                                             ".PlayFalling", 12)) ||
+                        (L >= 21 && !strncmp(nb + L - 21,
+                                             ".PlayLandingAnimation", 21));
+                    if (hopAnim) {
+                        logf_("[hopkill] p%d swallowed %s @+%lums", p, nb,
+                              (unsigned long)(nowS - g_hopkillT0[p]));
+                        return;      // swallowed - trampoline NOT called
+                    }
+                }
+                if (interest) {
+                    if (L >= 21 && !strncmp(nb + L - 21,
+                                            "StateCasting.EndState", 21)) {
+                        // v47: the ACTUAL exit event. Arm the anim re-sync
+                        // only for OUR exits (a chain ran within 2.5s).
+                        if (nowS - g_chainAbsAt[p] < 2500 &&
+                            !g_realignNeed[p]) {
+                            g_realignNeed[p]  = TRUE;
+                            g_needAt[p]       = nowS;
+                            g_needBegin[p]    = g_beginCastAt[p];
+                            g_needBind[p]     = g_castPending[p];
+                            logf_("    [realign] p%d ARMED by EndState "
+                                  "(exit-age %lums)", p,
+                                  (unsigned long)(nowS - g_chainAbsAt[p]));
+                        }
+                    } else if (L >= 20 && !strncmp(nb + L - 20,
+                                            "StateCasting.AnimEnd", 20)) {
+                        // v39 ANIMEND EXIT anchor: the cast anim's natural
+                        // end (hw: release+~650ms; the state ignores it,
+                        // v31). First post-release one wins.
+                        if (g_animEndAt[p] < g_castPending[p])
+                            g_animEndAt[p] = nowS;
+                    } else if (L >= 17 &&
+                               !strncmp(nb + L - 17,
+                                        "StateCasting.Tick", 17)) {
+                        g_castTickAt[p] = nowS;   // alive = state still there
+                    } else if (L >= 23 &&
+                               !strncmp(nb + L - 23,
+                                        "StateCasting.BeginState", 23)) {
+                        g_beginCastAt[p] = nowS;  // a fresh cast began
+                    } else if (L >= 30 &&
+                               !strncmp(nb + L - 24,
+                                        "HPCharacter.StartCasting", 24)) {
+                        // v47: StartCasting fires on EVERY cast (the aim
+                        // start) - Wine skips StateCasting.BeginState about
+                        // half the time, so the no-new-cast veto needs this
+                        // 100%-reliable stamp too.
+                        g_beginCastAt[p] = nowS;
+                        logf_("    [realign] p%d SCstamp p=%d slot=%lu "
+                              "chainAbs=%lu raw=%lu", p, p,
+                              (unsigned long)g_beginCastAt[p],
+                              (unsigned long)g_chainAbsAt[p],
+                              (unsigned long)nowS);
+                    }
+                }
+            }
+            break;   // pawn pointers are unique: at most one p matches
+        }
+    }
+    if (sPEtramp)
+        ((PFN_ProcessEvent)sPEtramp)(self, edx, func, parms, result);
+    // v43: frame-level Walking hold (see driveePawn). While a cluster is
+    // armed, every ProcessEvent from the held pawn re-asserts phys=1 - the
+    // detour fires many times per rendered frame, so the engine never keeps
+    // a projectile tick long enough to reach the renderer.
+    {
+        DWORD nowH = GetTickCount();
+        for (int p = 0; p < 8; p++) {
+            if (!g_pawn[p] || g_pawn[p] != self) continue;
+            if (g_holdArmed[p] && nowH < g_holdWalkUntil[p] &&
+                F.Physics > 0 && nowH - g_lastAirAt[p] > 400 &&
+                !IsBadWritePtr((BYTE *)self + F.Physics, 1) &&
+                !IsBadReadPtr((BYTE *)self + F.Physics, 1)) {
+                BYTE phH = *((BYTE *)self + F.Physics);
+                if (phH == 5 || phH == 6)
+                    *((BYTE *)self + F.Physics) = 1;
+            }
+            break;
+        }
+    }
+}
+
+// v33: O-key cast-property diff. The StateCasting loop re-pins the cast
+// anim every tick because SOME condition it waits for never becomes true
+// for our pawn. Every script property lives as a *Property object in the
+// global object table, carrying its offset (g_propOffsetField) and, for
+// bools, a power-of-two bit mask right after it. This dump lists the
+// casting-relevant classes' properties and prints the ones whose VALUES
+// differ between the two pawns - tap O WHILE P2 IS STUCK IN THE CAST POSE
+// and the state's wait-flag (bool/byte/int) stands out against P1.
+static void diagDumpCastProps(void)
+{
+    if (!g_objArray) { logf_("[castprop] no object table"); return; }
+    void *p2 = g_pawn[1];
+    void *p1 = g_pawn[0];
+    if (!p1) p1 = findActorByClass("harry");
+    if (!p2 || !p1) { logf_("[castprop] need both pawns (p1=%p p2=%p)",
+                            p1, p2); return; }
+    if (g_propOffsetField < 0) { logf_("[castprop] no prop offsets"); return; }
+    logf_("[castprop] === pawn property diff (p2=%s vs p1=%s) ===",
+          g_pawnName[1][0] ? g_pawnName[1] : "p2",
+          g_pawnName[0][0] ? g_pawnName[0] : "p1");
+    static const char *scopes[] = { ".HPCharacter.", ".KWPawn.", ".HPPawn.",
+                                    ".HPHeroPawn.", ".HPCompanion", NULL };
+    char b[300];
+    int n = g_objArray->Num, shown = 0, scanned = 0;
+    for (int i = 0; i < n && shown < 120; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o || IsBadReadPtr(o, g_propOffsetField + 0x40)) continue;
+        objName(o, b, sizeof(b));          // "BoolProperty hgame.HPCharacter.X"
+        const char *sp = strchr(b, ' ');
+        if (!sp) continue;
+        int tlen = (int)(sp - b);
+        if (tlen < 9 || strncmp(b + tlen - 8, "Property", 8) != 0) continue;
+        int hit = 0;
+        for (int k = 0; scopes[k]; k++)
+            if (strstr(sp, scopes[k])) { hit = 1; break; }
+        if (!hit) continue;
+        scanned++;
+        int   off = (int)*(DWORD *)((BYTE *)o + g_propOffsetField);
+        if (off < 0x20 || off > 0x2000) continue;   // junk misparses
+        const char *nm = strrchr(sp + 1, '.');
+        nm = nm ? nm + 1 : sp + 1;
+        char v2[48] = "?", v1[48] = "?";
+        if      (memcmp(b, "BoolProperty", 12) == 0) {
+            DWORD m = 1;
+            for (int d = 4; d <= 0x38; d += 4) {
+                DWORD mm = *(DWORD *)((BYTE *)o + g_propOffsetField + d);
+                if (mm && (mm & (mm - 1)) == 0) { m = mm; break; }
+            }
+            if (off > 0 && !IsBadReadPtr(p2, off + 4) &&
+                !IsBadReadPtr(p1, off + 4)) {
+                BOOL a2 = (*(DWORD *)((BYTE *)p2 + off) & m) != 0;
+                BOOL a1 = (*(DWORD *)((BYTE *)p1 + off) & m) != 0;
+                sprintf(v2, "%d", a2); sprintf(v1, "%d", a1);
+                if (a2 == a1) continue;
+            } else continue;
+        } else if (memcmp(b, "ByteProperty", 12) == 0 ||
+                   memcmp(b, "IntProperty",  11) == 0) {
+            if (off > 0 && !IsBadReadPtr(p2, off + 4) &&
+                !IsBadReadPtr(p1, off + 4)) {
+                int a2 = *(int *)((BYTE *)p2 + off);
+                int a1 = *(int *)((BYTE *)p1 + off);
+                if (a2 == a1) continue;
+                sprintf(v2, "%d", a2); sprintf(v1, "%d", a1);
+            } else continue;
+        } else if (memcmp(b, "FloatProperty", 13) == 0) {
+            if (off > 0 && !IsBadReadPtr(p2, off + 4) &&
+                !IsBadReadPtr(p1, off + 4)) {
+                float a2 = *(float *)((BYTE *)p2 + off);
+                float a1 = *(float *)((BYTE *)p1 + off);
+                if (fabsf(a2 - a1) < 0.01f) continue;
+                sprintf(v2, "%.2f", a2); sprintf(v1, "%.2f", a1);
+            } else continue;
+        } else continue;                    // structs/objects: next round
+        logf_("    [castprop] %-28s %-6s p2=%-12s p1=%-12s (+%#x)",
+              nm, b[0] == 'B' ? "bool" : (b[0] == 'F' ? "float" : "int"),
+              v2, v1, off);
+        shown++;
+    }
+    logf_("[castprop] %d props scanned, %d differ", scanned, shown);
+    if (scanned == 0) {
+        // naming debug: show what property-ish objects actually look like
+        int dbg = 0;
+        for (int i = 0; i < n && dbg < 12; i++) {
+            void *o = g_objArray->Data[i];
+            if (!o || IsBadReadPtr(o, 0x20)) continue;
+            objName(o, b, sizeof(b));
+            if (!strstr(b, "HPCharacter") && !strstr(b, "hpcharacter") &&
+                !strstr(b, "KWPawn")) continue;
+            logf_("    [castprop-dbg] %s", b);
+            dbg++;
+        }
+    }
+    if (shown == 0)
+        logf_("[castprop] NO differences - capture while she is STUCK "
+              "(cast, wait 2s, then tap O)");
+}
+
+static void pelogStart(void)
+{
+    if (!g_ProcessEvent || g_pelogOn) return;
+    if (!g_pawn[0]) g_pawn[0] = findActorByClass("harry"); // v32: the hw
+    // capture had ZERO p0 events - g_pawn[0] was unresolved; the aim-hunt
+    // already uses this fallback successfully.
+    sPEtarget = (BYTE *)g_ProcessEvent;
+    memcpy(sPEsaved, sPEtarget, 8);
+    logf_("[pelog] ProcessEvent bytes: %02X %02X %02X %02X %02X %02X",
+          sPEsaved[0], sPEsaved[1], sPEsaved[2],
+          sPEsaved[3], sPEsaved[4], sPEsaved[5]);
+    if (sPEsaved[0] == 0xE8 || sPEsaved[0] == 0xE9 || sPEsaved[0] == 0xEB) {
+        logf_("[pelog] refusing to hook: relative branch in prologue");
+        return;
+    }
+    if (!sPEtramp)
+        sPEtramp = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT,
+                                        PAGE_EXECUTE_READWRITE);
+    if (!sPEtramp) { logf_("[pelog] trampoline alloc failed"); return; }
+    // WHOLE-INSTRUCTION patch (v31 fix: the first attempt clobbered 6
+    // bytes and cut "push imm32" mid-instruction -> the trampoline
+    // executed garbage and hung the main thread). prologueLen() (the
+    // decoder below, used by the draw hook for years) accumulates whole
+    // instructions until we have >= 5 bytes; we overwrite exactly that
+    // many with a jmp rel32 (x86 user space is 2GB - always in range).
+    int n = prologueLen(sPEtarget);
+    if (n < 5 || n > 8) {
+        logf_("[pelog] refusing: prologueLen=%d", n);
+        return;
+    }
+    logf_("[pelog] patching %d whole prologue bytes", n);
+    // trampoline: saved n bytes, then jmp target+n
+    memcpy(sPEtramp, sPEsaved, n);
+    sPEtramp[n] = 0xE9;
+    *(DWORD *)(sPEtramp + n + 1) = (DWORD)((sPEtarget + n) -
+                                           (sPEtramp + n + 5));
+    // patch: jmp rel32 detour (+ int3 padding)
+    DWORD op = 0;
+    VirtualProtect(sPEtarget, 8, PAGE_EXECUTE_READWRITE, &op);
+    sPEtarget[0] = 0xE9;
+    *(DWORD *)(sPEtarget + 1) = (DWORD)((BYTE *)&pelogDetour -
+                                        (sPEtarget + 5));
+    for (int k = 5; k < n; k++) sPEtarget[k] = 0xCC;
+    VirtualProtect(sPEtarget, 8, op, &op);
+    FlushInstructionCache(GetCurrentProcess(), sPEtarget, 8);
+    logf_("[pelog] patch readback: %02X %02X %02X %02X %02X %02X",
+          sPEtarget[0], sPEtarget[1], sPEtarget[2],
+          sPEtarget[3], sPEtarget[4], sPEtarget[5]);
+    g_pelogOn    = TRUE;
+    g_pelogEnd   = GetTickCount() + 8000;
+    g_pelogT0    = GetTickCount();
+    g_pelogCount = 0;
+    logf_("[pelog] === START (8s): NOW cast with P1 (mouse, natural), "
+          "then with P2 (Y) ===");
+}
+
+// v36: AUTO window around every P2+ cast - no key needed. The log then
+// carries the full anim/state timeline (timestamps) of each cast: when
+// the natural AnimEnds land vs our exit vs the dip. Base machinery is
+// the proven E-key hook; window 3.4s, t0 = the fire moment.
+static void pelogAuto(void)
+{
+    if (!g_ProcessEvent || g_pelogOn) return;
+    pelogStart();
+    if (!g_pelogOn) return;
+    g_pelogEnd = GetTickCount() + 6500;
+    g_pelogT0  = GetTickCount() - 1200;
+    logf_("[pelog] auto window: cast timeline capture (6.5s)");
+}
+
+static void aimFXVisuals(int i, BOOL init)
+{
+    void *fx = g_aimFX[i];
+    if (!fx || IsBadWritePtr(fx, 0x200)) return;
+    if (g_dbgGlowScale >= 0.0f) {          // K-key A/B probe (diagnostic)
+        if (g_offDTAimFX > 0)  *(BYTE *)((BYTE *)fx + g_offDTAimFX) = 1;
+        if (g_offTexAimFX > 0 && g_texAimFXFr[0])
+            *(void **)((BYTE *)fx + g_offTexAimFX) = g_texAimFXFr[0];
+        if (g_offStyleAimFX > 0) *(BYTE *)((BYTE *)fx + g_offStyleAimFX) = 6;
+        if (g_offScaleAimFX > 0)
+            *(float *)((BYTE *)fx + g_offScaleAimFX) = g_dbgGlowScale;
+        return;
+    }
+    if (g_aimSup[i]) {                    // v24: body-clearance hidden
+        if (g_offScaleAimFX > 0)
+            *(float *)((BYTE *)fx + g_offScaleAimFX) = 0.001f;
+        return;
+    }
+    // v21 rendering, driven by [actions] GlowStyle:
+    //   6 (default) = the sprite path every build through v19 used - forced
+    //       DrawType=1 + STY_Additive + cycling Sparkle_1/3/7 + bUnlit +
+    //       pulsing DrawScale (base 1.2 * GlowSize/60). This is the ONLY
+    //       variant hardware has ever shown. v20's factory particle mode
+    //       (DrawType=10, Style=8, own emitter) rendered under Wine's
+    //       rasterizer but was INVISIBLE on the user's hardware D3D8 path.
+    //   8 = v20's factory particle mode (kept for reference/testing).
+    //   other = sprite with that raw Style byte (experiment if asked).
+    // Size: GlowSize% (60 default) scales the pulse base.
+    if (g_glowStyle == 8) {
+        if (g_offScaleAimFX > 0)
+            *(float *)((BYTE *)fx + g_offScaleAimFX) =
+                0.10f * (g_glowSize / 60.0f);
+        if (init)
+            logf_("  [aimfx] p%d visual: factory particle mode "
+                  "(DrawType=10), DrawScale=%.3f", i,
+                  0.10f * (g_glowSize / 60.0f));
+        return;
+    }
+    if (g_offDTAimFX > 0)  *(BYTE *)((BYTE *)fx + g_offDTAimFX) = 1;  // DT_Sprite
+    if (g_offTexAimFX > 0 && g_nAimFXFr > 0)
+        *(void **)((BYTE *)fx + g_offTexAimFX) =
+            g_texAimFXFr[(GetTickCount() / 120) % g_nAimFXFr];
+    else if (g_offTexAimFX > 0 && g_texAimFX)
+        *(void **)((BYTE *)fx + g_offTexAimFX) = g_texAimFX;
+    if (g_offStyleAimFX > 0)
+        *(BYTE *)((BYTE *)fx + g_offStyleAimFX) = (BYTE)g_glowStyle;
+    if (g_offUnlitAimFX > 0 && g_maskUnlitAimFX) {
+        DWORD *slot = (DWORD *)((BYTE *)fx + (g_offUnlitAimFX & ~3));
+        *slot |= g_maskUnlitAimFX;
+    }
+    {
+        float t = (GetTickCount() - g_aimFXAt[i]) * 0.005f;
+        float s = (1.2f * g_glowSize / 60.0f) * (1.0f + 0.3f * (float)sin(t));
+        if (g_offScaleAimFX > 0)
+            *(float *)((BYTE *)fx + g_offScaleAimFX) = s;
+        if (init)
+            logf_("  [aimfx] p%d visual: sprite glow, style=%d additive, "
+                  "sparkle x%d frames, DrawScale %.2f+-%.2f breathing",
+                  i, g_glowStyle, g_nAimFXFr, 1.2f * g_glowSize / 60.0f,
+                  0.36f * g_glowSize / 60.0f);
+    }
+}
+
+static void updateAimFX(int i, void *pawn, BOOL held,
+                        const float camLoc[3], const int camRot[3])
+{
+    if (i < 1 || i >= 8) return;
+    if (!held) {
+        g_aimSup[i] = FALSE;              // v24: reset with the glow
+        // v22: return the borrowed original cursor first (no-op if unused)
+        if (g_glowStyle == 0) origCursorDrive(i, g_pawn[i], FALSE, NULL);
+        if (g_aimFX[i]) {
+            BOOL gone = destroyAimFX(i);
+            logf_("  [aimfx] p%d cast released - aim glow %s", i,
+                  gone ? "destroyed" : "DESTROY FAILED");
+        }
+        g_aimDSmooth[i] = 0.0f;   // v20: fresh hysteresis next hold
+        return;
+    }
+    if (!pawn || !g_clsAimFX || !g_execSpawn || g_opNameConst < 0 ||
+        F.Location <= 0) return;
+
+    // Aim ray: from where the spell ACTUALLY SPAWNS, along the camera view
+    // direction - the same line fireCast sends the projectile along, so the
+    // glow is the spell's true flight path.
+    // v20: the origin is the EXACT nudge formula from fireCast (pawnLoc +
+    // camDir*90 + 45Z). v18/v19 used the learned pawn-yaw-rotated offset -
+    // but when pawn and camera yaw disagree, or the aim is steeply down,
+    // that origin lands at/inside her body, and with a near wall the marker
+    // then SAT ON HER (v19 hardware: gold inside P2 as seen from P1, glow
+    // "disappearing" when she aims at something close).
+    // Engine.Actor.Trace can NOT be driven from synthesized bytecode (its
+    // out-parms need the locals/ref machinery), so the aim point comes from
+    // a FastTrace probe chain.
+    float org[3] = { camLoc[0], camLoc[1], camLoc[2] };
+    double ry = camRot[1] * (6.283185307179586 / 65536.0);
+    double rp = camRot[0] * (6.283185307179586 / 65536.0);
+    float cpv = (float)cos(rp);
+    float dx = (float)cos(ry) * cpv, dy = (float)sin(ry) * cpv;
+    float dz = (float)sin(rp);
+    if (F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
+        float *pl = (float *)((BYTE *)pawn + F.Location);
+        org[0] = pl[0] + dx * 90.0f;
+        org[1] = pl[1] + dy * 90.0f;
+        org[2] = pl[2] + dz * 90.0f + 45.0f;
+    }
+    float aim[3] = { 0, 0, 0 };
+    float aimD = 0.0f;
+    BOOL snapped = FALSE;
+    BOOL locked  = FALSE;
+
+    // AimedCast: fireCast homes the spell at the best cone target, so the
+    // glow must sit on THAT actor or the two disagree again (v17 hardware
+    // report: spell veered at Ron/harry while the glow marked the wall).
+    // Same search, same rules - throttled, target latched between scans.
+    if (g_aimedCast) {
+        static DWORD sScanAt = 0;
+        static void *sLock[8] = { 0 };
+        DWORD now = GetTickCount();
+        if (now - sScanAt > 200) { sScanAt = now; sLock[i] = findAimTarget(pawn, NULL, FALSE); }
+        void *t = sLock[i];
+        if (t && !IsBadReadPtr(t, F.Location + 12)) {
+            static char sLockName[8][96] = { {0} };
+            char nb[96] = "";
+            objName(t, nb, sizeof(nb));
+            if (strcmp(nb, sLockName[i]) != 0) {
+                strncpy(sLockName[i], nb, sizeof(sLockName[i]) - 1);
+                float *tl = (float *)((BYTE *)t + F.Location);
+                float dd = (float)sqrt((tl[0]-org[0])*(tl[0]-org[0]) +
+                                       (tl[1]-org[1])*(tl[1]-org[1]) +
+                                       (tl[2]-org[2])*(tl[2]-org[2]));
+                logf_("  [aimfx] p%d lock -> %s at %.0f units", i, nb, dd);
+            }
+            float *tl = (float *)((BYTE *)t + F.Location);
+            aim[0] = tl[0]; aim[1] = tl[1]; aim[2] = tl[2] + 30.0f;
+            snapped = TRUE;     // already line-of-sight verified by the cone
+            locked  = TRUE;
+            aimD = (float)sqrt((aim[0]-org[0])*(aim[0]-org[0]) +
+                               (aim[1]-org[1])*(aim[1]-org[1]) +
+                               (aim[2]-org[2])*(aim[2]-org[2]));
+        }
+    }
+
+    if (!snapped) {
+    // v23 probe policy: fine steps from CLOSE in ({60,110,160,220,...}),
+    // hug the first blocker at -40 (v20's hard 150-ray-min BURIED the
+    // marker inside near walls: blockedD=150 -> want=110 -> clamped back
+    // to 150 = inside the geometry, glow gone at close range), open air
+    // parks at 900 (in range, not far). Hysteresis: snap IN instantly,
+    // ease OUT ~35%/frame. A final clear-line validation below pulls the
+    // point back until FastTrace passes - visibility beats everything.
+    static const float PD[14] = { 60, 110, 160, 220, 300, 400, 520, 660,
+                                  820, 1000, 1250, 1600, 2000, 3000 };
+    float blockedD = 0.0f;
+    for (int k = 0; k < 14; k++) {
+        float q[3] = { org[0] + dx * PD[k], org[1] + dy * PD[k],
+                       org[2] + dz * PD[k] };
+        if (!fastTraceClear(pawn, org, q)) { blockedD = PD[k]; break; }
+    }
+    if (blockedD > 0.0f) snapped = TRUE;         // hugging a surface
+    float want = (blockedD > 0.0f) ? blockedD - 40.0f : 900.0f;
+    if (want < 60.0f) want = 60.0f;
+    if (g_aimDSmooth[i] <= 0.0f || want < g_aimDSmooth[i])
+        g_aimDSmooth[i] = want;
+    else
+        g_aimDSmooth[i] += (want - g_aimDSmooth[i]) * 0.35f;
+    aimD = g_aimDSmooth[i];
+    aim[0] = org[0] + dx * aimD; aim[1] = org[1] + dy * aimD;
+    aim[2] = org[2] + dz * aimD;
+    }
+    // v22: horizontal clearance. Even at >=150 along the RAY, a steeply
+    // downward aim puts the marker back under/into the caster (the ray
+    // from the nudged origin re-enters her cylinder from above). Enforce
+    // >=110 units of HORIZONTAL distance from the pawn origin - push the
+    // point outward along the ray's horizontal projection (or her facing
+    // if the ray is near-vertical).
+    if (F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
+        float *pc = (float *)((BYTE *)pawn + F.Location);
+        float hx = aim[0] - pc[0], hy = aim[1] - pc[1];
+        float hd = sqrtf(hx * hx + hy * hy);
+        if (hd < 110.0f) {
+            float ux, uy;
+            if (fabsf(dx) + fabsf(dy) > 0.05f) { ux = dx; uy = dy; }
+            else if (F.Rotation > 0 &&
+                     !IsBadReadPtr(pawn, F.Rotation + 12)) {
+                int fy = *(int *)((BYTE *)pawn + F.Rotation + 4);
+                double fr = fy * (6.283185307179586 / 65536.0);
+                ux = (float)cos(fr); uy = (float)sin(fr);
+            } else { ux = 1.0f; uy = 0.0f; }
+            float ul = sqrtf(ux * ux + uy * uy);
+            if (ul < 0.01f) { ux = 1.0f; uy = 0.0f; ul = 1.0f; }
+            float push = 110.0f - hd;
+            aim[0] += ux / ul * push; aim[1] += uy / ul * push;
+        }
+    }
+    // v23: final validation - whatever the math produced, the marker must
+    // be on a CLEAR LINE from the origin (a push for clearance can land
+    // inside geometry). Pull the point back toward the origin until
+    // FastTrace passes; visibility beats clearance.
+    for (int v = 0; v < 5; v++) {
+        if (fastTraceClear(pawn, org, aim)) break;
+        aim[0] = org[0] + (aim[0] - org[0]) * 0.7f;
+        aim[1] = org[1] + (aim[1] - org[1]) * 0.7f;
+        aim[2] = org[2] + (aim[2] - org[2]) * 0.7f;
+    }
+    // v24: BODY CLEARANCE - the last gate. v23 hardware log proof: close
+    // blocker at d=60 + the pull-back above CONVERGED the marker onto the
+    // ray origin - "placed=" landed ~30 units from the caster's own chest
+    // = glow inside the character. After every other step, the point must
+    // be BODY_R (horizontal) away from EVERY player pawn (caster
+    // included). Try pushing along the aim's horizontal projection (open
+    // ground) and sliding LEFT/RIGHT along a wall; every candidate must
+    // still be FastTrace-clear. If nothing clears (nose-to-wall), HIDE
+    // the glow this frame - "never inside a character" (standing rule)
+    // beats "always visible". Hysteresis 95/105 stops edge flicker.
+    // (BodyClear=0 in the ini skips this gate entirely - v27 isolation
+    // knob for the one remaining v23->v26 delta.)
+    if (g_bodyClear) {
+        float need = g_aimSup[i] ? 105.0f : 95.0f;
+        float ux = dx, uy = dy;
+        float ul = sqrtf(ux * ux + uy * uy);
+        if (ul < 0.01f) { ux = 1.0f; uy = 0.0f; ul = 1.0f; }
+        ux /= ul; uy /= ul;
+        float dirs[3][2] = { { ux, uy }, { -uy, ux }, { uy, -ux } };
+        BOOL ok = FALSE;
+        float bx = 0.0f, by = 0.0f;
+        for (int dsel = 0; dsel < 3 && !ok; dsel++) {
+            for (int st = 1; st <= 12 && !ok; st++) {
+                float cx = aim[0] + dirs[dsel][0] * (25.0f * st);
+                float cy = aim[1] + dirs[dsel][1] * (25.0f * st);
+                BOOL bad = FALSE;
+                for (int p2 = 0; p2 < 8; p2++) {
+                    void *pp = g_pawn[p2];
+                    if (!pp || F.Location <= 0 ||
+                        IsBadReadPtr(pp, F.Location + 12)) continue;
+                    float *pl = (float *)((BYTE *)pp + F.Location);
+                    float hx = cx - pl[0], hy = cy - pl[1];
+                    if (sqrtf(hx * hx + hy * hy) < need) { bad = TRUE; break; }
+                }
+                if (bad) continue;
+                float cc[3] = { cx, cy, aim[2] };
+                if (!fastTraceClear(pawn, org, cc)) continue;
+                ok = TRUE; bx = cx; by = cy;
+            }
+        }
+        if (ok) {
+            if (g_aimSup[i])
+                logf_("  [aimfx] p%d body-clear: resumed", i);
+            g_aimSup[i] = FALSE;
+            aim[0] = bx; aim[1] = by;
+        } else {
+            if (!g_aimSup[i])
+                logf_("  [aimfx] p%d body-clear: no room (nose-to-wall) - "
+                      "glow hidden", i);
+            g_aimSup[i] = TRUE;
+        }
+    }
+    if (!snapped && F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
+        // unobstructed fallback: keep the glow above the caster's feet so it
+        // never ends up under the floor (a buried spawn point can be blocked)
+        float *pl2 = (float *)((BYTE *)pawn + F.Location);
+        if (aim[2] < pl2[2] + 16.0f) aim[2] = pl2[2] + 16.0f;
+    }
+
+    // v26: remember the final aim point for the per-pane park/restore
+    // (setAimFXPaneVisible) - Location writes are the ONLY per-pane
+    // mechanism hardware has ever honored (see notes there).
+    g_aimLast[i][0] = aim[0]; g_aimLast[i][1] = aim[1];
+    g_aimLast[i][2] = aim[2];
+
+    // v22: GlowStyle=0 (default) - drive the game's OWN cursor actor
+    // instead of spawning anything. Falls through to the emitter path only
+    // if the level has no SpellCursor to borrow.
+    if (g_glowStyle == 0 && origCursorDrive(i, pawn, TRUE, aim)) {
+        if (g_aimFX[i]) { destroyAimFX(i); g_aimFX[i] = NULL; }
+        return;
+    }
+
+    // Live check: freed/reused emitters respawn. bDeleteMe catches one-shot
+    // FX that already finished (engine sets it before garbage collection).
+    BOOL alive = FALSE;
+    if (g_aimFX[i] && !IsBadReadPtr(g_aimFX[i], 0x200)) {
+        if (g_offDeleteMe > 0 && g_maskDeleteMe) {
+            DWORD d = *(DWORD *)((BYTE *)g_aimFX[i] + g_offDeleteMe);
+            alive = ((d & g_maskDeleteMe) == 0);
+        } else {
+            char b[160];
+            objName(g_aimFX[i], b, sizeof(b));
+            alive = (strstr(b, "SpellCursor") != NULL);
+        }
+    }
+    if (!alive) {
+        if (g_aimFX[i]) destroyAimFX(i);
+        // Engine.Actor.Spawn driven through a synthesized FFrame (spawnFX).
+        // If the aim point itself fails placement, retry once from a point
+        // straight above the caster - open sky, always placeable.
+        int zeroRot[3] = { 0, 0, 0 };
+        g_aimFX[i] = spawnFX(pawn, g_clsAimFX, pawn, aim, zeroRot);
+        float rescue[3] = { aim[0], aim[1], aim[2] };
+        BOOL rescued = FALSE;
+        if (!g_aimFX[i] && F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
+            float *pl3 = (float *)((BYTE *)pawn + F.Location);
+            rescue[0] = pl3[0]; rescue[1] = pl3[1]; rescue[2] = pl3[2] + 150.0f;
+            g_aimFX[i] = spawnFX(pawn, g_clsAimFX, pawn, rescue, zeroRot);
+            rescued = TRUE;
+        }
+        // Read back where the engine really placed the emitter: proves the
+        // token stream (class, owner, NAME_None, loc, rot) was consumed in
+        // the expected order.
+        float rb[3] = { 0.0f, 0.0f, 0.0f };
+        if (g_aimFX[i] && F.Location > 0 &&
+            !IsBadReadPtr(g_aimFX[i], F.Location + 12))
+            memcpy(rb, (BYTE *)g_aimFX[i] + F.Location, 12);
+        const float *req = rescued ? rescue : aim;
+        logf_("  [aimfx] p%d SpellCursorEmitter req=(%.0f %.0f %.0f) d=%.0f %s "
+              "placed=(%.0f %.0f %.0f)%s%s",
+              i, req[0], req[1], req[2], aimD,
+              locked ? "(locked)" : (snapped ? "(trace hit)" : "(fallback)"),
+              rb[0], rb[1], rb[2],
+              g_aimFX[i] ? "" : " SPAWN FAILED",
+              rescued ? " [rescue]" : "");
+        logf_("  [aimfx] p%d org=(%.0f %.0f %.0f) rot=(%d %d %d) aim=(%.0f %.0f %.0f)",
+              i, org[0], org[1], org[2],
+              camRot[0], camRot[1], camRot[2],
+              aim[0], aim[1], aim[2]);
+        if (g_aimFX[i]) {
+            g_aimFXAt[i] = GetTickCount();
+            aimFXVisuals(i, TRUE);
+            if (g_aimDiag && !g_aimDiagDone) {
+                g_aimDiagDone = TRUE;
+                aimFXDiagnose(pawn, g_aimFX[i], aim);
+            }
+        }
+    } else if (!IsBadWritePtr((BYTE *)g_aimFX[i] + F.Location, 12)) {
+        float *al = (float *)((BYTE *)g_aimFX[i] + F.Location);
+        al[0] = aim[0]; al[1] = aim[1]; al[2] = aim[2];
+        aimFXVisuals(i, FALSE);          // keep the glow breathing
+    }
+}
+
+// One-shot (dump_objects runs only): what does each candidate FX class look
+// like to the renderer right after Spawn? Dumps the live aim emitter, then
+// probe-spawns the other cursor/fx classes at the aim point, dumps them and
+// destroys them again.
+static void aimFXDiagnose(void *pawn, void *fx, const float at[3])
+{
+    logf_("  [aimdiag] === aim glow diagnostics ===");
+    logf_("  [aimdiag] live aim emitter:");
+    dumpActorVisuals(fx, "SpellCursorEmitter(live)");
+    dumpCursorInstances();     // the level's own SpellCursor0 + its fields
+    // v17 pose hunt: casting/aiming STATE FIELDS on the hero classes. If the
+    // pawn hangs in the cast pose, something here (bCasting/bAiming-ish) is
+    // still set and re-asserting the overlay every tick.
+    dumpPropsMatching("Cast");
+    dumpPropsMatching("Aim");
+    static const char *probes[] = { "hgame.SpellFlyEmitter", "hgame.SpellCursor",
+                                    NULL };
+    int zr[3] = { 0, 0, 0 };
+    for (int p = 0; probes[p]; p++) {
+        void *cls = findObjectByPath(probes[p]);
+        if (!cls) { logf_("  [aimdiag] probe %s: class not found", probes[p]); continue; }
+        float loc[3] = { at[0], at[1], at[2] + 30.0f * (p + 1) };
+        void *probe = spawnFX(pawn, cls, pawn, loc, zr);
+        logf_("  [aimdiag] probe %s spawn -> %p", probes[p], probe);
+        dumpActorVisuals(probe, probes[p]);
+        if (probe) {
+            BOOL gone = destroyActorFX(probe);
+            logf_("  [aimdiag] probe destroyed=%d", gone);
+        }
+    }
+    // The live emitter's particle object: what class is it and what does its
+    // own config look like (texture/size decide whether anything renders)?
+    char b[160];
+    if (fx && !IsBadReadPtr(fx, 0x500)) {
+        void **edata = *(void ***)((BYTE *)fx + 0x3F8);
+        if (edata && !IsBadReadPtr(edata, 4) && edata[0] &&
+            !IsBadReadPtr(edata[0], 0x100)) {
+            void *pe = edata[0];
+            logf_("  [aimdiag] particle object of the live emitter:");
+            dumpActorVisuals(pe, "ParticleEmitter obj");
+            dumpClassesMatching("SpriteEmitter");
+            static const char *texPaths[] = {
+                "Engine.SpriteEmitter.Texture", "KWGame.SpriteEmitter.Texture",
+                "Engine.ParticleEmitter.Texture", "KWGame.ParticleEmitter.Texture",
+                NULL };
+            for (int t = 0; texPaths[t]; t++) {
+                int o = propOffset(texPaths[t]);
+                if (o < 0) continue;
+                logf_("  [aimdiag] %s = +0x%X", texPaths[t], o);
+                if (!IsBadReadPtr(pe, o + 4)) {
+                    void *tex = *(void **)((BYTE *)pe + o);
+                    logf_("    texture value = %p%s", tex,
+                          (tex && !IsBadReadPtr(tex, 8)) ? objName(tex, b, sizeof(b)) : "");
+                }
+            }
+        }
+    }
+    // v19: the rendered glow is the emitter's PARTICLES - the ACTOR's
+    // DrawScale does not scale them (measured: identical px footprint with
+    // 1.9+0.7 vs 1.2+0.4 pulsing). Dump the particle class's property list
+    // and every *Size* property anywhere, so the real size knob can be
+    // found and written from aimFXVisuals.
+    // v19 size research, kept for the record (see the sizing note in
+    // aimFXVisuals for the conclusions): the glow's fixed-size floor is
+    // authored by the game FX system at spawn. StartSizeRange on the live
+    // emitter and on the class-default archetype, Opacity, and the actor
+    // DrawScale below ~1.6 were ALL measured inert against it.
+    logf_("  [aimdiag] --- size-knob hunt (v19) ---");
+    dumpClassPropsFull("hgame.SpellCursorEmitter");
+    dumpPropsAny("Size");
+    if (fx && !IsBadReadPtr(fx, 0x500) && g_offEmbAimFX > 0 &&
+        !IsBadReadPtr((BYTE *)fx + g_offEmbAimFX, 8)) {
+        void *edata = *(void **)((BYTE *)fx + g_offEmbAimFX);
+        int   ecnt  = *(int *)((BYTE *)fx + g_offEmbAimFX + 4);
+        logf_("    Emitters array: count=%d data=%p", ecnt, edata);
+        if (ecnt < 0 || ecnt > 8) ecnt = 1;
+        for (int e = 0; e < ecnt && e < 4; e++) {
+            void *pe = ((void **)edata)[e];
+            if (!pe || IsBadReadPtr(pe, 0x4A0)) continue;
+            logf_("    emitter %d @ %p (start size range at diag time: "
+                  "%.0f/%.0f)", e, pe,
+                  *(float *)((BYTE *)pe + 0x2B8),
+                  *(float *)((BYTE *)pe + 0x2B8 + 12));
+        }
+    }
+    // list every SpellCursorEmitter-ish object incl. the class-default
+    // emitter archetype the engine copies at spawn.
+    if (g_objArray) {
+        char nb[160];
+        logf_("    all SpellCursorEmitter-ish objects:");
+        for (int i = 0; i < g_objArray->Num; i++) {
+            void *o = g_objArray->Data[i];
+            if (!o || IsBadReadPtr(o, 8)) continue;
+            objName(o, nb, sizeof(nb));
+            if (!strstr(nb, "SpellCursorEmitter")) continue;
+            logf_("      %p  %s", o, nb);
+        }
+    }
+    logf_("  [aimdiag] === end diagnostics ===");
+}
+
+// Press: enter the same aiming/casting pose the original player uses.
+// Release: actually fire. The projectile is left alive to fly and hit things.
+static void beginCast(int i, void *pawn)
+{
+    if (i >= 0 && i < 8) g_ownCastAt[i] = GetTickCount();   // v47: own-cast clock
+
+    char b[160];
+    void *cls = spellClassFor(pawn);
+    logf_("  [cast-begin] p%d pawn=%s spellClass=%s", i, g_pawnName[i],
+          cls ? objName(cls, b, sizeof(b)) : "<NONE>");
+    if (!cls) { logf_("    !! no spell class available - cast skipped"); return; }
+
+    if (g_offCurrentSpell > 0) *(void **)((BYTE *)pawn + g_offCurrentSpell) = cls;
+
+    if (g_fnChoose) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        *(void **)(p + 0x00) = cls;
+        *(DWORD *)(p + 0x04) = 1;
+        callFnP(pawn, g_fnChoose, p, 12, "ChooseSpell(cls,force)");
+    }
+    if (g_fnShowWeapon)  callFn(pawn, g_fnShowWeapon, "ShowWeapon");
+    if (g_fnSwitchFight) callFn(pawn, g_fnSwitchFight, "SwitchToFightStanceAnims");
+    if (g_fnCanCast) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        callFnP(pawn, g_fnCanCast, p, 4, "canCast()");
+    }
+    if (g_fnStartCast) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        *(void **)(p + 0x00) = cls;
+        *(float *)(p + 0x04) = 1.0f;
+        callFnP(pawn, g_fnStartCast, p, 12, "StartCasting(cls,1.0)");
+    }
+    if (g_fnPlayCastAim) callFn(pawn, g_fnPlayCastAim, "playCastAim");
+}
+
+static void fireCast(int i, void *pawn)
+{
+    char b[160];
+    void *cls = spellClassFor(pawn);
+    logf_("  [cast-fire] p%d pawn=%s spellClass=%s", i, g_pawnName[i],
+          cls ? objName(cls, b, sizeof(b)) : "<NONE>");
+    if (!cls) return;
+
+    void *target = NULL;
+    if (g_aimedCast) {
+        float d = 0.0f;
+        target = findAimTarget(pawn, &d, TRUE);
+        if (target) logf_("    aim -> %s at %.0f units",
+                          objName(target, b, sizeof(b)), d);
+        else        logf_("    aim -> no target in cone, firing straight ahead");
+        if (g_offSpellTarget > 0) *(void **)((BYTE *)pawn + g_offSpellTarget) = target;
+    }
+
+    if (g_fnPlayCast) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        *(void **)(p + 0x00) = target;
+        *(void **)(p + 0x10) = cls;
+        callFnP(pawn, g_fnPlayCast, p, 20, "playCast(tgt,0,cls)");
+    }
+    {   // castSpell(target, offset, class) - the gameplay fire
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        *(void **)(p + 0x00) = target;
+        *(void **)(p + 0x10) = cls;
+        callFnP(pawn, g_fnCast, p, 20, "castSpell(tgt,0,cls)");
+    }
+    if (g_fnCharFire) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        callFnP(pawn, g_fnCharFire, p, 4, "HPCharacter.Fire(0)");
+    }
+    if (g_fnSpawnSpell) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        *(void **)(p + 0x00) = cls;
+        *(void **)(p + 0x04) = target;
+        callFnP(pawn, g_fnSpawnSpell, p, 12, "SpawnSpell(cls,target)");
+        void *spawned = *(void **)(p + 0x08);
+        g_castPending[i]  = GetTickCount();
+        g_postPush[i]     = FALSE;       // v37: one physics-rest sample/cast
+        g_settleAlign[i]  = FALSE;       // v40: one anim re-pick per cast
+        g_realignNeed[i]  = FALSE;       // v47: newer cast owns the pawn
+        discoverStateField(pawn);
+        if (i > 0) pelogAuto();          // v36: timeline around every cast
+        g_castPhys0[i]    = (F.Physics > 0 && !IsBadReadPtr(pawn, F.Physics))
+                          ? *((BYTE *)pawn + F.Physics) : 0;
+        g_castActor[i]    = spawned;
+        g_castLoggedFly[i] = FALSE;
+        logf_("    SpawnSpell -> %s",
+              spawned ? objName(spawned, b, sizeof(b)) : "<null>");
+
+        // Detach from the caster and kick it along the view so it actually
+        // flies like player 1's projectile instead of hanging as a glow.
+        if (spawned && !IsBadReadPtr(spawned, 0x200) && F.Location > 0) {
+            if (F.Base > 0 && !IsBadWritePtr((BYTE *)spawned + F.Base, 4)) {
+                void *base = *(void **)((BYTE *)spawned + F.Base);
+                if (base == pawn) {
+                    *(void **)((BYTE *)spawned + F.Base) = NULL;
+                    logf_("    spell Base cleared (was parented to caster)");
+                }
+            }
+            // v19: SpawnSpell places the spell AT THE PAWN ORIGIN - inside
+            // the caster's own ~35r/80h collision cylinder (v18 measured
+            // local=(0,0,0)). From her own camera her body occludes the
+            // glow, but from another player's viewing angle the additive
+            // glow renders through her silhouette (v18 hardware: 255 gold
+            // px inside P2's body in P1's pane), and the overlap can jolt
+            // her on spawn. Nudge the actor out along the camera ray
+            // BEFORE anything else reads its Location: the spawn-offset
+            // learning right below then measures the NUDGED position, so
+            // the aim glow's ray origin is where spells really start.
+            // Keep this ABOVE the learning block and the velocity kick.
+            if (!IsBadWritePtr((BYTE *)spawned + F.Location, 12) &&
+                !IsBadReadPtr(pawn, F.Location + 12)) {
+                int ncy = playerCamYaw(i), ncpt = playerCamPitch(i);
+                double nry = ncy * (6.283185307179586 / 65536.0);
+                double nrp = ncpt * (6.283185307179586 / 65536.0);
+                float ncpv = (float)cos(nrp);
+                float cd[3] = { (float)cos(nry) * ncpv, (float)sin(nry) * ncpv,
+                                (float)sin(nrp) };
+                float *npl = (float *)((BYTE *)pawn + F.Location);
+                float *nsl = (float *)((BYTE *)spawned + F.Location);
+                nsl[0] = npl[0] + cd[0] * 90.0f;
+                nsl[1] = npl[1] + cd[1] * 90.0f;
+                nsl[2] = npl[2] + cd[2] * 90.0f + 45.0f;
+                logf_("    spell nudged out of caster: spawn d=(%.0f %.0f %.0f) "
+                      "(camDir*90 + 45Z)",
+                      nsl[0] - npl[0], nsl[1] - npl[1], nsl[2] - npl[2]);
+            }
+            float *sl = (float *)((BYTE *)spawned + F.Location);
+            g_castSpawnLoc[i][0] = sl[0];
+            g_castSpawnLoc[i][1] = sl[1];
+            g_castSpawnLoc[i][2] = sl[2];
+            // v18: learn where SpawnSpell really puts the spell, in pawn-local
+            // space, so the aim glow's ray origin is the spell's own origin.
+            if (F.Rotation > 0 && !IsBadReadPtr(pawn, F.Rotation + 12)) {
+                float *pl = (float *)((BYTE *)pawn + F.Location);
+                float d[3] = { sl[0] - pl[0], sl[1] - pl[1], sl[2] - pl[2] };
+                int pyaw = *(int *)((BYTE *)pawn + F.Rotation + 4);
+                rotYaw(d, -pyaw * (6.283185307179586 / 65536.0));
+                g_spellOffLocal[0] = d[0]; g_spellOffLocal[1] = d[1];
+                g_spellOffLocal[2] = d[2];
+                BOOL first = !g_spellOffLearned;
+                g_spellOffLearned = TRUE;
+                if (first)
+                    logf_("    spell spawn offset learned: local=(%.0f %.0f %.0f) "
+                          "world d=(%.0f %.0f %.0f)",
+                          d[0], d[1], d[2], sl[0] - pl[0], sl[1] - pl[1], sl[2] - pl[2]);
+            }
+            if (F.Velocity > 0) {
+                float *sv = (float *)((BYTE *)spawned + F.Velocity);
+                float sp = sqrtf(sv[0]*sv[0] + sv[1]*sv[1] + sv[2]*sv[2]);
+                if (!target) {
+                    // v13/v14: no auto-target -> fire along the camera view,
+                    // yaw AND pitch ("aim where the camera points").
+                    // v14: also aim the spell ACTOR's rotation and use the
+                    // spell's own Speed. baseSpell extends Engine.Projectile;
+                    // projectile script re-derives Velocity from Rotation, so
+                    // a velocity-only kick (v13) was overwritten back to
+                    // horizontal on the next tick - spells never flew up.
+                    int cy = playerCamYaw(i), cpt = playerCamPitch(i);
+                    double ry = cy  * (6.283185307179586 / 65536.0);
+                    double rp = cpt * (6.283185307179586 / 65536.0);
+                    float speed = 1200.0f;
+                    if (g_offProjSpeed > 0 &&
+                        !IsBadReadPtr((BYTE *)spawned + g_offProjSpeed, 4)) {
+                        float s = *(float *)((BYTE *)spawned + g_offProjSpeed);
+                        if (s > 100.0f && s < 20000.0f) speed = s;
+                    }
+                    float cpv = (float)cos(rp);
+                    float dx = (float)cos(ry) * cpv, dy = (float)sin(ry) * cpv;
+                    float dz = (float)sin(rp);
+                    sv[0] = dx * speed; sv[1] = dy * speed; sv[2] = dz * speed;
+                    if (g_offProjMaxSpeed > 0 &&
+                        !IsBadWritePtr((BYTE *)spawned + g_offProjMaxSpeed, 4))
+                        *(float *)((BYTE *)spawned + g_offProjMaxSpeed) = speed * 1.5f;
+                    if (F.Rotation > 0 &&
+                        !IsBadWritePtr((BYTE *)spawned + F.Rotation, 12)) {
+                        int *sr = (int *)((BYTE *)spawned + F.Rotation);
+                        sr[0] = cpt; sr[1] = cy; sr[2] = 0;
+                    }
+                    if (F.DesiredRotation > 0 &&
+                        !IsBadWritePtr((BYTE *)spawned + F.DesiredRotation, 12)) {
+                        int *dr = (int *)((BYTE *)spawned + F.DesiredRotation);
+                        dr[0] = cpt; dr[1] = cy; dr[2] = 0;
+                    }
+                    if (F.Acceleration > 0 &&
+                        !IsBadWritePtr((BYTE *)spawned + F.Acceleration, 12)) {
+                        float *sa = (float *)((BYTE *)spawned + F.Acceleration);
+                        sa[0] = sa[1] = sa[2] = 0.0f;   // no homing pull
+                    }
+                    if (F.Physics > 0)
+                        *((BYTE *)spawned + F.Physics) = 6;  // PHYS_Projectile
+                    logf_("    spell aimed along camera yaw=%d pitch=%d "
+                          "speed=%.0f (was %.0f u/s)", cy, cpt, speed, sp);
+                } else if (sp < 20.0f) {
+                    int yaw = playerViewYaw(i);
+                    double r = yaw * (6.283185307179586 / 65536.0);
+                    sv[0] = (float)cos(r) * 1200.0f;
+                    sv[1] = (float)sin(r) * 1200.0f;
+                    sv[2] =  40.0f;
+                    if (F.Physics > 0) *((BYTE *)spawned + F.Physics) = 6; // PHYS_Projectile
+                    logf_("    spell given projectile velocity (was stationary)");
+                } else {
+                    logf_("    spell already moving at %.0f units/s", sp);
+                }
+            }
+        }
+    }
+    if (g_fnFinalize) callFn(pawn, g_fnFinalize, "finalizeSpell");
+}
+
+// Interact / use: trigger whatever the pawn is standing at, and pick up a
+// carryable if the game says one is in range.
+static void doUse(int i, void *pawn)
+{
+    logf_("  [use] p%d pawn=%s", i, g_pawnName[i]);
+    if (g_fnCanPickup) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        callFnP(pawn, g_fnCanPickup, p, 4, "CanDoPickupActor()");
+        if (p[0] && g_fnPickup) {
+            BYTE q[64]; memset(q, 0, sizeof(q));
+            callFnP(pawn, g_fnPickup, q, 4, "PickupActor(NULL)");
+        }
+    }
+    if (g_fnTrigger) {
+        BYTE p[64]; memset(p, 0, sizeof(p));
+        callFnP(pawn, g_fnTrigger, p, 12, "Trigger()");
+    }
+}
+
+// Stop the companion AI fighting us for control.
+// Hard UnPossess (v7) DID stop the AI — and also stopped the engine integrating
+// walking physics, so player 2 could turn and cast but not walk. The controller
+// must stay linked. Soft StopTrailing + bControlAnimations=0, then while the
+// player is idle we pin GroundSpeed/AccelRate to 0 and snap XY if the AI still
+// shoves the pawn. While the player is moving we restore those and write vel.
+static BOOL g_aiReleased[8] = {0};
+static BOOL g_letAI[8]     = {0};          // debug: M key hands the pawn back
+static void *g_savedCtrl[8] = {0};
+
+// Only companion/AI controllers may be UnPossessed. Calling HPAIController.UnPossess
+// on a KWCutControllerII tears down the cutscene state machine and GPFs
+// (AActor::ProcessState on KWCutControllerII.Scripting).
+static BOOL isCompanionCtrl(const char *name)
+{
+    if (!name || !name[0]) return FALSE;
+    if (strstr(name, "CutController") || strstr(name, "KWCut")) return FALSE;
+    if (strstr(name, "HPCompanionController")) return TRUE;
+    if (strstr(name, "HPAIController")) return TRUE;
+    if (strstr(name, "CompanionController")) return TRUE;
+    return FALSE;
+}
+
+// Open the companion follow sphere (TrailCharFollowRadius) and forget the lead.
+// Cheap field writes - safe every frame. The sphere around Harry is this radius.
+static void cutLeash(int i, void *pawn, void *ctrl)
+{
+    if (ctrl && g_offFollowRadius > 0 &&
+        !IsBadWritePtr((BYTE *)ctrl + g_offFollowRadius, 4)) {
+        float *r = (float *)((BYTE *)ctrl + g_offFollowRadius);
+        if (*r < 40000.0f) {
+            static DWORD lastLog[8] = {0};
+            DWORD n = GetTickCount();
+            if ((n - lastLog[i]) >= 2000) {
+                lastLog[i] = n;
+                logf_("  [leash] p%d TrailCharFollowRadius %.0f -> 50000", i, *r);
+            }
+            *r = 50000.0f;
+        }
+    }
+    if (ctrl && g_offLeadChar > 0 &&
+        !IsBadWritePtr((BYTE *)ctrl + g_offLeadChar, 4)) {
+        void **lc = (void **)((BYTE *)ctrl + g_offLeadChar);
+        if (*lc) {
+            static DWORD lastLc[8] = {0};
+            DWORD n = GetTickCount();
+            if ((n - lastLc[i]) >= 2000) {
+                lastLc[i] = n;
+                char b[160];
+                logf_("  [leash] p%d LeadChar %s cleared", i, objName(*lc, b, sizeof(b)));
+            }
+            *lc = NULL;
+        }
+    }
+    if (ctrl && g_offUseDistLead > 0)
+        setBoolProp(ctrl, g_offUseDistLead, g_maskUseDistLead, FALSE);
+    // Harry.TrailingChar still pointing at us keeps the leash alive.
+    void *lead = g_pawn[0];
+    if (!lead) lead = findActorByClass("harry");
+    if (lead) {
+        if (!g_pawn[0]) g_pawn[0] = lead;
+        if (g_offTrailingChar > 0 &&
+            !IsBadWritePtr((BYTE *)lead + g_offTrailingChar, 4)) {
+            void **tc = (void **)((BYTE *)lead + g_offTrailingChar);
+            if (*tc == pawn) {
+                *tc = NULL;
+                logf_("  [leash] p%d dropped from lead.TrailingChar", i);
+            }
+        }
+    }
+}
+
+static void releaseAI(int i, void *pawn, BOOL hard)
+{
+    void *ctrl = *(void **)((BYTE *)pawn + F.PawnController);
+    char b[160];
+    logf_("  [ai-release%s] p%d pawn=%s controller=%s", hard ? "/hard" : "/soft",
+          i, g_pawnName[i], ctrl ? objName(ctrl, b, sizeof(b)) : "<none>");
+    if (!ctrl) { logf_("    (already released)"); return; }
+    if (hard && !isCompanionCtrl(b)) {
+        logf_("    (not a companion AI - leaving %s alone)", b);
+        return;
+    }
+
+    BYTE p[64];
+    if (!hard) {
+        if (g_fnStopTrail) { memset(p, 0, sizeof(p));
+            callFnP(ctrl, g_fnStopTrail, p, 4, "OnStopTrailingLeadChar()"); }
+        if (g_fnStopTrailKW) { memset(p, 0, sizeof(p));
+            callFnP(ctrl, g_fnStopTrailKW, p, 4, "KWAIController.StopTrailingLeadChar()"); }
+        cutLeash(i, pawn, ctrl);
+        {
+            void *lead = g_pawn[0] ? g_pawn[0] : findActorByClass("harry");
+            if (lead && g_fnDropTrail) {
+                BYTE q[64]; memset(q, 0, sizeof(q));
+                *(void **)q = pawn;
+                callFnP(lead, g_fnDropTrail, q, 8, "DropTrailingChar(pawn)");
+            }
+        }
+        if (g_offCtrlAnims > 0)
+            setBoolProp(ctrl, g_offCtrlAnims, g_maskCtrlAnims, FALSE);
+        if (g_fnChangeAnim) callFn(pawn, g_fnChangeAnim, "ChangeAnimation");
+        g_aiReleased[i] = TRUE;
+        return;
+    }
+    if (g_offCtrlAnims > 0)
+        setBoolProp(ctrl, g_offCtrlAnims, g_maskCtrlAnims, FALSE);
+    g_savedCtrl[i] = ctrl;
+    void *fn = g_fnUnPossessAI ? g_fnUnPossessAI : g_fnUnPossess;
+    if (!fn) {
+        logf_("    !! no UnPossess UFunction - falling back to soft release");
+        releaseAI(i, pawn, FALSE);
+        return;
+    }
+    memset(p, 0, sizeof(p));
+    callFnP(ctrl, fn, p, 4, g_fnUnPossessAI ? "derived.UnPossess()"
+                                            : "Controller.UnPossess()");
+    // UnPossess may drop Physics to PHYS_None; walking physics must stay on
+    // or our velocity writes are ignored and the pawn freezes.
+    if (F.Physics > 0 && !IsBadWritePtr((BYTE *)pawn + F.Physics, 1)) {
+        BYTE ph = *((BYTE *)pawn + F.Physics);
+        if (ph == 0) *((BYTE *)pawn + F.Physics) = 1;
+    }
+    if (g_offDontPossess > 0)
+        setBoolProp(pawn, g_offDontPossess, g_maskDontPossess, TRUE);
+    // Belt: if the controller still points at us, cut that link too.
+    if (F.ControllerPawn > 0 && !IsBadWritePtr((BYTE *)ctrl + F.ControllerPawn, 4)) {
+        if (*(void **)((BYTE *)ctrl + F.ControllerPawn) == pawn)
+            *(void **)((BYTE *)ctrl + F.ControllerPawn) = NULL;
+    }
+    logf_("  [ai-release/hard] Pawn.Controller now = %p phys=%d",
+          *(void **)((BYTE *)pawn + F.PawnController),
+          F.Physics > 0 ? *((BYTE *)pawn + F.Physics) : -1);
+    g_aiReleased[i] = TRUE;
+}
+
+// Every driven frame: keep animation channels on physics, not the AI. Do NOT
+// UnPossess — that kills walking. Do NOT null Controller.Pawn.
+static void suppressAI(int i, void *pawn)
+{
+    if (!F.ok || !pawn || i < 1 || i >= 8) return;
+    if (g_letAI[i]) return;
+    if (F.PawnController <= 0) return;
+    void *ctrl = *(void **)((BYTE *)pawn + F.PawnController);
+    if (!ctrl || IsBadReadPtr(ctrl, 0x100)) return;
+    char b[160];
+    objName(ctrl, b, sizeof(b));
+    if (!isCompanionCtrl(b)) return;
+    if (g_offCtrlAnims > 0)
+        setBoolProp(ctrl, g_offCtrlAnims, g_maskCtrlAnims, FALSE);
+    cutLeash(i, pawn, ctrl);
+}
+
+// Undo a hard release: give the pawn back to its original controller so the
+// engine resumes ticking its physics.
+static void repossess(int i, void *pawn)
+{
+    if (!g_savedCtrl[i]) return;
+    if (g_offDontPossess > 0)
+        setBoolProp(pawn, g_offDontPossess, g_maskDontPossess, FALSE);
+    void *fn = g_fnPossessAI ? g_fnPossessAI : findObjectByPath("Engine.Controller.Possess");
+    if (!fn) return;
+    BYTE p[64]; memset(p, 0, sizeof(p));
+    *(void **)(p + 0x00) = pawn;                 // aPawn
+    callFnP(g_savedCtrl[i], fn, p, 8, "Controller.Possess(pawn)");
+    logf_("  [ai-restore] p%d Pawn.Controller now = %p", i,
+          *(void **)((BYTE *)pawn + F.PawnController));
+    g_savedCtrl[i] = NULL;
+    g_aiReleased[i] = FALSE;
+}
+
+
+// ------------------------- player 2..N control -----------------------------
+// Field offsets are resolved BY NAME through UProperty::Offset, never guessed.
+
+
+// Canvas drawing window, resolved by name like everything else.
+static struct { int OrgX, OrgY, ClipX, ClipY; } C = { -1, -1, -1, -1 };
+
+static void resolveCanvasFields(void)
+{
+    if (C.ClipX >= 0 || g_propOffsetField < 0) return;
+    C.OrgX  = propOffset("Engine.Canvas.OrgX");
+    C.OrgY  = propOffset("Engine.Canvas.OrgY");
+    C.ClipX = propOffset("Engine.Canvas.ClipX");
+    C.ClipY = propOffset("Engine.Canvas.ClipY");
+    logf_("[canvas] OrgX=+0x%X OrgY=+0x%X ClipX=+0x%X ClipY=+0x%X",
+          C.OrgX, C.OrgY, C.ClipX, C.ClipY);
+    if (C.OrgX < 0 || C.OrgY < 0 || C.ClipX < 0 || C.ClipY < 0) {
+        C.ClipX = -1;                     // incomplete -> disable HUD clipping
+        logf_("[canvas] incomplete - HUD will not be clipped");
+    }
+}
+
+static void resolveFields(void)
+{
+    static int tries = 0;
+    if (F.ok || tries >= 5) return;
+    tries++;
+    if (g_propOffsetField < 0) calibratePropertyOffset();
+    if (g_propOffsetField < 0) return;
+    F.Location       = propOffset("Engine.Actor.Location");
+    F.Rotation       = propOffset("Engine.Actor.Rotation");
+    F.Velocity       = propOffset("Engine.Actor.Velocity");
+    F.Acceleration   = propOffset("Engine.Actor.Acceleration");
+    F.LifeSpan       = propOffset("Engine.Actor.LifeSpan");
+    F.Physics        = propOffset("Engine.Actor.Physics");
+    F.PawnController = propOffset("Engine.Pawn.Controller");
+    F.ControllerPawn = propOffset("Engine.Controller.Pawn");
+    F.GroundSpeed    = propOffset("Engine.Pawn.GroundSpeed");
+    F.JumpZ          = propOffset("Engine.Pawn.JumpZ");
+    F.AccelRate      = propOffset("Engine.Pawn.AccelRate");
+    F.Base           = propOffset("Engine.Actor.Base");
+    F.DesiredRotation= propOffset("Engine.Actor.DesiredRotation");
+    F.RotationRate   = propOffset("Engine.Actor.RotationRate");
+    resolveCanvasFields();
+    F.ok = (F.Location > 0 && F.Rotation > 0 && F.Acceleration > 0 &&
+            F.PawnController > 0 && F.ControllerPawn > 0);
+    logf_("[fields] Loc=+0x%X Rot=+0x%X Vel=+0x%X Accel=+0x%X Phys=+0x%X "
+          "Pawn.Ctrl=+0x%X Ctrl.Pawn=+0x%X GroundSpeed=+0x%X JumpZ=+0x%X "
+          "AccelRate=+0x%X Base=+0x%X DesRot=+0x%X RotRate=+0x%X -> %s",
+          F.Location, F.Rotation, F.Velocity, F.Acceleration, F.Physics,
+          F.PawnController, F.ControllerPawn, F.GroundSpeed, F.JumpZ,
+          F.AccelRate, F.Base, F.DesiredRotation, F.RotationRate,
+          F.ok ? "OK" : "INCOMPLETE");
+    // v41: the pawn's mesh COMPONENT carries its own rotation (UE2
+    // Actor-derived object). A mesh yaw stuck away from the actor yaw is
+    // the visible "standing in incorrect yaw". Resolved by name like every
+    // other offset; <=0 just disables the v41 yaw watch/fix.
+    g_meshOff = (g_propOffsetField >= 0)
+              ? propOffset("Engine.Actor.Mesh") : -1;
+    logf_("[fields] Mesh component prop=+0x%X (v41 yaw guard %s)",
+          g_meshOff, g_meshOff > 0 ? "ARMED" : "off");
+}
+
+// Take authority over a pawn. Soft StopTrailing is not enough (AI Tick writes
+// Acceleration before our PostRender zero). Default is a derived UnPossess,
+// then we keep PHYS_Walking so collision/gravity/walk-anims still work.
+static BOOL g_detached[8] = {0};
+static float g_savedGS[8]  = {0};
+static float g_savedAR[8]  = {0};
+static float g_pinXY[8][2] = {{0}};
+static BOOL  g_pinned[8]   = {0};
+static void takeControl(int i, void *pawn)
+{
+    if (!F.ok || F.Physics < 0) return;
+    if (!pawn || IsBadReadPtr(pawn, F.Physics + 1)) return;
+    if (g_letAI[i]) return;                // debug repossess - leave AI alone
+    resolveActions();
+    if (!g_detached[i]) {
+        BYTE *phys = (BYTE *)pawn + F.Physics;
+        char b[160];
+        void *ctrl = (F.PawnController > 0) ? *(void **)((BYTE *)pawn + F.PawnController) : NULL;
+        logf_("  player %d takes control of %s (was Physics=%d, AI=%s)",
+              i, g_pawnName[i], *phys,
+              ctrl ? objName(ctrl, b, sizeof(b)) : "<none>");
+        g_detached[i] = TRUE;
+        releaseAI(i, pawn, FALSE);         // soft - keep the controller for physics
+        if (g_fnChangeAnim) callFn(pawn, g_fnChangeAnim, "ChangeAnimation");
+    }
+    suppressAI(i, pawn);                   // every frame, in case it re-binds
+}
+
+// Everything cached that belongs to the current level. Called on a detected
+// level change, and by the "n" debug key so the recovery path can be tested
+// deterministically instead of hoping to catch a door transition.
+static void invalidateLevelCaches(const char *reason)
+{
+    logf_("*** %s: dropping cached actors and re-resolving", reason);
+    for (int k = 0; k < 8; k++) {
+        g_pawn[k] = NULL; g_pawnName[k][0] = 0;
+        g_detached[k] = FALSE; g_aiReleased[k] = FALSE; g_letAI[k] = FALSE;
+        g_savedCtrl[k] = NULL; g_camDistCur[k] = 0.0f;
+        g_savedGS[k] = 0; g_savedAR[k] = 0; g_pinned[k] = FALSE;
+        g_aimFX[k] = NULL; g_aimFXAt[k] = 0;   // dies with the level anyway
+    }
+    g_fnResolved = FALSE;      // UFunctions live in packages too
+    g_defaultSpell = NULL;
+    resetViewYaw();
+    F.ok = FALSE;              // re-resolve field offsets as well
+}
+
+// Input for split view i (i >= 1).
+struct PadState { float fwd, side, turn, lookx, looky; BOOL jump, cast, use; };
+
+// XInput (Xbox 360 / DualSenseX / most wrappers). Delay-loaded so a machine
+// without the DLL still runs. DualSense native is DirectInput, not XInput -
+// that is why DualSenseX "Xbox 360" did nothing in v10: we never called it.
+#ifndef XINPUT_GAMEPAD_A
+#define XINPUT_GAMEPAD_A              0x1000
+#define XINPUT_GAMEPAD_B              0x2000
+#define XINPUT_GAMEPAD_X              0x4000
+#define XINPUT_GAMEPAD_Y              0x8000
+#define XINPUT_GAMEPAD_LEFT_SHOULDER  0x0100
+#define XINPUT_GAMEPAD_RIGHT_SHOULDER 0x0200
+#endif
+typedef struct { WORD wButtons; BYTE bLeftTrigger; BYTE bRightTrigger;
+                 SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY; } XI_PAD;
+typedef struct { DWORD dwPacketNumber; XI_PAD Gamepad; } XI_STATE;
+typedef DWORD (WINAPI *PFN_XIGetState)(DWORD, XI_STATE *);
+typedef void (WINAPI *PFN_XIEnable)(BOOL);
+static PFN_XIGetState g_XIGetState = NULL;
+static PFN_XIEnable   g_XIEnable   = NULL;
+static BOOL g_xiTried = FALSE;
+
+static void loadXInput(void)
+{
+    if (g_xiTried) return;
+    g_xiTried = TRUE;
+    const char *dlls[] = { "xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll", NULL };
+    for (int d = 0; dlls[d]; d++) {
+        HMODULE m = LoadLibraryA(dlls[d]);
+        if (!m) {
+            logf_("[pad] XInput LoadLibrary(%s) failed (err=%lu)",
+                  dlls[d], (unsigned long)GetLastError());
+            continue;
+        }
+        // v12: export probing by name AND ordinal. Wrappers (DualSenseX /
+        // ViGEm) frequently export by ordinal only, and xinput9_1_0.dll on
+        // real Windows exports XInputGetState ONLY as ordinal 2 - the name
+        // never resolves there. v11 probed by name only.
+        FARPROC p = NULL; const char *how = NULL;
+        if ((p = GetProcAddress(m, "XInputGetState")) != NULL)
+            how = "name XInputGetState";
+        else if ((p = GetProcAddress(m, MAKEINTRESOURCEA(2))) != NULL)
+            how = "ordinal 2";
+        else if ((p = GetProcAddress(m, MAKEINTRESOURCEA(100))) != NULL)
+            how = "ordinal 100 (GetStateEx)";
+        if (p) {
+            g_XIGetState = (PFN_XIGetState)p;
+            logf_("[pad] XInput %s -> XInputGetState via %s (%p)",
+                  dlls[d], how, (void *)p);
+            g_XIEnable = (PFN_XIEnable)GetProcAddress(m, "XInputEnable");
+            if (g_XIEnable) {
+                g_XIEnable(TRUE);
+                logf_("[pad] XInputEnable(TRUE) called");
+            }
+            return;
+        }
+        logf_("[pad] XInput %s loaded but no GetState export (name/2/100)",
+              dlls[d]);
+    }
+    logf_("[pad] XInput not available - DirectInput only");
+}
+
+static float axisNorm(DWORD pos)
+{
+    return ((float)pos - 32767.0f) / 32767.0f;
+}
+static float deadz(float v, float dz)
+{
+    if (v > -dz && v < dz) return 0.0f;
+    float s = (v > 0.0f) ? 1.0f : -1.0f;
+    return s * (fabsf(v) - dz) / (1.0f - dz);
+}
+static float xiStick(SHORT v, SHORT dz)
+{
+    float f = (float)v, d = (float)dz;
+    if (f > -d && f < d) return 0.0f;
+    float s = (f > 0.0f) ? 1.0f : -1.0f;
+    return s * (fabsf(f) - d) / (32767.0f - d);
+}
+// Analog trigger whose rest is an extreme (0 or 65535), DualSense L2/R2.
+static float trigFromRest(DWORD pos, DWORD rest)
+{
+    if (rest < 12000)
+        return (float)pos / 65535.0f;
+    if (rest > 53000)
+        return (65535.0f - (float)pos) / 65535.0f;
+    return 0.0f;
+}
+static BOOL nameHas(const char *n, const char *frag)
+{
+    if (!n || !frag) return FALSE;
+    size_t N = strlen(n), F = strlen(frag);
+    if (F == 0 || F > N) return FALSE;
+    for (size_t i = 0; i + F <= N; i++) {
+        size_t k = 0;
+        for (; k < F; k++) {
+            char a = n[i + k], b = frag[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+        }
+        if (k == F) return TRUE;
+    }
+    return FALSE;
+}
+static BOOL isSonyName(const char *n)
+{
+    return nameHas(n, "dual") || nameHas(n, "wireless controller") ||
+           nameHas(n, "playstation") || nameHas(n, "sony") ||
+           nameHas(n, "ps5") || nameHas(n, "ps4") || nameHas(n, "ds4");
+}
+
+enum { PAD_UNK = 0, PAD_XINPUT = 1, PAD_SONY = 2, PAD_XBOXDI = 3 };
+
+// Player i (>=1) reads pad (i-1). XInput first (DualSenseX / Xbox), then
+// winmm. DualSense HID: LS=X/Y, RS=Z/Rz, L2=Rx, R2=Ry, Cross=btn2, Square=btn1.
+static void readPad(int i, PadState *out)
+{
+    if (i < 1 || i >= 8) return;
+    UINT id = (UINT)(i - 1);
+    loadXInput();
+
+    if (g_XIGetState) {
+        // v12: scan ALL slots 0-3 and claim the first connected pad for this
+        // player (player 3 takes the next one). v11 polled only slot i-1=0;
+        // ViGEm/DualSenseX virtual pads routinely land on another slot, which
+        // is exactly why DualSenseX "did not respond at all".
+        static int  xiSlot[8];
+        static BOOL xiInit = FALSE;
+        if (!xiInit) {
+            for (int k = 0; k < 8; k++) xiSlot[k] = -1;
+            xiInit = TRUE;
+        }
+        if (xiSlot[i] < 0) {
+            DWORD codes[4] = { 0, 0, 0, 0 };
+            int found = -1;
+            for (DWORD s = 0; s < 4; s++) {
+                XI_STATE st;
+                memset(&st, 0, sizeof(st));
+                codes[s] = g_XIGetState(s, &st);
+                if (codes[s] != 0) continue;        // not connected
+                BOOL taken = FALSE;
+                for (int j = 0; j < 8; j++)
+                    if (j != i && xiSlot[j] == (int)s) { taken = TRUE; break; }
+                if (!taken) { found = (int)s; break; }
+            }
+            if (found >= 0) {
+                xiSlot[i] = found;
+                logf_("[pad] player %d CLAIMED XInput slot %d - A=jump RT=cast "
+                      "right stick=camera (DualSenseX / Xbox)", i, found);
+            } else {
+                static DWORD xiNoneAt[8] = {0};
+                DWORD nowc = GetTickCount();
+                if (!xiNoneAt[i] || (nowc - xiNoneAt[i]) >= 30000) {
+                    xiNoneAt[i] = nowc;
+                    logf_("[pad] player %d: no free XInput pad on slots 0-3 "
+                          "(codes %u %u %u %u) - trying DirectInput",
+                          i, codes[0], codes[1], codes[2], codes[3]);
+                }
+            }
+        }
+        if (xiSlot[i] >= 0) {
+            XI_STATE st;
+            memset(&st, 0, sizeof(st));
+            DWORD xr = g_XIGetState((DWORD)xiSlot[i], &st);
+            if (xr != 0) {
+                logf_("[pad] player %d LOST XInput slot %d (%lu) - re-scanning",
+                      i, xiSlot[i], (unsigned long)xr);
+                xiSlot[i] = -1;
+            } else {
+                const float DZ_L = 7849.0f, DZ_R = 8689.0f;
+                float ly = xiStick(st.Gamepad.sThumbLY, (SHORT)DZ_L);
+                float lx = xiStick(st.Gamepad.sThumbLX, (SHORT)DZ_L);
+                out->fwd += ly;                     // XInput Y up = forward
+                if (g_strafeMode) out->side += lx;
+                else              out->turn += lx;
+                out->lookx += xiStick(st.Gamepad.sThumbRX, (SHORT)DZ_R);
+                // XInput RY up-positive -> PadState looky is Windows Y-down.
+                out->looky += -xiStick(st.Gamepad.sThumbRY, (SHORT)DZ_R);
+                if (st.Gamepad.wButtons & XINPUT_GAMEPAD_A) out->jump = TRUE;
+                if (st.Gamepad.wButtons & XINPUT_GAMEPAD_X) out->use  = TRUE;
+                if (st.Gamepad.bRightTrigger > 30)          out->cast = TRUE;
+                static DWORD lastXi[8] = {0};
+                DWORD now = GetTickCount();
+                if ((now - lastXi[i]) >= 2000) {
+                    lastXi[i] = now;
+                    logf_("[pad] p%d XInput slot=%d LS=(%+.2f %+.2f) RS=(%+.2f %+.2f) "
+                          "LT=%u RT=%u btns=0x%04X",
+                          i, xiSlot[i], lx, ly,
+                          xiStick(st.Gamepad.sThumbRX, (SHORT)DZ_R),
+                          xiStick(st.Gamepad.sThumbRY, (SHORT)DZ_R),
+                          (unsigned)st.Gamepad.bLeftTrigger,
+                          (unsigned)st.Gamepad.bRightTrigger,
+                      (unsigned)st.Gamepad.wButtons);
+                }
+                return;     // do not also read HID, or DualSenseX + native would double
+            }
+        }
+    }
+
+    static char  padName[8][MAXPNAMELEN];
+    static int   padProf[8]  = {0};
+    static DWORD restRaw[8][6];
+    static int   restN[8]    = {0};
+    static BOOL  restOK[8]   = {0};
+
+    // ---- v26: legacy-joystick live-scan ----------------------------------
+    // v12 fixed the "wrong device" problem for XInput (virtual pads steal
+    // slot 0); the HID path still polled a hard-coded id = i-1. The v25
+    // hardware report: the DualSense was polled at id 0 through a generic
+    // "Microsoft PC-joystick driver" entry that reports permanently
+    // neutral axes (32767) and no buttons - an idle/virtual stick sitting
+    // at id 0 while the real pad lives at another id. Fix: log the whole
+    // joystick id map once, then watch all ids and LOCK onto the first
+    // one that shows live input (a button, or an axis that MOVED between
+    // scans - resting triggers at 0 do not count as movement).
+    static int  joyLock[8];
+    static BOOL joyInit = FALSE;
+    if (!joyInit) {
+        for (int k = 0; k < 8; k++) joyLock[k] = -1;
+        joyInit = TRUE;
+    }
+    if (joyLock[i] < 0) {
+        static BOOL  sMapped[8] = { FALSE };
+        static DWORD sScanAt[8] = { 0 };
+        static DWORD sPrevAx[8][16][6];
+        static DWORD sPrevBtn[8][16];
+        DWORD nowJ = GetTickCount();
+        if (!sMapped[i]) {
+            sMapped[i] = TRUE;
+            for (UINT d2 = 0; d2 < 16; d2++) {
+                JOYCAPSA c2; memset(&c2, 0, sizeof(c2));
+                if (joyGetDevCapsA(d2, &c2, sizeof(c2)) == JOYERR_NOERROR)
+                    logf_("[pad] joy id=%u name='%s' mid=%u pid=%u "
+                          "btns=%u axes=%u",
+                          d2, c2.szPname, c2.wMid, c2.wPid,
+                          c2.wNumButtons, c2.wNumAxes);
+            }
+        }
+        if (nowJ - sScanAt[i] >= 300) {
+            sScanAt[i] = nowJ;
+            for (UINT d2 = 0; d2 < 16; d2++) {
+                if (d2 == id) continue;            // default already polled
+                BOOL taken = FALSE;
+                for (int j2 = 0; j2 < 8; j2++)
+                    if (j2 != i && joyLock[j2] == (int)d2)
+                        { taken = TRUE; break; }
+                if (taken) continue;
+                JOYINFOEX j2i; memset(&j2i, 0, sizeof(j2i));
+                j2i.dwSize  = sizeof(j2i);
+                j2i.dwFlags = JOY_RETURNX | JOY_RETURNY | JOY_RETURNZ |
+                              JOY_RETURNR | JOY_RETURNU | JOY_RETURNV |
+                              JOY_RETURNBUTTONS;
+                if (joyGetPosEx(d2, &j2i) != JOYERR_NOERROR) continue;
+                DWORD ax[6] = { j2i.dwXpos, j2i.dwYpos, j2i.dwZpos,
+                                j2i.dwRpos, j2i.dwUpos, j2i.dwVpos };
+                BOOL live = (j2i.dwButtons != 0);
+                for (int a = 0; a < 6 && !live; a++) {
+                    DWORD dv = (ax[a] > sPrevAx[i][d2][a])
+                             ? ax[a] - sPrevAx[i][d2][a]
+                             : sPrevAx[i][d2][a] - ax[a];
+                    if (dv > 600) live = TRUE;
+                }
+                memcpy(sPrevAx[i][d2], ax, sizeof(ax));
+                sPrevBtn[i][d2] = j2i.dwButtons;
+                if (live) {
+                    joyLock[i] = (int)d2;
+                    padProf[i] = 0;               // re-profile the new device
+                    restOK[i]  = FALSE;
+                    restN[i]   = 0;
+                    logf_("[pad] p%d LIVE input on joy id=%u - locking "
+                          "(default id %u was dead)", i, d2, id);
+                    id = d2;
+                    break;
+                }
+            }
+        }
+    } else if ((UINT)joyLock[i] != id) {
+        id = (UINT)joyLock[i];
+    }
+
+    JOYINFOEX ji;
+    memset(&ji, 0, sizeof(ji));
+    ji.dwSize  = sizeof(ji);
+    ji.dwFlags = JOY_RETURNX | JOY_RETURNY | JOY_RETURNZ | JOY_RETURNR |
+                 JOY_RETURNU | JOY_RETURNV | JOY_RETURNBUTTONS | JOY_RETURNPOV;
+    MMRESULT er = joyGetPosEx(id, &ji);
+    if (er != JOYERR_NOERROR) {
+        static BOOL loggedMiss[8] = {0};
+        if (!loggedMiss[i]) {
+            loggedMiss[i] = TRUE;
+            logf_("[pad] player %d: joyGetPosEx(id=%u) -> %u (no pad)", i, id, er);
+        }
+        return;
+    }
+
+    // (padName/padProf/restRaw/restN/restOK are declared above, before the
+    // v26 live-scan block that resets them when a live pad is locked onto.)
+
+    if (!padProf[i]) {
+        JOYCAPSA caps;
+        memset(&caps, 0, sizeof(caps));
+        padName[i][0] = 0;
+        if (joyGetDevCapsA(id, &caps, sizeof(caps)) == JOYERR_NOERROR) {
+            strncpy(padName[i], caps.szPname, MAXPNAMELEN - 1);
+            padName[i][MAXPNAMELEN - 1] = 0;
+            logf_("[pad] player %d id=%u name='%s' mid=%u pid=%u buttons=%u "
+                  "axes=%u caps=0x%lX (hasZ=%d hasR=%d hasU=%d hasV=%d hasPov=%d)",
+                  i, id, caps.szPname, caps.wMid, caps.wPid, caps.wNumButtons,
+                  caps.wNumAxes, (unsigned long)caps.wCaps,
+                  (caps.wCaps & JOYCAPS_HASZ) ? 1 : 0,
+                  (caps.wCaps & JOYCAPS_HASR) ? 1 : 0,
+                  (caps.wCaps & JOYCAPS_HASU) ? 1 : 0,
+                  (caps.wCaps & JOYCAPS_HASV) ? 1 : 0,
+                  (caps.wCaps & JOYCAPS_HASPOV) ? 1 : 0);
+        } else {
+            logf_("[pad] player %d id=%u present but joyGetDevCaps failed", i, id);
+        }
+        // v12: the Sony map must NOT depend on the device name. Windows often
+        // reports a localized or HID-generic name ("HID-compliant game
+        // controller"), which kept v10/v11 on the Xbox map. A DualSense always
+        // exposes >= 13 buttons and >= 6 axes through DirectInput; no Xbox or
+        // generic pad reports that combination.
+        const char *why = "default";
+        padProf[i] = PAD_XBOXDI;
+        if (isSonyName(padName[i])) {
+            padProf[i] = PAD_SONY;
+            why = "name";
+        } else if (caps.wNumButtons >= 13 && caps.wNumAxes >= 6) {
+            padProf[i] = PAD_SONY;
+            why = "caps: >=13 buttons & >=6 axes";
+        }
+        logf_("[pad] p%d initial profile=%s (%s)", i,
+              padProf[i] == PAD_SONY ? "SONY/DualSense" : "XBOX-DirectInput",
+              why);
+    }
+
+    // Rest-sample while idle so we can tell sticks (centre ~32767) from
+    // DualSense L2/R2 (rest 0). Needed if the device name is generic.
+    if (!restOK[i] && restN[i] < 12 && ji.dwButtons == 0) {
+        float lx = axisNorm(ji.dwXpos), ly = axisNorm(ji.dwYpos);
+        if (lx > -0.20f && lx < 0.20f && ly > -0.20f && ly < 0.20f) {
+            restRaw[i][0] += ji.dwXpos; restRaw[i][1] += ji.dwYpos;
+            restRaw[i][2] += ji.dwZpos; restRaw[i][3] += ji.dwRpos;
+            restRaw[i][4] += ji.dwUpos; restRaw[i][5] += ji.dwVpos;
+            restN[i]++;
+            if (restN[i] >= 8) {
+                for (int a = 0; a < 6; a++) restRaw[i][a] /= (DWORD)restN[i];
+                restOK[i] = TRUE;
+                DWORD z = restRaw[i][2], r = restRaw[i][3];
+                DWORD u = restRaw[i][4], v = restRaw[i][5];
+                BOOL zC = (z > 18000 && z < 47000);
+                BOOL rC = (r > 18000 && r < 47000);
+                BOOL uT = (u < 12000 || u > 53000);
+                BOOL vT = (v < 12000 || v > 53000);
+                int old = padProf[i];
+                // v12: rest evidence may only UPGRADE XBOX-DI to SONY. v11 let
+                // it downgrade a caps-detected Sony pad back to the Xbox map,
+                // which is how the pad stayed broken with a "same as before"
+                // report.
+                if (zC && rC && (uT || vT)) padProf[i] = PAD_SONY;
+                logf_("[pad] p%d rest X=%lu Y=%lu Z=%lu R=%lu U=%lu V=%lu -> profile=%s%s",
+                      i, restRaw[i][0], restRaw[i][1], z, r, u, v,
+                      padProf[i] == PAD_SONY ? "SONY/DualSense" : "XBOX-DirectInput",
+                      old != padProf[i] ? " (revised)" : "");
+            }
+        }
+    }
+
+    const float DZ = 0.22f;
+    float ax = deadz(axisNorm(ji.dwXpos), DZ);
+    float ay = deadz(axisNorm(ji.dwYpos), DZ);
+    float az = deadz(axisNorm(ji.dwZpos), DZ);
+    float ar = deadz(axisNorm(ji.dwRpos), DZ);
+    float au = deadz(axisNorm(ji.dwUpos), DZ);
+    float av = deadz(axisNorm(ji.dwVpos), DZ);
+
+    out->fwd -= ay;
+    if (g_strafeMode) out->side += ax;
+    else              out->turn += ax;
+
+    float rsx = 0.0f, rsy = 0.0f, rt = 0.0f;
+    BOOL sony = (padProf[i] == PAD_SONY);
+    if (sony) {
+        // PCGW DualSense: RS = Z + Rz, L2 = Rx (U), R2 = Ry (V).
+        rsx = az;
+        rsy = ar;
+        // Analog R2 only after rest proves V is a trigger (rest ~0). An
+        // unused axis sitting at 32767 would otherwise look "half pulled".
+        if (restOK[i] && (restRaw[i][5] < 12000 || restRaw[i][5] > 53000))
+            rt = trigFromRest(ji.dwVpos, restRaw[i][5]);
+        if (ji.dwButtons & JOY_BUTTON8) rt = 1.0f; // digital R2
+        // Cross = jump (Xbox A). Square (btn1) = use (Xbox X). Do NOT treat
+        // L2/R2 digital or L1/R1 as cast - that was v10 firing on both triggers.
+        if (ji.dwButtons & JOY_BUTTON2) out->jump = TRUE;   // Cross
+        if (ji.dwButtons & JOY_BUTTON1) out->use  = TRUE;   // Square
+        if (ji.dwButtons & JOY_BUTTON3) out->use  = TRUE;   // Circle extra
+        if (rt > 0.35f) out->cast = TRUE;
+    } else {
+        // Xbox 360 DirectInput: RS often R+U, combined triggers on Z.
+        if (ar != 0.0f || au != 0.0f) { rsx = ar; rsy = au; }
+        else if (av != 0.0f)          { rsx = av; rsy = 0.0f; }
+        if (ji.dwButtons & JOY_BUTTON1) out->jump = TRUE;   // A
+        if (ji.dwButtons & JOY_BUTTON3) out->use  = TRUE;   // X
+        static BOOL zNeutral[8] = {0};
+        if (az > -0.25f && az < 0.25f) zNeutral[i] = TRUE;
+        if (zNeutral[i] && az < -0.40f) { out->cast = TRUE; rt = -az; }
+    }
+    out->lookx += rsx;
+    out->looky += rsy;
+
+    static DWORD lastLive[8] = {0};
+    DWORD now = GetTickCount();
+    if ((now - lastLive[i]) >= 2000) {
+        lastLive[i] = now;
+        // v12: RAW axis/button values, not just the deadzoned floats, so a
+        // mapping that is still wrong can be re-derived from the log alone.
+        logf_("[pad] p%d %s raw[X=%lu Y=%lu Z=%lu R=%lu U=%lu V=%lu btns=0x%lX] "
+              "norm[X=%+.2f Y=%+.2f Z=%+.2f R=%+.2f U=%+.2f V=%+.2f] "
+              "look=(%+.2f %+.2f) rt=%.2f",
+              i, sony ? "SONY" : "XBDI",
+              ji.dwXpos, ji.dwYpos, ji.dwZpos, ji.dwRpos, ji.dwUpos, ji.dwVpos,
+              (unsigned long)ji.dwButtons,
+              ax, ay, az, ar, au, av, rsx, rsy, rt);
+    }
+}
+
+static void readInput(int i, PadState *out)
+{
+    out->fwd = out->side = out->turn = out->lookx = out->looky = 0.0f;
+    out->jump = out->cast = out->use = FALSE;
+    if (i < 1 || i >= 8) return;
+
+    const PlayerKeys &k = g_pk[i];
+    if (keyDown(k.fwd)   || keyDown(k.fwd2))   out->fwd  += 1.0f;
+    if (keyDown(k.back)  || keyDown(k.back2))  out->fwd  -= 1.0f;
+    if (keyDown(k.left)  || keyDown(k.left2))  out->side -= 1.0f;
+    if (keyDown(k.right) || keyDown(k.right2)) out->side += 1.0f;
+
+    if (keyDown(k.turnL)) out->turn -= 1.0f;
+    if (keyDown(k.turnR)) out->turn += 1.0f;
+
+    // Numpad presses that arrived as arrow VKs (NumLock off) and were taken
+    // away from the game by the window hook.
+    if (i == 1) {
+        extern volatile LONG *numArrowState(void);
+        volatile LONG *na = numArrowState();
+        if (na[0]) out->fwd  += 1.0f;
+        if (na[1]) out->fwd  -= 1.0f;
+        if (na[2]) out->side -= 1.0f;
+        if (na[3]) out->side += 1.0f;
+    }
+
+    readPad(i, out);
+}
+
+// Drive a controlled pawn from its player's input, relative to that view's yaw.
+// Per-player view yaw. This MUST NOT be derived from the pawn's rotation.
+// It previously was: the camera took its yaw from the pawn, that yaw was used
+// as the movement basis, and the pawn was then turned to face the movement
+// direction. Any sideways input therefore rotated the basis a little further
+// every frame -- the pawn spun on the spot and never travelled. Forward was
+// the only input with no rotation in it, which is why forward alone worked.
+volatile LONG g_p2Moving[8] = {0};
+static int   g_lookYaw[8]  = {0};          // right-stick camera yaw offset
+static int   g_lookPitch[8]= {0};          // right-stick camera pitch offset
+static int   g_jumpYawLock[8] = {0};
+static DWORD g_jumpLockUntil[8] = {0};
+static BOOL  g_jumpStanding[8] = {0};
+static int   g_jumpPh[8]        = {0};   // v12: 0 none, 1 walk-prep, 2 airborne
+static DWORD g_jumpLaunchAt[8]  = {0};
+static float g_jumpVz[8]        = {0};
+static DWORD g_jumpLogUntil[8]  = {0};   // v12: per-frame jump telemetry
+static int   g_jumpLogN[8]      = {0};
+static int   g_savedDesRot[8][3];        // v12: restore after the jump
+static int   g_savedRotRate[8][3];
+static BYTE  g_lastPhys[8] = {0};
+static BOOL  g_yawInit[8]  = {0};
+static DWORD g_lastTick[8] = {0};
+
+static void driveePawn(int i, void *pawn)
+{
+    if (!F.ok || !pawn || IsBadReadPtr(pawn, 0x500)) return;
+    if (i < 0 || i >= 8) return;
+    PadState in; readInput(i, &in);
+    g_padJump[i] = in.jump;
+    g_padCast[i] = in.cast;
+    g_padUse[i]  = in.use;
+
+    float *vel = (float *)((BYTE *)pawn + F.Velocity);
+    int   *rot = (int *)  ((BYTE *)pawn + F.Rotation);
+    float *acc = (F.Acceleration > 0)
+               ? (float *)((BYTE *)pawn + F.Acceleration) : NULL;
+
+    if (!g_yawInit[i]) { g_viewYaw[i] = rot[1]; g_yawInit[i] = TRUE; }
+
+    DWORD now = GetTickCount();
+    float dt  = g_lastTick[i] ? (now - g_lastTick[i]) / 1000.0f : 0.016f;
+    g_lastTick[i] = now;
+    if (dt > 0.2f) dt = 0.2f;
+
+    // v12: per-frame standing-jump telemetry. rot[] here is read BEFORE any of
+    // our pins this frame, i.e. as the engine tick left it. On hardware this
+    // line decides the next move: rawRot yaw drifting away while the mesh yaws
+    // = something rotates the actor (fix: pin harder / find who). rawRot pinned
+    // while the mesh yaws anyway = animation root (fix: anim side).
+    if (now < g_jumpLogUntil[i] && g_jumpLogN[i] < 140) {
+        g_jumpLogN[i]++;
+        BYTE phLog = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 255;
+        float *pvLog = (float *)((BYTE *)pawn + F.Velocity);
+        logf_("    [jump] p%d rawRot=(%d %d %d) phys=%u vel=(%.0f %.0f %.0f) "
+              "viewYaw=%d lock=%d ph=%d",
+              i, rot[0], rot[1], rot[2], (unsigned)phLog,
+              pvLog[0], pvLog[1], pvLog[2],
+              g_viewYaw[i], g_jumpYawLock[i], g_jumpPh[i]);
+    }
+
+    // v12: standing jump spends one engine tick in PHYS_Walking BEFORE going
+    // to PHYS_Falling. Walking->Falling takes the same anim path as a moving
+    // jump (which never yaws the mesh); None->Falling picked the standing
+    // jump anim that yaws it. Launch happens on a later frame so the engine
+    // really ticks once with Walking.
+    if (g_jumpPh[i] == 1 && now >= g_jumpLaunchAt[i]) {
+        g_jumpPh[i] = 2;
+        float *pvj = (float *)((BYTE *)pawn + F.Velocity);
+        pvj[0] = pvj[1] = 0.0f;
+        pvj[2] = g_jumpVz[i];
+        if (F.Physics > 0) *((BYTE *)pawn + F.Physics) = 2;   // PHYS_Falling
+        logf_("    jump launch: Walking->Falling vz=%.0f", g_jumpVz[i]);
+    }
+
+    // v42: airborne bookkeeping (single source of truth for the exit vetoes)
+    {   BYTE phA = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+        if (phA == 2) g_lastAirAt[i] = now;
+    }
+    // v43 GROUNDHOLD: the v42 hw log showed the engine's companion code
+    // re-setting PHYS_Projectile(6) EVERY TICK through the post-cast window
+    // (47 rescues in one session). Reactive fixes win the tick but lose
+    // frames: anims froze (persistent cast pose) and rotation glitched
+    // (wrong yaw). Now: on first sighting arm a 2.5s hold (refreshed on
+    // every re-sighting); while armed, Walking is restored here EVERY frame
+    // AND in the ProcessEvent detour (multiple times per frame, so no
+    // rendered frame keeps a projectile tick). Cluster start logs once
+    // (with the pawn's Base - the trigger context); when the hold expires
+    // clean, one ChangeAnimation re-syncs the anim system.
+    {   BYTE phR = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+        float vzR = (F.Velocity > 0 && !IsBadReadPtr(pawn, F.Velocity + 12))
+                  ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
+        BOOL grounded = g_jumpPh[i] == 0 && vzR > -60.0f && vzR < 60.0f;
+        if (F.Physics > 0 && grounded && (phR == 5 || phR == 6)) {
+            if (!g_holdArmed[i]) {
+                g_holdArmed[i]  = TRUE;
+                g_holdResync[i] = FALSE;
+                char bb[96] = "?";
+                if (F.Base > 0 && !IsBadReadPtr(pawn, F.Base + 4)) {
+                    void *bs = *(void **)((BYTE *)pawn + F.Base);
+                    if (bs) objName(bs, bb, sizeof(bb));
+                }
+                logf_("  [physfix] p%d phys=%u cluster start - hold armed "
+                      "2.5s (base=%s)", i, (unsigned)phR, bb);
+            }
+            g_holdWalkUntil[i] = now + 2500;
+            *((BYTE *)pawn + F.Physics) = 1;
+        } else if (g_holdArmed[i] && now > g_holdWalkUntil[i]) {
+            g_holdArmed[i] = FALSE;
+            if (!g_holdResync[i] && g_fnChangeAnim) {
+                g_holdResync[i] = TRUE;
+                callFn(pawn, g_fnChangeAnim,
+                       "ChangeAnimation [physrealign]");
+                logf_("  [physrealign] p%d anim re-synced after physics "
+                      "hold", i);
+            }
+        }
+    }
+
+    // Tank default: left/right TURN, matching the original player's arrows.
+    // v13 default (FreeCamera=0): right stick X also TURNS pawn + camera
+    // together, exactly like the original player - the character always faces
+    // where the camera points and aims there. FreeCamera=1 keeps the old
+    // free-orbit behaviour for testing.
+    float turn = in.turn;
+    if (!g_strafeMode) turn += in.side;
+    if (!g_freeLook)   turn += in.lookx;
+    if (turn < -0.05f || turn > 0.05f) {
+        if (turn >  1.0f) turn =  1.0f;
+        if (turn < -1.0f) turn = -1.0f;
+        g_viewYaw[i] += (int)(turn * g_turnSpeed * dt * (65536.0f / 360.0f));
+        g_viewYaw[i] &= 0xFFFF;
+    }
+
+    // FreeCamera mode only: right stick orbits the camera without turning the
+    // pawn. In the default mode lookx went into the turn above and lookYaw
+    // stays 0, so the camera sits directly behind the pawn at all times.
+    if (g_freeLook && (in.lookx < -0.05f || in.lookx > 0.05f)) {
+        float lx = in.lookx; if (lx > 1) lx = 1; if (lx < -1) lx = -1;
+        g_lookYaw[i] += (int)(lx * 180.0f * dt * (65536.0f / 360.0f));
+        g_lookYaw[i] &= 0xFFFF;
+    }
+    if (in.looky < -0.05f || in.looky > 0.05f) {
+        float ly = in.looky; if (ly > 1) ly = 1; if (ly < -1) ly = -1;
+        // stick up (negative Y on Windows) -> look up
+        // v14: range widened (was +-8000/+4000 = only 14 deg of up-look) so
+        // vertical aim actually matters; see playerCamPitch for the totals.
+        g_lookPitch[i] += (int)(-ly * 120.0f * dt * (65536.0f / 360.0f));
+        if (g_lookPitch[i] < -12000) g_lookPitch[i] = -12000;
+        if (g_lookPitch[i] >  10000) g_lookPitch[i] =  10000;
+    }
+
+    // Standing jump: keep actor yaw pinned for the whole airtime, not a timer.
+    // The mesh turn is the jump ANIM (PlayJump) - that call is skipped standing.
+    // v12: also pin DesiredRotation (any FaceRotation pull now converges on
+    // our yaw instead of the AI's) and zero RotationRate so nothing advances
+    // toward a stale desired rotation during the air.
+    {
+        BYTE phNowLock = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 1;
+        if (g_jumpStanding[i]) {
+            g_viewYaw[i] = g_jumpYawLock[i];
+            rot[0] = 0; rot[2] = 0;
+            if (F.DesiredRotation > 0) {
+                int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                dr[0] = 0; dr[1] = g_jumpYawLock[i]; dr[2] = 0;
+            }
+            if (F.RotationRate > 0) {
+                int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                rr[0] = 0; rr[1] = 0; rr[2] = 0;
+            }
+            if (phNowLock != 2) {
+                if (!g_jumpLockUntil[i])
+                    g_jumpLockUntil[i] = now + 250;
+                else if (now >= g_jumpLockUntil[i]) {
+                    g_jumpStanding[i] = FALSE;
+                    g_jumpPh[i] = 0;
+                    g_jumpLockUntil[i] = 0;
+                    // restore what we pinned during the jump so the game's
+                    // own rotation systems see their pre-jump values again
+                    if (F.DesiredRotation > 0) {
+                        int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                        dr[0] = g_savedDesRot[i][0];
+                        dr[1] = g_savedDesRot[i][1];
+                        dr[2] = g_savedDesRot[i][2];
+                    }
+                    if (F.RotationRate > 0) {
+                        int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                        rr[0] = g_savedRotRate[i][0];
+                        rr[1] = g_savedRotRate[i][1];
+                        rr[2] = g_savedRotRate[i][2];
+                    }
+                }
+            } else {
+                g_jumpLockUntil[i] = 0;
+            }
+        }
+    }
+
+    double yaw = g_viewYaw[i] * (6.283185307179586 / 65536.0);
+    float  fx = (float)cos(yaw), fy = (float)sin(yaw);
+
+    float fwd  = in.fwd;
+    float side = g_strafeMode ? in.side : 0.0f;
+    float mag  = sqrtf(fwd * fwd + side * side);
+
+    // Capture the pawn's real walk stats once, before we pin them to 0 on idle.
+    if (g_savedGS[i] <= 0.0f && F.GroundSpeed > 0) {
+        float gs = *(float *)((BYTE *)pawn + F.GroundSpeed);
+        if (gs > 50.0f && gs < 2000.0f) g_savedGS[i] = gs;
+    }
+    if (g_savedAR[i] <= 0.0f && F.AccelRate > 0) {
+        float ar = *(float *)((BYTE *)pawn + F.AccelRate);
+        if (ar > 50.0f && ar < 20000.0f) g_savedAR[i] = ar;
+    }
+    float speed = (g_savedGS[i] > 50.0f) ? g_savedGS[i] : 300.0f;
+    float accel = (g_savedAR[i] > 50.0f) ? g_savedAR[i] : 2048.0f;
+
+    InterlockedExchange(&g_p2Moving[i], (mag >= 0.15f) ? 1 : 0);
+    if (mag >= 0.15f) g_lastMoveAt[i] = now;
+    // v44 STANDING YAW LOCK: the companion AI FaceRotates the actor toward
+    // its own preferred yaw EVERY TICK whenever nothing pins it (v43 hw
+    // log: ~6 deg off between pin windows = the "wrong yaw while
+    // standing"; Wine: it even pulls to a fixed 15691). Throttled writes
+    // lose frames, so while STANDING (not moving, not airborne) this holds
+    // the full pin every frame: DesiredRotation = view yaw AND
+    // RotationRate = 0, so the engine's own rotation logic has nothing to
+    // advance - the exact mechanism of the (hw-proven) post-cast yawpin
+    // and the v12 jump pin. Saved RotationRate is restored the moment the
+    // pawn moves or goes airborne; transition lines are logged.
+    {
+        static BOOL sYawLockOn[8]  = { 0 };
+        static int  sSavedRR2[8][3] = {{ 0 }};
+        BYTE phS = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+        BOOL wantLock =
+            g_p2Moving[i] == 0 && phS != 2 &&
+            F.DesiredRotation > 0 && F.RotationRate > 0 &&
+            !IsBadReadPtr(pawn, F.RotationRate + 12) &&
+            !IsBadWritePtr(pawn, F.RotationRate + 12);
+        if (wantLock && !sYawLockOn[i]) {
+            int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+            sSavedRR2[i][0] = rr[0];
+            sSavedRR2[i][1] = rr[1];
+            sSavedRR2[i][2] = rr[2];
+            sYawLockOn[i] = TRUE;
+            logf_("  [yawhold] p%d engaged (standing lock)",
+                  i);
+        }
+        if (sYawLockOn[i]) {
+            if (wantLock) {
+                int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                dr[0] = 0; dr[1] = g_viewYaw[i]; dr[2] = 0;
+                int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                rr[0] = 0; rr[1] = 0; rr[2] = 0;
+            } else {
+                sYawLockOn[i] = FALSE;
+                if (F.RotationRate > 0 &&
+                    !IsBadWritePtr(pawn, F.RotationRate + 12)) {
+                    int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                    rr[0] = sSavedRR2[i][0];
+                    rr[1] = sSavedRR2[i][1];
+                    rr[2] = sSavedRR2[i][2];
+                }
+                logf_("  [yawhold] p%d released (moving/airborne)", i);
+            }
+        }
+    }
+    // v47 EVENT-DRIVEN SETTLE RE-SYNC: armed by the detour when OUR
+    // StateCasting.EndState flows by (the actual exit). Executed here -
+    // every frame, fresh context - only while EVERY guard holds at
+    // execution time: 1.2s..6s since the exit (late window covers
+    // walk-aways), standing with a 300ms stand-still debounce (no
+    // mid-blend snaps), no aim glow (aims do not tick StateCasting), the
+    // casting state quiet for 300ms (never yank a live cast), same-cast
+    // binding (a newer fire cancels), no post-exit BeginState/StartCasting,
+    // and never during the mod's OWN cleanup-chain cast (g_ownCastAt - the
+    // cleanup re-cast is the mod's own doing; its exit re-arms the sync
+    // anyway). If a
+    // guard cannot be satisfied the need simply expires - a skipped
+    // re-sync is always safer than a mis-timed one.
+    if (g_realignNeed[i] && g_needAt[i] && F.ok) {
+        DWORD since = now - g_needAt[i];
+        BOOL standing = g_p2Moving[i] == 0 &&
+                        now - g_lastMoveAt[i] > 300;
+        if (since > 6000) {
+            g_realignNeed[i] = FALSE;
+        } else if (standing &&
+                   since >= 1200 &&
+                   g_beginCastAt[i] == g_needBegin[i] &&  // NOTHING began
+                                                          // since the arm
+                                                          // (player aim, our
+                                                          // own chain cast)
+                   g_castPending[i] == g_needBind[i] &&   // nothing fired
+                   now - g_ownCastAt[i] > 3000 &&   // never during OUR chain
+                                                    // cast (aim+fire+exit)
+                   !aimGlowAlive(i) &&
+                   now - g_castTickAt[i] > 300 &&
+                   F.Rotation > 0 &&
+                   !IsBadReadPtr(pawn, F.Rotation + 12)) {
+            g_realignNeed[i] = FALSE;
+            logf_("    [realign] p%d FIRE i=%d pend=%lu needBind=%lu "
+                  "tickAge=%lu glow=%d begin=%lu needBegin=%lu own=%lu "
+                  "now=%lu", i, i,
+                  (unsigned long)g_castPending[i],
+                  (unsigned long)g_needBind[i],
+                  (unsigned long)(now - g_castTickAt[i]),
+                  aimGlowAlive(i) ? 1 : 0,
+                  (unsigned long)g_beginCastAt[i],
+                  (unsigned long)g_needBegin[i],
+                  (unsigned long)g_ownCastAt[i],
+                  (unsigned long)now);
+            int mdc = meshYawDelta(pawn,
+                *(int *)((BYTE *)pawn + F.Rotation + 4));
+            if (g_fnChangeAnim)
+                callFn(pawn, g_fnChangeAnim,
+                       "ChangeAnimation [settlealign]");
+            logf_("    [settlealign] p%d anim re-picked at cast settle "
+                  "(exit+%lums, meshDelta=%d)", i,
+                  (unsigned long)since, mdc);
+        }
+    }
+    rot[1] = g_viewYaw[i];   // always face the view, like the original player
+
+    float *pl = (F.Location > 0) ? (float *)((BYTE *)pawn + F.Location) : NULL;
+
+    if (mag < 0.15f) {
+        vel[0] = vel[1] = 0.0f;
+        if (acc) acc[0] = acc[1] = acc[2] = 0.0f;
+        // AI Tick writes Acceleration before physics (v6 idle drift). Pin
+        // GroundSpeed to 0 so walking integration has nothing to apply.
+        // Snap XY only for SMALL shoves; a huge jump is a cutscene teleport
+        // and must become the new pin (v8 first Wine run froze Hermione in
+        // the void by fighting a 4500-unit hub warp).
+        if (F.GroundSpeed > 0) *(float *)((BYTE *)pawn + F.GroundSpeed) = 0.0f;
+        if (F.AccelRate > 0)   *(float *)((BYTE *)pawn + F.AccelRate)   = 0.0f;
+        BYTE phNow = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 1;
+        // PHYS_None while standing still: AI accel is not integrated -> no shake.
+        // Jump handler (after us this frame) will set PHYS_Falling.
+        // v12: skip while a standing jump is mid-prep - it needs PHYS_Walking
+        // to survive one whole engine tick before launch.
+        if (phNow == 1 && F.Physics > 0 && g_jumpPh[i] == 0)
+            *((BYTE *)pawn + F.Physics) = 0;
+        if (g_lastPhys[i] == 2 && phNow != 2) {
+            // landed from a jump: v12 calls ChangeAnimation only. PlayWaiting
+            // on land was a yaw suspect - its idle anim can swing the mesh to
+            // face where the ANIM wants, not where we pinned the actor.
+            if (g_fnChangeAnim) callFn(pawn, g_fnChangeAnim, "ChangeAnimation");
+            else if (g_fnPlayWaiting) callFn(pawn, g_fnPlayWaiting, "PlayWaiting");
+            rot[1] = g_viewYaw[i];
+        }
+        g_lastPhys[i] = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : phNow;
+        if (pl && phNow != 2) {
+            if (!g_pinned[i]) {
+                g_pinXY[i][0] = pl[0]; g_pinXY[i][1] = pl[1];
+                g_pinned[i] = TRUE;
+            } else {
+                float ddx = pl[0] - g_pinXY[i][0], ddy = pl[1] - g_pinXY[i][1];
+                float d2 = ddx * ddx + ddy * ddy;
+                // Only follow teleports. Do NOT snap small drifts - that shook.
+                if (d2 > 80.0f * 80.0f) {
+                    g_pinXY[i][0] = pl[0]; g_pinXY[i][1] = pl[1];
+                    static DWORD lastSnap[8] = {0};
+                    DWORD n = GetTickCount();
+                    if ((n - lastSnap[i]) >= 2000) {
+                        lastSnap[i] = n;
+                        logf_("  [ai-drift] p%d pin followed teleport %.0f units",
+                              i, sqrtf(d2));
+                    }
+                }
+            }
+        } else {
+            g_pinned[i] = FALSE;
+        }
+        if (g_wasMoving[i]) {
+            g_wasMoving[i] = FALSE;
+            if (g_fnPlayWaiting) callFn(pawn, g_fnPlayWaiting, "PlayWaiting");
+            else if (g_fnChangeAnim) callFn(pawn, g_fnChangeAnim, "ChangeAnimation");
+        }
+        return;
+    }
+    g_pinned[i] = FALSE;
+    if (F.GroundSpeed > 0) *(float *)((BYTE *)pawn + F.GroundSpeed) = speed;
+    if (F.AccelRate > 0)   *(float *)((BYTE *)pawn + F.AccelRate)   = accel;
+    if (F.Physics > 0) {
+        BYTE ph = *((BYTE *)pawn + F.Physics);
+        if (ph == 0) *((BYTE *)pawn + F.Physics) = 1;   // PHYS_Walking
+    }
+    if (mag > 1.0f) { fwd /= mag; side /= mag; }
+
+    float dx = fx * fwd - fy * side;
+    float dy = fy * fwd + fx * side;
+
+    vel[0] = dx * speed; vel[1] = dy * speed;
+    if (acc) { acc[0] = dx * accel; acc[1] = dy * accel; acc[2] = 0.0f; }
+    if (!g_wasMoving[i]) {
+        g_wasMoving[i] = TRUE;
+        if (g_fnChangeAnim) callFn(pawn, g_fnChangeAnim, "ChangeAnimation");
+    }
+}
+
+int  playerViewYaw(int i) { return (i >= 0 && i < 8) ? g_viewYaw[i] : 0; }
+int  playerCamYaw(int i) {
+    if (i < 0 || i >= 8) return 0;
+    return (g_viewYaw[i] + g_lookYaw[i]) & 0xFFFF;
+}
+int playerCamPitch(int i) {
+    int p = g_camPitch + ((i >= 0 && i < 8) ? g_lookPitch[i] : 0);
+    // v14: with base -1400 this is about -73 deg down .. +47 deg up - close
+    // to the original player's camera range. The old +8000 cap made
+    // looking up (and aiming spells up) nearly impossible.
+    if (p < -16000) p = -16000;
+    if (p >  13000) p =  13000;
+    return p;
+}
+void resetViewYaw(void)   {
+    for (int k = 0; k < 8; k++) {
+        g_yawInit[k] = FALSE;
+        g_lookYaw[k] = 0; g_lookPitch[k] = 0;
+        g_jumpLockUntil[k] = 0; g_lastPhys[k] = 0; g_jumpStanding[k] = FALSE;
+        g_jumpPh[k] = 0; g_jumpLaunchAt[k] = 0; g_jumpVz[k] = 0;
+        g_jumpLogUntil[k] = 0; g_jumpLogN[k] = 0;
+        for (int a = 0; a < 3; a++) {
+            g_savedDesRot[k][a] = 0; g_savedRotRate[k][a] = 0;
+        }
+    }
+}
+
+// ------------------------------- FFrame ------------------------------------
+
+
+// ------------------------- captured camera state ---------------------------
+static void  *g_viewport   = NULL;
+static int    g_sizeX = 0, g_sizeY = 0;
+static void  *g_camActor   = NULL;
+static float  g_camLoc[3]  = {0,0,0};
+static int    g_camRot[3]  = {0,0,0};
+static float  g_camFOV     = 90.0f;
+static volatile LONG g_haveCam = 0;
+
+// ---------------------------- Draw hook ------------------------------------
+typedef void (__fastcall *PFN_Draw)(void*, void*, void*, int, BYTE*, int*);
+static PFN_Draw g_origDraw = NULL;
+static Hook     g_hkDraw;
+static LONG     g_frame = 0;
+
+static void __fastcall Draw_detour(void *self, void *edx, void *Viewport,
+                                   int Blit, BYTE *HitData, int *HitSize)
+{
+    LONG fn = InterlockedIncrement(&g_frame);
+    {   // rolling FPS, so the cost of N extra scene renders is measurable
+        static DWORD t0 = 0; static LONG f0 = 0;
+        DWORD now = GetTickCount();
+        if (!t0) { t0 = now; f0 = fn; }
+        else if (now - t0 >= 5000) {
+            logf_("[perf] %.2f fps over %lums (split=%s N=%d)",
+                  (fn - f0) * 1000.0 / (now - t0), now - t0,
+                  g_splitOn ? "ON" : "off", g_numPlayers);
+            t0 = now; f0 = fn;
+        }
+    }
+    if (Viewport && !IsBadReadPtr(Viewport, 0x100)) {
+        g_viewport = Viewport;
+        g_sizeX = *(int *)((BYTE *)Viewport + 0x8C);
+        g_sizeY = *(int *)((BYTE *)Viewport + 0x90);
+    }
+    g_origDraw(self, edx, Viewport, Blit, HitData, HitSize);
+}
+
+// ------------------- FPlayerSceneNode ctor hook (camera) -------------------
+// Captures the exact camera the engine computed for player 1 this frame.
+typedef void *(__fastcall *PFN_PSN)(void*, void*, void*, void*, void*,
+                                    float, float, float, int, int, int, float);
+static PFN_PSN g_origPSN = NULL;
+static Hook    g_hkPSN;
+
+static void *__fastcall PSN_detour(void *self, void *edx, void *vp, void *rt,
+                                   void *actor, float lx, float ly, float lz,
+                                   int rp, int ry, int rr, float fov)
+{
+    g_camActor = actor;
+    g_camLoc[0] = lx; g_camLoc[1] = ly; g_camLoc[2] = lz;
+    g_camRot[0] = rp; g_camRot[1] = ry; g_camRot[2] = rr;
+    g_camFOV = fov;
+    if (InterlockedExchange(&g_haveCam, 1) == 0)
+        logf_("camera captured: actor=%p loc=(%.1f %.1f %.1f) rot=(%d %d %d) fov=%.1f",
+              actor, lx, ly, lz, rp, ry, rr, fov);
+    return g_origPSN(self, edx, vp, rt, actor, lx, ly, lz, rp, ry, rr, fov);
+}
+
+// -------------------------- PostRender hook --------------------------------
+typedef void (__fastcall *PFN_PostRender)(void*, void*, void*);
+static PFN_PostRender g_origPostRender = NULL;
+static Hook           g_hkPostRender;
+static LONG           g_prCount   = 0;
+
+static volatile LONG  g_portalOff = 0;   // set to 1 if a portal call misbehaves
+static volatile LONG  g_liveFrames = 0;
+static BOOL           g_dumped     = FALSE;
+
+// Emit one DrawPortal call's parameter bytecode and invoke the native.
+static void drawPortal(void *canvas, int x, int y, int w, int h,
+                       void *camActor, const float loc[3], const int rot[3],
+                       int fov, BOOL clearZ)
+{
+    BYTE bc[96];
+    int  p = 0;
+    #define PUT8(v)  bc[p++] = (BYTE)(v)
+    #define PUT32(v) *(DWORD *)(bc + p) = (DWORD)(v); p += 4
+    #define PUTF(v)  *(float *)(bc + p) = (float)(v); p += 4
+
+    PUT8(g_ops[OP_INT].op); PUT32(x);
+    PUT8(g_ops[OP_INT].op); PUT32(y);
+    PUT8(g_ops[OP_INT].op); PUT32(w);
+    PUT8(g_ops[OP_INT].op); PUT32(h);
+    PUT8(g_ops[OP_OBJ].op); PUT32((DWORD)camActor);
+    PUT8(g_ops[OP_VEC].op); PUTF(loc[0]); PUTF(loc[1]); PUTF(loc[2]);
+    PUT8(g_ops[OP_ROT].op); PUT32(rot[0]); PUT32(rot[1]); PUT32(rot[2]);
+    PUT8(g_ops[OP_INT].op); PUT32(fov);
+    PUT8(clearZ ? g_ops[OP_TRUE].op : g_ops[OP_FALSE].op);
+    PUT8(g_ops[OP_END].op);
+    PUT8(g_ops[OP_END].op);   // guard byte
+
+    FFrameLite st;
+    memset(&st, 0, sizeof(st));
+    st.Object = canvas;
+    st.Code   = bc;
+
+    BYTE result[64];
+    memset(result, 0, sizeof(result));
+
+    g_execDrawPortal(canvas, NULL, &st, result);
+}
+
+// Per-strip FOV. DrawPortal builds the projection from Viewport SizeX/SizeY
+// (the FULL window) and the FOV we pass, then blits into the portal rect.
+// Using the full-window aspect on a half-width strip horizontally squeezes
+// the image. We temporarily set SizeX/SizeY to the portal size, and recompute
+// FOV so the vertical field matches the original full-screen view.
+static int portalFov(int w, int h)
+{
+    float base = (g_camFOV > 1.0f) ? g_camFOV : 85.0f;
+    if (g_fovMode == 0 || g_sizeX <= 0 || g_sizeY <= 0 || w <= 0 || h <= 0)
+        return (int)(base * g_fovScale + 0.5f);
+    const float D2R = 0.01745329252f, R2D = 57.29577951f;
+    float hf0 = base * D2R;
+    float vf  = 2.0f * atanf(tanf(hf0 * 0.5f) * ((float)g_sizeY / (float)g_sizeX));
+    float hf1 = 2.0f * atanf(tanf(vf  * 0.5f) * ((float)w / (float)h));
+    float deg = hf1 * R2D * g_fovScale;
+    if (deg < 40.0f) deg = 40.0f;
+    if (deg > 140.0f) deg = 140.0f;
+    return (int)(deg + 0.5f);
+}
+
+static void drawPortalSized(void *canvas, int x, int y, int w, int h,
+                            void *camActor, const float loc[3], const int rot[3],
+                            BOOL clearZ)
+{
+    int fov = portalFov(w, h);
+    int *sx = NULL, *sy = NULL, osx = 0, osy = 0;
+    if (g_viewport && !IsBadWritePtr((BYTE *)g_viewport + 0x90, 4)) {
+        sx = (int *)((BYTE *)g_viewport + 0x8C);
+        sy = (int *)((BYTE *)g_viewport + 0x90);
+        osx = *sx; osy = *sy;
+        *sx = w; *sy = h;
+    }
+    static BOOL loggedFov = FALSE;
+    if (!loggedFov) {
+        loggedFov = TRUE;
+        logf_("[fov] full=%.0f (%dx%d) strip=%dx%d -> portalFov=%d (mode=%d scale=%.2f)",
+              g_camFOV, g_sizeX, g_sizeY, w, h, fov, g_fovMode, g_fovScale);
+    }
+    drawPortal(canvas, x, y, w, h, camActor, loc, rot, fov, clearZ);
+    if (sx) { *sx = osx; *sy = osy; }
+}
+
+
+// Draws the split views. Returns TRUE if it actually drew, so the caller
+// knows whether the HUD needs to be constrained to player 1's strip.
+// v26: per-pane visibility for the aim glow. The ORIGINAL game cursor is a
+// per-view element - player 1 never sees player 2's cursor. v25 tried to
+// get that by toggling bHidden around each portal draw; Wine honored it,
+// hardware did NOT (the user still saw the glow inside P2 from P1's half
+// - consistent with v22, where our bHidden CLEAR never made the borrowed
+// cursor visible on hw either: bHidden writes do not affect the hw D3D8
+// render path for these actors). Location writes, though, are proven on
+// hardware (the glow moves/hugs surfaces there). So the glow is now
+// PARKED far below the world (0,0,-100000) whenever its owner's pane is
+// not the one being drawn - including the engine's base render - and
+// restored to the real aim point for exactly its owner's portal.
+// bHidden is still toggled as a belt-and-suspenders measure.
+static void setAimFXPaneVisible(int panePlayer)
+{
+    if (!g_panePark) return;   // v27 isolation knob: pane parking off =
+                               // glow visible in every pane (v24 behavior)
+    static int   sOffH  = -2;
+    static DWORD sMaskH = 0;
+    if (sOffH == -2) {
+        sOffH  = propOffset("Engine.Actor.bHidden");
+        sMaskH = boolBitMask("Engine.Actor.bHidden");
+    }
+    if (F.Location <= 0) return;
+    for (int j = 1; j < 8; j++) {
+        void *fx = g_aimFX[j];
+        if (!fx || IsBadWritePtr((BYTE *)fx + F.Location, 12)) continue;
+        float *al = (float *)((BYTE *)fx + F.Location);
+        if (j == panePlayer && !g_aimSup[j]) {
+            // owner's pane: draw it exactly where the aim math wants it
+            al[0] = g_aimLast[j][0];
+            al[1] = g_aimLast[j][1];
+            al[2] = g_aimLast[j][2];
+        } else {
+            // every other pane + the engine's base render: parked in the
+            // void, frustum-culled, invisible from anywhere
+            al[0] = 0.0f; al[1] = 0.0f; al[2] = -100000.0f;
+        }
+        if (sOffH > 0 && sMaskH) {
+            DWORD *slot = (DWORD *)((BYTE *)fx + (sOffH & ~3));
+            if (j == panePlayer) *slot &= ~sMaskH;
+            else                 *slot |=  sMaskH;
+        }
+    }
+}
+
+static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
+{
+    LONG n = InterlockedIncrement(&g_prCount);
+
+    if (n <= 2 && canvas && !IsBadReadPtr(canvas, 0x80)) {
+        logf_("PostRender #%ld canvas=%p  Canvas.SizeX/Y(+0x64,+0x68) = %d x %d "
+              " ClipX/Y(+0x40,+0x44) = %.0f x %.0f",
+              n, canvas, *(int *)((BYTE *)canvas + 0x64),
+              *(int *)((BYTE *)canvas + 0x68),
+              *(float *)((BYTE *)canvas + 0x40),
+              *(float *)((BYTE *)canvas + 0x44));
+    }
+
+    // ---- split toggle (sampled FIRST, before any early return) ------------
+    // This used to sit after the "not ready" checks, so on any frame where the
+    // camera or canvas was not ready the key was not sampled at all. It is
+    // also debounced: a single physical press can span many frames, and any
+    // double-toggle would read as "the split flashed on and went away".
+    {
+        static BOOL  prevKey = FALSE;
+        static DWORD lastToggle = 0;
+        BOOL down = (GetAsyncKeyState(g_toggleKey) & 0x8000) != 0;
+        DWORD now = GetTickCount();
+        if (down && !prevKey && (now - lastToggle) >= 300) {
+            lastToggle = now;
+            g_splitOn = !g_splitOn;
+            g_liveFrames = 0;
+            logf_("toggle key 0x%02X -> split %s", g_toggleKey,
+                  g_splitOn ? "ON" : "OFF");
+        }
+        prevKey = down;
+    }
+
+    // ---- optional file trigger, for headless testing only -----------------
+    // OFF by default. When it was always-on AND authoritative it silently
+    // undid the key toggle every 30 frames; it is now opt-in and edge-only.
+    if (g_fileToggle && (n % 30) == 0) {
+        static int prevFile = -1;
+        int f = (GetFileAttributesA("split_on") != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+        if (prevFile < 0)        prevFile = f;
+        else if (f != prevFile) {
+            g_splitOn = f ? TRUE : FALSE;
+            g_liveFrames = 0;
+            logf_("split_on file %s -> split %s",
+                  f ? "appeared" : "removed", f ? "ON" : "OFF");
+        }
+        prevFile = f;
+    }
+
+    // If the split is meant to be on but nothing is drawn, say why. Silent
+    // early-returns are exactly what made the field bug hard to pin down.
+    const char *blocked = NULL;
+    if (!g_opsOK)                                  blocked = "opcodes not resolved";
+    else if (!g_execDrawPortal)                    blocked = "execDrawPortal missing";
+    else if (g_portalOff)                          blocked = "portals disabled";
+    else if (!g_haveCam)                           blocked = "no camera captured yet";
+    else if (!canvas || IsBadReadPtr(canvas, 0x80)) blocked = "bad canvas";
+    else if (g_sizeX <= 0 || g_sizeY <= 0)         blocked = "screen size unknown";
+    if (blocked) {
+        static DWORD lastWhy = 0;
+        DWORD now = GetTickCount();
+        if (g_splitOn && (now - lastWhy) >= 5000) {
+            lastWhy = now;
+            logf_("[split] ON but not drawing: %s", blocked);
+        }
+        return FALSE;
+    }
+
+        if ((n % 30) == 0) {
+            // One-shot level introspection, triggered by a "dump_objects" file.
+            if (!g_dumped &&
+                GetFileAttributesA("dump_objects") != INVALID_FILE_ATTRIBUTES) {
+                g_dumped = TRUE;
+                BOOL late = FALSE;
+                {
+                    HANDLE h = CreateFileA("dump_objects", GENERIC_READ,
+                                           FILE_SHARE_READ, NULL,
+                                           OPEN_EXISTING, 0, NULL);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        char mb[8] = { 0 }; DWORD rd = 0;
+                        if (ReadFile(h, mb, 7, &rd, NULL) &&
+                            rd >= 4 && !strncmp(mb, "late", 4)) late = TRUE;
+                        CloseHandle(h);
+                    }
+                }
+                if (late) {
+                    // The full boot dump freezes the game for minutes and
+                    // eats the scripted key presses. "late" arms the aim
+                    // probe only: it dumps classes + instances + probe FX
+                    // from inside the first cast-hold, when everything is
+                    // live. Only the offset calibration runs now.
+                    logf_("--- late diagnostics: aim probe armed ---");
+                    calibratePropertyOffset();
+                    g_aimDiag = TRUE;
+                }
+                else
+                {
+                char b[512];
+                logf_("--- object dump ---");
+                logf_("  Viewport      = %p", g_viewport);
+                if (g_viewport && !IsBadReadPtr(g_viewport, 0x40))
+                    logf_("  Viewport.Actor= %s",
+                          objName(*(void **)((BYTE *)g_viewport + 0x34), b, sizeof(b)));
+                logf_("  camera actor  = %s", objName(g_camActor, b, sizeof(b)));
+
+                // Derive the current level's package prefix ("HP3_Adv1Express.")
+                // from the camera actor's full name, so this works on any map.
+                static char pref[128];
+                pref[0] = 0;
+                {
+                    const char *sp = strchr(b, ' ');
+                    const char *dot = sp ? strchr(sp + 1, '.') : NULL;
+                    if (sp && dot) {
+                        int L = (int)(dot - (sp + 1)) + 1;
+                        if (L > 0 && L < 120) { memcpy(pref, sp + 1, L); pref[L] = 0; }
+                    }
+                }
+                logf_("  level prefix  = '%s'", pref);
+                logf_("  canvas        = %s", objName(canvas, b, sizeof(b)));
+
+                const char *filt[2] = { pref[0] ? pref : "Controller", NULL };
+                dumpObjects(filt);
+
+                dumpHeroFunctions();
+                logf_("--- property offset calibration ---");
+                calibratePropertyOffset();
+                static const char *probes[] = {
+                    "Engine.Actor.Velocity", "Engine.Actor.Acceleration",
+                    "Engine.Actor.Physics", "Engine.Actor.Owner",
+                    "Engine.Actor.Level", "Engine.Actor.DrawType",
+                    "Engine.Pawn.Controller", "Engine.Pawn.Health",
+                    "Engine.Pawn.GroundSpeed", "Engine.Pawn.bIsWalking",
+                    "Engine.Controller.Pawn", "Engine.Controller.PlayerReplicationInfo",
+                    "Engine.PlayerController.Player",
+                    "Engine.PlayerController.ViewTarget",
+                    "Engine.PlayerController.myHUD",
+                    "Engine.PlayerController.DesiredFOV",
+                    NULL
+                };
+                for (int q = 0; probes[q]; q++) {
+                    int off = propOffset(probes[q]);
+                    if (off >= 0) logf_("    %-46s = +0x%X", probes[q], off);
+                    else          logf_("    %-46s = <not found>", probes[q]);
+                }
+                dumpActionSigs();
+                dumpCursorSigs();
+                g_aimDiag = TRUE;      // aim glow will probe FX classes once
+                logf_("--- object dump end ---");
+                }
+            }
+        }
+    // Level changes free every actor we cached. Detect it cheaply from the
+    // camera actor's package name and drop all caches, or we dereference
+    // freed memory the moment the player walks through a door.
+    if ((n % 45) == 0 && g_camActor) {
+        static char lastPkg[96] = "";
+        char b[256], pkg[96] = "";
+        objName(g_camActor, b, sizeof(b));
+        const char *sp = strchr(b, ' ');
+        const char *dot = sp ? strchr(sp + 1, '.') : NULL;
+        if (sp && dot) {
+            int L = (int)(dot - (sp + 1));
+            if (L > 0 && L < 95) { memcpy(pkg, sp + 1, L); pkg[L] = 0; }
+        }
+        if (pkg[0] && strcmp(pkg, lastPkg)) {
+            if (lastPkg[0]) {
+                char why[256];
+                _snprintf(why, sizeof(why) - 1, "level change '%s' -> '%s'", lastPkg, pkg);
+                why[sizeof(why) - 1] = 0;
+                invalidateLevelCaches(why);
+            }
+            strcpy(lastPkg, pkg);
+        }
+    }
+
+    if (!g_splitOn) return FALSE;
+
+    LONG live = InterlockedIncrement(&g_liveFrames);
+    if (live == 1) logf_("*** split-screen active: camera loc=(%.1f %.1f %.1f) "
+                         "rot=(%d %d %d) fov=%.1f  screen=%dx%d N=%d",
+                         g_camLoc[0], g_camLoc[1], g_camLoc[2],
+                         g_camRot[0], g_camRot[1], g_camRot[2],
+                         g_camFOV, g_sizeX, g_sizeY, g_numPlayers);
+
+    int W = g_sizeX, H = g_sizeY, N = g_numPlayers;
+    if (N < 1) N = 1;
+
+    hookGameWindow();
+    finishPendingCasts();
+
+    {   // K (diagnostic, 2-player configs only - K is P3's back key at N=3):
+        // A/B the aim glow's actor DrawScale live - 4.0, 0.3, back to
+        // normal. Settles whether the visible sparkle sizes with DrawScale
+        // (it does only ABOVE the engine's fixed-size floor; see the
+        // sizing note in aimFXVisuals).
+        static BOOL prevK = FALSE;
+        static int  stageK = 0;
+        BOOL k = g_numPlayers <= 2 && keyDown('K');
+        if (k && !prevK) {
+            g_dbgGlowScale = (stageK == 0) ? 4.0f :
+                             (stageK == 1) ? 0.3f : -1.0f;
+            logf_("  [glowAB] K -> stage %d, DrawScale=%.1f%s", stageK,
+                  g_dbgGlowScale,
+                  g_dbgGlowScale < 0 ? " (normal pulsing)" : "");
+            stageK = (stageK + 1) % 3;
+        }
+        prevK = k;
+    }
+
+    {   // D (diagnostic, 2-player configs): dump every live cursor/emitter
+        // actor with full renderer fields - the P1-marker hunt. USE ON
+        // HARDWARE: hold player 1's own aim (mouse) so the game's real
+        // marker is on screen, tap D, send hp3mod.log.
+        static BOOL prevD = FALSE;
+        BOOL d = g_numPlayers <= 2 && keyDown('D');
+        if (d && !prevD) diagDumpAimHunt();
+        prevD = d;
+    }
+
+    {   // E (diagnostic, v31): 8-second ProcessEvent capture on the player
+        // pawns. Tap E, then cast with P1 (mouse - the game's own natural
+        // cast, which never hops), then cast with P2 (Y - ours). The log
+        // gets BOTH exit sequences; the diff tells us exactly which calls
+        // the engine makes that we do not. Patch auto-removes at window
+        // end. See the pelog block above aimFXVisuals.
+        static BOOL prevO = FALSE;
+        BOOL oo = keyDown('O');
+        if (oo && !prevO) diagDumpCastProps();   // v33: stuck-pose diff
+        prevO = oo;
+        static BOOL prevE = FALSE;
+        BOOL e = keyDown('E');
+        if (e && !prevE) pelogStart();
+        prevE = e;
+        if (g_pelogOn && GetTickCount() >= g_pelogEnd)
+            pelogStop();   // render-loop safety: never rely on the
+                           // detour alone to unpatch itself
+    }
+
+    {   // C (diagnostic): call the game's OWN makeCursor() on P1's real
+        // controller, then dump the live SpellCursor at once and again
+        // 1.5s later - ground truth for the original aim glow's visuals
+        // (Style/Texture/DrawScale of its CursorParticles) and placement.
+        static BOOL prevC = FALSE;
+        static DWORD dumpAt = 0; static int dumpsLeft = 0;
+        BOOL c = keyDown('C');
+        BOOL cPress = c && !prevC;
+        if (cPress) {
+            void *ctrl = NULL;
+            if (g_viewport && !IsBadReadPtr(g_viewport, 0x38))
+                ctrl = *(void **)((BYTE *)g_viewport + 0x34);
+            void *fn = findObjectByPath("KWGame.KWHeroController.makeCursor");
+            logf_("  [origaim] C: ctrl=%p makeCursor=%p", ctrl, fn);
+            if (ctrl && fn) {
+                if (F.ControllerPawn > 0 &&
+                    !IsBadReadPtr((BYTE *)ctrl + F.ControllerPawn, 4)) {
+                    void *cp = *(void **)((BYTE *)ctrl + F.ControllerPawn);
+                    if (cp && F.Location > 0 &&
+                        !IsBadReadPtr(cp, F.Location + 12)) {
+                        float *cl = (float *)((BYTE *)cp + F.Location);
+                        logf_("  [origaim] ctrl pawn loc=(%.0f %.0f %.0f)",
+                              cl[0], cl[1], cl[2]);
+                    }
+                }
+                callFn(ctrl, fn, "makeCursor()");
+                dumpCursorInstances();
+                dumpsLeft = 2; dumpAt = GetTickCount() + 1500;
+                // and spawn ONE bare SpellCursorEmitter (NO styling at all)
+                // 200 units in front of P2 - factory-default visuals, to
+                // compare against the game's own cursor look.
+                {
+                    void *p2 = getPawn(1);
+                    if (p2 && F.Location > 0 &&
+                        !IsBadReadPtr(p2, F.Location + 12)) {
+                        float *pl = (float *)((BYTE *)p2 + F.Location);
+                        int cy2 = playerCamYaw(1), cp2 = playerCamPitch(1);
+                        double ry2 = cy2 * (6.283185307179586 / 65536.0);
+                        double rp2 = cp2 * (6.283185307179586 / 65536.0);
+                        float cpv2 = (float)cos(rp2);
+                        float dir[3] = { (float)cos(ry2) * cpv2,
+                                         (float)sin(ry2) * cpv2,
+                                         (float)sin(rp2) };
+                        float at[3] = { pl[0] + dir[0] * 200.0f,
+                                        pl[1] + dir[1] * 200.0f,
+                                        pl[2] + dir[2] * 200.0f + 40.0f };
+                        int zr[3] = { 0, 0, 0 };
+                        static void *s_bareFX = NULL;
+                        s_bareFX = spawnFX(p2, g_clsAimFX, p2, at, zr);
+                        logf_("  [origaim] BARE SpellCursorEmitter spawned "
+                              "at (%.0f %.0f %.0f) - factory visuals:", 
+                              at[0], at[1], at[2]);
+                        dumpActorVisuals(s_bareFX, "bare (unstyled)");
+                    }
+                }
+            }
+        }
+        prevC = c;
+        if (dumpsLeft > 0 && GetTickCount() >= dumpAt) {
+            logf_("  [origaim] cursor state +%.1fs:", 1.5f * (3 - dumpsLeft));
+            dumpCursorInstances();
+            dumpsLeft--; dumpAt = GetTickCount() + 1500;
+        }
+        // once: the game's own cursor emitter ARCHETYPE - texture (the
+        // ParticleEmitter.Texture at +0x334, NOT Actor.Texture), size range
+        // and opacity the game itself configured for the spell cursor.
+        {
+            static BOOL done = FALSE;
+            if (cPress && !done) {
+                done = TRUE;
+                if (g_objArray) {
+                    char nb[160];
+                    for (int i = 0; i < g_objArray->Num; i++) {
+                        void *o = g_objArray->Data[i];
+                        if (!o || IsBadReadPtr(o, 0x338)) continue;
+                        objName(o, nb, sizeof(nb));
+                        if (!strstr(nb, "SpellCursorEmitterNoHit")) continue;
+                        void *tex = *(void **)((BYTE *)o + 0x334);
+                        float *ss = (float *)((BYTE *)o + 0x2B8);
+                        logf_("  [origaim] archetype %p: ParticleEmitter."
+                              "Texture=%p '%s' StartSizeRange min=(%.0f %.0f "
+                              "%.0f) max=(%.0f %.0f %.0f) Opacity=%.2f", o,
+                              tex, (tex && !IsBadReadPtr(tex, 8))
+                                   ? objName(tex, nb, sizeof(nb)) : "?",
+                              ss[0], ss[1], ss[2], ss[3], ss[4], ss[5],
+                              *(float *)((BYTE *)o + 0xAC));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < N; i++) {
+        int x  = (int)((LONGLONG)W * i / N);
+        int x2 = (int)((LONGLONG)W * (i + 1) / N);
+        int w  = x2 - x;
+
+        float loc[3] = { g_camLoc[0], g_camLoc[1], g_camLoc[2] };
+        int   rot[3] = { g_camRot[0], g_camRot[1], g_camRot[2] };
+
+        if (i > 0) {
+            void *pawn = getPawn(i);
+            if (pawn && !IsBadReadPtr(pawn, 0x170)) {
+                resolveFields();
+                resolveActions();
+                thirdPersonCam(i, pawn, loc, rot);
+                takeControl(i, pawn);
+                driveePawn(i, pawn);
+                {   // edge-triggered actions: "." = jump, "/" = cast
+                    static BOOL prevJ[8] = {0}, prevF[8] = {0};
+                    BOOL j = keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) || g_padJump[i];
+                    BOOL f = keyDown(g_pk[i].cast) || keyDown(g_pk[i].cast2) || g_padCast[i];
+                    if (j && !prevJ[i]) {
+                        // v13: grounded jumps only. v12 honored a jump press
+                        // in mid-air: every rapid re-press reset vz to full
+                        // jump speed during the flight and the pawn climbed
+                        // indefinitely. Now a press is only honored when the
+                        // pawn is not Falling and not mid walk-prep.
+                        BYTE phJ = (F.Physics > 0)
+                                 ? *((BYTE *)pawn + F.Physics) : 1;
+                        BOOL moving = g_p2Moving[i] != 0;
+                        int *pr = (int *)((BYTE *)pawn + F.Rotation);
+                        float *pv = (float *)((BYTE *)pawn + F.Velocity);
+                        float jz = 420.0f;
+                        if (F.JumpZ > 0) {
+                            float v = *(float *)((BYTE *)pawn + F.JumpZ);
+                            if (v > 50.0f && v < 2000.0f) jz = v;
+                        }
+                        if (phJ == 2 || g_jumpPh[i] == 1) {
+                            logf_("    jump ignored (%s, phys=%u) - "
+                                  "grounded jumps only",
+                                  phJ == 2 ? "airborne" : "mid-prep",
+                                  (unsigned)phJ);
+                        } else if (moving) {
+                            // Moving jump: DoJump_Player + PlayJump were always
+                            // fine on this path (v6+). PHYS Falling + vz.
+                            callFn(pawn, g_fnJump, "DoJump_Player");
+                            if (g_fnPlayJump) callFn(pawn, g_fnPlayJump, "PlayJump");
+                            pv[2] = jz;
+                            if (F.Physics > 0)
+                                *((BYTE *)pawn + F.Physics) = 2;  // PHYS_Falling
+                            logf_("    jump impulse (moving): vz=%.0f", jz);
+                        } else {
+                            g_jumpStanding[i]  = TRUE;
+                            g_jumpYawLock[i]   = playerViewYaw(i);
+                            g_jumpLockUntil[i] = 0;
+                            if (F.DesiredRotation > 0) {
+                                int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                                g_savedDesRot[i][0] = dr[0];
+                                g_savedDesRot[i][1] = dr[1];
+                                g_savedDesRot[i][2] = dr[2];
+                            }
+                            if (F.RotationRate > 0) {
+                                int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                                g_savedRotRate[i][0] = rr[0];
+                                g_savedRotRate[i][1] = rr[1];
+                                g_savedRotRate[i][2] = rr[2];
+                            }
+                            pr[0] = 0; pr[1] = g_jumpYawLock[i]; pr[2] = 0;
+                            pv[0] = pv[1] = 0.0f;
+                            if (F.DesiredRotation > 0) {
+                                int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                                dr[0] = 0; dr[1] = g_jumpYawLock[i]; dr[2] = 0;
+                            }
+                            // Wine test 1 showed the engine rotates the pawn
+                            // ~85 deg on the very first Walking tick after a
+                            // long idle (rawRot yaw 167 -> 15691, vel 0).
+                            // Kill that rotation DURING the prep tick itself:
+                            // rate 0 stops the physics rotation advance.
+                            if (F.RotationRate > 0) {
+                                int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                                rr[0] = 0; rr[1] = 0; rr[2] = 0;
+                            }
+                            g_jumpVz[i]       = jz;
+                            g_jumpPh[i]       = 1;              // walk-prep
+                            g_jumpLaunchAt[i] = GetTickCount() + 15;
+                            if (F.Physics > 0)
+                                *((BYTE *)pawn + F.Physics) = 1;   // PHYS_Walking
+                            g_jumpLogUntil[i] = GetTickCount() + 1400;
+                            g_jumpLogN[i]     = 0;
+                            logf_("    jump prep: PHYS_Walking 1 tick then "
+                                  "Falling vz=%.0f yawlock=%d playJump=0 "
+                                  "desRotPinned=%d rotRatePinned=%d",
+                                  jz, g_jumpYawLock[i],
+                                  F.DesiredRotation > 0 ? 1 : 0,
+                                  F.RotationRate > 0 ? 1 : 0);
+                        }
+                    }
+                    if (f && !prevF[i]) {
+                        callFn(pawn, g_fnFire, "PressedFire");
+                        beginCast(i, pawn);
+                    }
+                    if (!f && prevF[i]) {
+                        fireCast(i, pawn);
+                        if (g_fnCharRelFire) callFn(pawn, g_fnCharRelFire, "HPCharacter.ReleasedFire");
+                        callFn(pawn, g_fnFireRel, "ReleasedFire");
+                    }
+                    // v15: while the cast button is held, keep the game's own
+                    // aim-glow emitter at the point this camera is aiming at
+                    updateAimFX(i, pawn, f, loc, rot);
+                    // ";" = use/interact, "," = hand the pawn over from the AI
+                    static BOOL prevU[8] = {0}, prevP[8] = {0};
+                    BOOL u = keyDown(g_pk[i].use) || keyDown(g_pk[i].use2) || g_padUse[i];
+                    BOOL o = keyDown(g_pk[i].release);
+                    if (u && !prevU[i]) doUse(i, pawn);
+                    if (o && !prevP[i]) releaseAI(i, pawn, FALSE);   // soft
+                    BOOL h = keyDown(g_pk[i].hard);
+                    static BOOL prevH[8] = {0};
+                    if (h && !prevH[i]) {
+                        g_letAI[i] = !g_letAI[i];
+                        if (g_letAI[i]) {
+                            g_detached[i] = FALSE;
+                            repossess(i, pawn);
+                            logf_("  [debug] p%d AI repossessed (M) - split will not fight it", i);
+                        } else {
+                            logf_("  [debug] p%d AI suppressed again (M)", i);
+                        }
+                    }
+                    prevH[i] = h;
+                    BOOL inval = keyDown(g_pk[i].inval);
+                    static BOOL prevI = FALSE;
+                    if (inval && !prevI && i == 1)
+                        invalidateLevelCaches("forced cache invalidation (debug key)");
+                    prevI = inval;
+                    prevU[i] = u; prevP[i] = o;
+                    prevJ[i] = j; prevF[i] = f;
+                }
+            } else {
+                // No pawn for this slot: fall back to a yaw-offset view so the
+                // strip is still visibly distinct rather than a clone.
+                rot[1] = g_camRot[1] + i * (65536 / N);
+            }
+        }
+
+        // v35: remember her last healthy standing height. Sample when she
+        // is OUT of the cast state entirely (no pending cast, no aim glow)
+        // and not falling: standing idle (phys=0) or walking (phys=1).
+        // Idle-standing samples are the true floor-rest height - a walking
+        // sample can carry a footfall bob (observed 170.8 vs rest 170.5),
+        // so the LAST sample before she aims (usually idle) is the right
+        // one to restore at the exit.
+        if (i > 0 && i < 8 && g_pawn[i] && F.ok && F.Physics > 0 &&
+            F.Location > 0 && !g_castPending[i] && !aimGlowAlive(i) &&
+            !IsBadReadPtr(g_pawn[i], F.Location + 12)) {
+            BYTE ph = *((BYTE *)g_pawn[i] + F.Physics);
+            if (ph == 0 || ph == 1) {
+                float *pl = (float *)((BYTE *)g_pawn[i] + F.Location);
+                g_restZ[i]     = pl[2];
+                g_restXY[i][0] = pl[0]; g_restXY[i][1] = pl[1];
+                int slot = g_restRingN[i] % 8;
+                g_restRing[i][slot][0] = pl[0];
+                g_restRing[i][slot][1] = pl[1];
+                g_restRing[i][slot][2] = pl[2];
+                g_restRingPost[i][slot] = 0;      // organic standing sample
+                g_restRingN[i]++;
+            }
+        }
+
+        // movement telemetry, so a headless run can prove the pawn responds
+        // Time-based, not frame-based: at 60 fps a frame counter would write
+        // several lines a second and bloat the log on real hardware.
+        static DWORD lastTel[8] = {0};
+        DWORD nowTel = GetTickCount();
+        if (i > 0 && i < 8 && g_pawn[i] && F.ok &&
+            (nowTel - lastTel[i]) >= 2000) {
+            lastTel[i] = nowTel;
+            float *pl = (float *)((BYTE *)g_pawn[i] + F.Location);
+            PadState dbg; readInput(i, &dbg);
+            float *pv = (float *)((BYTE *)g_pawn[i] + F.Velocity);
+            void *ctrl = (F.PawnController > 0)
+                       ? *(void **)((BYTE *)g_pawn[i] + F.PawnController) : NULL;
+            float dLead = -1.0f;
+            void *lead = g_pawn[0] ? g_pawn[0] : findActorByClass("harry");
+            if (lead && F.Location > 0 && !IsBadReadPtr(lead, F.Location + 12)) {
+                float *hl = (float *)((BYTE *)lead + F.Location);
+                float dx = pl[0]-hl[0], dy = pl[1]-hl[1], dz = pl[2]-hl[2];
+                dLead = sqrtf(dx*dx + dy*dy + dz*dz);
+            }
+            logf_("  [t+%3ld] p%d in(fwd=%+.1f side=%+.1f turn=%+.1f look=%+.2f,%+.2f j=%d c=%d) loc=(%.0f %.0f Z=%.0f) vz=%.0f phys=%d yaw=%d ctrl=%p dLead=%.0f",
+                  live, i, dbg.fwd, dbg.side, dbg.turn, dbg.lookx, dbg.looky,
+                  dbg.jump ? 1 : 0, dbg.cast ? 1 : 0,
+                  pl[0], pl[1], pl[2], pv[2],
+                  F.Physics > 0 ? *((BYTE *)g_pawn[i] + F.Physics) : -1, playerViewYaw(i),
+                  ctrl, dLead);
+        }
+
+        if (live == 1)
+            logf_("  portal[%d]: rect=(%d,0 %dx%d) char=%s loc=(%.0f %.0f %.0f) yaw=%d",
+                  i, x, w, H, i == 0 ? "<engine cam>" : g_pawnName[i],
+                  loc[0], loc[1], loc[2], rot[1]);
+
+        // v25: P2+'s aim glow renders only in its owner's pane
+        setAimFXPaneVisible(i);
+        drawPortalSized(canvas, x, 0, w, H, g_camActor, loc, rot, TRUE);
+    }
+    // v25: hidden everywhere else - including the engine's own base render
+    setAimFXPaneVisible(-1);
+
+    if (live == 1)   logf_("  >>> %d portals drawn, survived <<<", N);
+    {   // once every 5 s: proof the split is still up, and for how long
+        static DWORD lastBeat = 0, firstBeat = 0;
+        DWORD now = GetTickCount();
+        if (!firstBeat) firstBeat = now;
+        if ((now - lastBeat) >= 5000) {
+            lastBeat = now;
+            logf_("[split] still ON: %d views, %ld frames, %.1f s since toggle",
+                  N, live, (now - firstBeat) / 1000.0);
+        }
+    }
+    if (live == 200) logf_("  >>> still alive after 200 split frames <<<");
+    return TRUE;
+}
+
+// The HUD used to be drawn full-screen BEFORE the portals, which meant the
+// portals painted straight over it and the split had no HUD at all. Now the
+// portals go down first and the engine's own PostRender runs afterwards, with
+// the canvas clipped to player 1's strip so the HUD lands inside that view
+// instead of being stretched across every strip.
+static void __fastcall PostRender_detour(void *self, void *edx, void *canvas)
+{
+    BOOL split = renderSplitPortals(self, edx, canvas);
+
+    if (!split || C.ClipX < 0 || !canvas || IsBadReadPtr(canvas, 0x80)) {
+        g_origPostRender(self, edx, canvas);
+        return;
+    }
+
+    float *orgX  = (float *)((BYTE *)canvas + C.OrgX);
+    float *orgY  = (float *)((BYTE *)canvas + C.OrgY);
+    float *clipX = (float *)((BYTE *)canvas + C.ClipX);
+    float *clipY = (float *)((BYTE *)canvas + C.ClipY);
+    float sOrgX = *orgX, sOrgY = *orgY, sClipX = *clipX, sClipY = *clipY;
+
+    int N = g_numPlayers; if (N < 1) N = 1; if (N > 8) N = 8;
+    float stripW = (float)g_sizeX / (float)N;
+
+    *orgX  = 0.0f;                       // player 1 owns the leftmost strip
+    *orgY  = 0.0f;
+    *clipX = stripW;
+    *clipY = (float)g_sizeY;
+
+    static BOOL logged = FALSE;
+    if (!logged) {
+        logged = TRUE;
+        logf_("  [hud] clipped to strip 0: org=(0,0) clip=(%.0f,%.0f) "
+              "(was clip=(%.0f,%.0f))", *clipX, *clipY, sClipX, sClipY);
+    }
+
+    g_origPostRender(self, edx, canvas);
+
+    *orgX = sOrgX; *orgY = sOrgY; *clipX = sClipX; *clipY = sClipY;
+}
+
+// -------------------------------- init -------------------------------------
+static DWORD WINAPI initThread(LPVOID)
+{
+    for (int w = 0; w < 240; w++) { Sleep(250); if (GetModuleHandleA("Engine.dll")) break; }
+    Sleep(750);
+
+    g_core   = GetModuleHandleA("Core.dll");
+    g_engine = GetModuleHandleA("Engine.dll");
+    logf_("--- init (t=%lu ms) Core=%p Engine=%p ---",
+          GetTickCount(), (void *)g_core, (void *)g_engine);
+    if (!g_core || !g_engine) { logf_("FATAL: modules missing"); return 0; }
+
+    logf_("[opcode discovery]");
+    g_opsOK = discoverOpcodes();
+    logf_("  opcodes %s", g_opsOK ? "ALL RESOLVED" : "INCOMPLETE - portals disabled");
+
+    g_ProcessEvent = (PFN_ProcessEvent)resolveThunk(
+        (BYTE *)GetProcAddress(g_core, "?ProcessEvent@UObject@@UAEXPAVUFunction@@PAX1@Z"));
+    g_objArray    = (TArrayLite *)GetProcAddress(g_core, SYM_GOBJ);
+    g_GetFullName = (PFN_GetFullName)resolveThunk((BYTE *)GetProcAddress(g_core, SYM_FULLNAME));
+    g_GetName     = (PFN_GetName)    resolveThunk((BYTE *)GetProcAddress(g_core, SYM_GETNAME));
+    logf_("GObjObjects=%p (Num=%d)  GetFullName=%p  GetName=%p",
+          (void *)g_objArray,
+          (g_objArray && !IsBadReadPtr(g_objArray, 12)) ? g_objArray->Num : -1,
+          (void *)g_GetFullName, (void *)g_GetName);
+
+    g_execFastTrace = (PFN_execFastTrace)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?execFastTrace@AActor@@QAEXAAUFFrame@@QAX@Z"));
+    logf_("execFastTrace = %p", (void *)g_execFastTrace);
+    g_execSpawn = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?execSpawn@AActor@@QAEXAAUFFrame@@QAX@Z"));
+    g_execDestroy = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?execDestroy@AActor@@QAEXAAUFFrame@@QAX@Z"));
+    logf_("execSpawn = %p  execDestroy = %p",
+          (void *)g_execSpawn, (void *)g_execDestroy);
+    g_execDrawPortal = (PFN_execDrawPortal)
+        resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_DRAWPORT));
+    logf_("execDrawPortal = %p", (void *)g_execDrawPortal);
+
+    logf_("[hooks]");
+    if (installHook(&g_hkDraw, resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_DRAW)),
+                    (void *)&Draw_detour, "UGameEngine::Draw"))
+        g_origDraw = (PFN_Draw)g_hkDraw.tramp;
+
+    if (installHook(&g_hkPSN, resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_PSNODE)),
+                    (void *)&PSN_detour, "FPlayerSceneNode::ctor"))
+        g_origPSN = (PFN_PSN)g_hkPSN.tramp;
+
+    if (installHook(&g_hkPostRender, resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_POSTREND)),
+                    (void *)&PostRender_detour, "MasterProcessPostRender"))
+        g_origPostRender = (PFN_PostRender)g_hkPostRender.tramp;
+
+    logf_("--- init done, numPlayers=%d ---", g_numPlayers);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) void *WINAPI Direct3DCreate8(UINT SDKVersion)
+{
+    logf_("Direct3DCreate8(SDKVersion=%u)", SDKVersion);
+    if (!g_realCreate) return NULL;
+    void *r = g_realCreate(SDKVersion);
+    logf_("  -> IDirect3D8* = %p", r);
+    return r;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hInst);
+        InitializeCriticalSection(&g_logCs); g_logCsInit = TRUE;
+        // Read the config before opening the log, so logging itself is
+        // configurable ([debug] Log=0 for a silent release install).
+        char ini[MAX_PATH];
+        GetCurrentDirectoryA(MAX_PATH, ini);
+        strcat(ini, "\\hp3mod.ini");
+        if (GetPrivateProfileIntA("debug", "Log", 1, ini))
+            g_log = fopen("hp3mod.log", "w");
+        logf_("===========================================================");
+        logf_("=== hp3mod %s", MOD_STAMP);
+        logf_("=== if this does not say 'v46' you are running an OLD d3d8.dll");
+        logf_("===========================================================");
+
+        int n = GetPrivateProfileIntA("split", "Players", 0, ini);
+        if (n >= 1 && n <= 8) { g_numPlayers = n; logf_("hp3mod.ini: Players=%d", n); }
+        int cd = GetPrivateProfileIntA("camera", "Distance",  0, ini);
+        int ch = GetPrivateProfileIntA("camera", "Height",   -1, ini);
+        int cp = GetPrivateProfileIntA("camera", "Pitch",  99999, ini);
+        if (cd >  0)     g_camDist   = (float)cd;
+        if (ch >= 0)     g_camHeight = (float)ch;
+        if (cp != 99999) g_camPitch  = cp;
+        g_camCollide = GetPrivateProfileIntA("camera",  "Collision", 1, ini) != 0;
+        g_freeLook   = GetPrivateProfileIntA("camera",  "FreeCamera", 0, ini) != 0;
+        g_aimedCast  = GetPrivateProfileIntA("actions", "AimedCast", 0, ini) != 0;
+        {   // v40: gap between the state's natural AnimEnd and our exit.
+            // 90 (default) = the v39 timing that killed the hop. If a cast
+            // leaves a weird stance on hardware, raise it (250/400) to move
+            // back toward the v38 timing - or lower it toward 40. The code
+            // fallback MUST equal the shipped ini default.
+            int ca = GetPrivateProfileIntA("actions", "CastExitAdj", 90, ini);
+            if (ca < 40) ca = 40;
+            if (ca > 600) ca = 600;
+            g_castExitAdj = ca;
+        }
+        {   // v19: aim glow marker size in percent (particle size scale).
+            int gs = GetPrivateProfileIntA("actions", "GlowSize", 0, ini);
+            if (gs >= 20 && gs <= 200) g_glowSize = gs;
+        }
+        g_glowStyle = GetPrivateProfileIntA("actions", "GlowStyle", 6, ini);
+        {   // v23: Cleanup default full - the state exit is REQUIRED (v22
+            // hardware: without it the cast pose hangs forever, even while
+            // running). "light" (no state exit) is hang-bait, kept only as
+            // a documented experiment.
+            char cb[16] = { 0 };
+            GetPrivateProfileStringA("actions", "Cleanup", "full", cb,
+                                     sizeof(cb) - 1, ini);
+            g_cleanupLight = (_stricmp(cb, "light") == 0);
+        }
+        {   // v25: hop bisect. full (default) = the v23 chain that the v23
+            // hardware run PROVED exits the pose (hw also proved noanimend
+            // HANGS - the manual AnimEnd is required). min / exitanim are
+            // experiments that drop hop-suspect calls.
+            char cc[16] = { 0 };
+            GetPrivateProfileStringA("actions", "CleanupChain", "full",
+                                     cc, sizeof(cc) - 1, ini);
+            if      (_stricmp(cc, "full")      == 0) g_cleanupChain = 0;
+            else if (_stricmp(cc, "noanimend") == 0) g_cleanupChain = 1;
+            else if (_stricmp(cc, "min")       == 0) g_cleanupChain = 2;
+            else if (_stricmp(cc, "exitanim")  == 0) g_cleanupChain = 3;
+        }
+        {   // v25: ms after release before the cleanup chain fires. If the
+            // chain interrupts the cast anim mid-phase (the hop), a later
+            // fire may let the engine finish it cleanly. Try 2200.
+            int cd = GetPrivateProfileIntA("actions", "CleanupDelay", 1200,
+                                           ini);
+            if (cd >= 400 && cd <= 2600) g_cleanupDelay = cd;
+        }
+        {   // v28: split-chain hop fix. Phase A (blendOut+StopCasting)
+            // fires at CleanupDelay, phase B (state exit+Switch+AnimEnd)
+            // CleanupSplit ms later - the exit lands on a faded pose
+            // instead of snapping the cast pose mid-anim. 0 = v27's
+            // single-pass chain (hop but proven no-hang).
+            int cs = GetPrivateProfileIntA("actions", "CleanupSplit", 0,
+                                           ini);   // fallback MUST equal the
+                                           // shipped default (v31 lesson)
+            if (cs >= 0 && cs <= 2600) g_cleanupSplit = cs;
+        }
+        {   // v27 isolation knobs - defaults reproduce v23's proven-exiting
+            // behavior exactly (guards OFF). Only flip ONE at a time on
+            // hardware, and note what changed in the report.
+            g_hopGuard  = GetPrivateProfileIntA("actions", "HopGuard",  0,
+                                                ini) != 0;
+            g_reAssert  = GetPrivateProfileIntA("actions", "ReAssert",  0,
+                                                ini) != 0;
+            g_bodyClear = GetPrivateProfileIntA("actions", "BodyClear", 1,
+                                                ini) != 0;
+            g_panePark  = GetPrivateProfileIntA("actions", "PanePark",  1,
+                                                ini) != 0;
+        }
+        // v18: default straight-shot. The v17 default auto-aim cone kept
+        // snapping the spell to other players / companions near the caster
+        // while the glow marked where the camera points - the two disagreed.
+        g_toggleKey  = iniKey("split", "ToggleKey", VK_F10, ini);
+        g_fileToggle = GetPrivateProfileIntA("debug", "FileToggle", 0, ini) != 0;
+        g_strafeMode = GetPrivateProfileIntA("player2", "StrafeMode", 0, ini) != 0;
+        g_turnSpeed  = (float)GetPrivateProfileIntA("player2", "TurnSpeed", 180, ini);
+        if (g_turnSpeed < 20.0f)  g_turnSpeed = 20.0f;
+        if (g_turnSpeed > 400.0f) g_turnSpeed = 400.0f;
+        g_fovMode  = GetPrivateProfileIntA("camera", "FovMode", 1, ini);
+        {
+            int fs = GetPrivateProfileIntA("camera", "FovScale", 100, ini);
+            g_fovScale = fs / 100.0f;
+            if (g_fovScale < 0.50f) g_fovScale = 0.50f;
+            if (g_fovScale > 2.00f) g_fovScale = 2.00f;
+        }
+        logf_("hp3mod.ini: StrafeMode=%d TurnSpeed=%.0f FovMode=%d FovScale=%.2f "
+              "FreeCamera=%d",
+              g_strafeMode, g_turnSpeed, g_fovMode, g_fovScale, g_freeLook);
+        // StartOn=1 brings the split up as soon as the level is running, with
+        // no key press at all - both a convenience and a clean way to tell a
+        // broken toggle apart from a broken renderer.
+        g_splitOn    = GetPrivateProfileIntA("split", "StartOn", 0, ini) != 0;
+        logf_("hp3mod.ini: ToggleKey=0x%02X StartOn=%d FileToggle=%d",
+              g_toggleKey, g_splitOn, g_fileToggle);
+        initKeyDefaults();
+        loadKeyMap(ini);
+        logf_("hp3mod.ini: camera dist=%.0f height=%.0f pitch=%d collision=%d aimedcast=%d",
+              g_camDist, g_camHeight, g_camPitch, g_camCollide, g_aimedCast);
+
+        char sys[MAX_PATH];
+        GetSystemDirectoryA(sys, MAX_PATH); strcat(sys, "\\d3d8.dll");
+        g_realD3D8 = LoadLibraryA(sys);
+        if (g_realD3D8)
+            g_realCreate = (PFN_Direct3DCreate8)GetProcAddress(g_realD3D8, "Direct3DCreate8");
+        logf_("real d3d8 %p, create %p", (void *)g_realD3D8, (void *)g_realCreate);
+
+        CreateThread(NULL, 0, initThread, NULL, 0, NULL);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        logf_("=== detach (frames=%ld postrender=%ld) ===", g_frame, g_prCount);
+        if (g_log) fclose(g_log);
+    }
+    return TRUE;
+}

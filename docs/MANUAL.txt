@@ -1,0 +1,602 @@
+===========================================================================
+ Split-Screen Multiplayer for
+ Harry Potter and the Prisoner of Azkaban (PC, EA/KnowWonder 2004)
+ Technical prototype - Windows
+===========================================================================
+
+WHAT IT DOES
+  Adds N-way vertical split-screen to a game that shipped with all
+  split-screen support stripped out of its binaries. Each strip follows a
+  different character and players 2..N are directly controllable.
+
+  Nothing is recompiled and no game file is modified. The mod is a proxy
+  d3d8.dll that loads with the game, hooks the renderer, and drives the
+  engine's own DrawPortal once per player.
+
+
+INSTALLING
+  1. Copy  d3d8.dll  and  hp3mod.ini  into the game's  system\  folder,
+     next to hppoa.exe.
+  2. Run the game normally.
+
+  Windows loads a DLL from the application directory before the one in
+  System32, so no other configuration is needed.
+
+UNINSTALLING
+  Delete d3d8.dll (and hp3mod.ini, hp3mod.log). Nothing else was touched.
+
+
+USING IT
+
+  >>> CHECK YOU ARE RUNNING THIS BUILD <<<
+      Open system\hp3mod.log and read line 2. It must say:
+          === hp3mod build v47 ...
+      If it says anything earlier, or the file is missing, Windows is still
+      loading an older d3d8.dll. Close the game completely before replacing
+      BOTH d3d8.dll AND hp3mod.ini.
+
+  >>> IF THE SPLIT FLASHES ON AND DISAPPEARS <<<
+      Open hp3mod.ini and set:      StartOn=1
+      The split then comes up by itself as soon as the level is running.
+
+  Split screen starts OFF unless StartOn=1. Press F10 in game to toggle it.
+  (The game binds F9 to its own screenshot command, so F10 is the toggle.)
+
+  ---------------------------------------------------------------------------
+   PLAYER 2 CONTROLS  -  same scheme as the original player
+  ---------------------------------------------------------------------------
+   Forward/back walks. Left/right TURNS the view. That is how Harry's
+   arrow keys work, and it is how player 2 works now.
+
+   RECOMMENDED: the letter cluster or a gamepad. These never collide with
+   player 1 and do not care about NumLock.
+
+             T / G                  forward / back
+             F / H                  TURN left / right
+             Q / E                  also turn
+             R                      jump
+             Y                      cast spell  (hold to aim, release to fire)
+             V                      use / interact
+
+             The numpad does the same thing (8/2 forward-back, 4/6 turn,
+             0 jump, . cast, + use, - release the AI).
+             >>> NumLock ON, or Windows reports the numpad as arrow keys. <<<
+
+             Gamepad - Xbox 360 / DualSenseX (XInput) AND native DualSense:
+             Left stick Y        walk forward / back
+             Left stick X        TURN (tank), same as F/H
+             Right stick X       TURN - camera follows behind the character,
+                                 exactly like the original player (v13).
+                                 Set [camera] FreeCamera=1 for the old
+                                 free-orbit camera (testing only).
+             Right stick Y       camera pitch - AND the vertical aim of
+                                 spells (aim up/down, cast follows it).
+                                 v14 widened the range: roughly 45 deg up,
+                                 70 deg down. The camera also ORBITS the
+                                 character with the pitch like the original
+                                 player's: look down and it swings overhead
+                                 with the character centered in frame
+                                 (v13 just tilted the view at the feet).
+             A / DualSense Cross jump    (grounded jumps only, like the game)
+             Right trigger       cast (hold aim, release fire). While
+                                 holding, a sparkling gold glow (the
+                                 game's own Sparkle_1/3/7 FX textures,
+                                 cycling + pulsing, v17) rides the spell's
+                                 exact flight line from the caster's wand,
+                                 snapping back from walls - where it sits
+                                 is where the spell goes. With no
+                                 auto-target the spell
+                                 flies along the camera (yaw AND pitch,
+                                 v14 aims the spell actor itself so the
+                                 direction sticks); with a target in the
+                                 cone it auto-aims like the original game.
+                                 The casting pose is cleared again ~1.2 s
+                                 after the spell leaves the wand - v17
+                                 exits the casting script STATE (the real
+                                 reason the pose used to hang).
+                                 v18: the glow is ADDITIVE (no more black
+                                 box around the sprite), rides the spell's
+                                 exact flight line from where the spell
+                                 really spawns, and hugs the wall it will
+                                 hit. Casts fire straight along the camera
+                                 by default now (set AimedCast=1 in
+                                 hp3mod.ini for soft auto-aim - the glow
+                                 then jumps onto the target it locks).
+                                 v19: the spell itself now spawns OUTSIDE
+                                 the caster (90 units along the camera ray
+                                 + 45 up), so its glow no longer renders
+                                 inside player 2's body as seen from
+                                 player 1's pane.
+                                 v20: the glow stayed in cast range
+                                 instead of parking at the far wall, hugged
+                                 whatever you point at, and never came
+                                 closer than 150 units to the caster - but
+                                 its "factory particle" rendering turned
+                                 out invisible on real hardware.
+                                 v23: the glow is the hardware-proven
+                                 additive sprite again, now with a hard
+                                 110-unit horizontal clearance from the
+                                 caster, so it can never sit inside her
+                                 body from any view. GlowStyle= in
+                                 hp3mod.ini can switch styles.
+                                 v24: hardware showed the clearance push
+                                 could still be dragged back INTO the
+                                 caster when she stands nose-to-wall -
+                                 the glow now keeps a body-clearance
+                                 distance from EVERY character (it slides
+                                 along the wall beside her, and hides
+                                 only when there is no room at all), and
+                                 its size is reduced 40% (GlowSize=36).
+                                 The post-cast hop is being bisected:
+                                 CleanupChain=noanimend (default) drops
+                                 the manual AnimEnd event; set
+                                 CleanupChain=full to restore v23, or
+                                 =min to also drop the stance switch -
+                                 tell me which one still hops.
+                                 v25: the pose exit is RESTORED - the
+                                 manual AnimEnd turned out to be
+                                 required (v24 without it hung the pose
+                                 again), CleanupChain=full is the
+                                 default once more. The glow is now a
+                                 true PER-PANE cursor: it renders only
+                                 in its own player's half of the screen,
+                                 exactly like the original game cursor -
+                                 so it can never appear inside player 2
+                                 as seen from player 1's half, no matter
+                                 where it sits in the world. New hop
+                                 experiments: CleanupDelay=2200 (fire
+                                 the cleanup chain later) and
+                                 CleanupChain=exitanim. The D-key hunt
+                                 now ALSO lists every live drawable
+                                 actor near player 1.
+                                 v26: per-pane hiding now works on
+                                 HARDWARE too - the glow is physically
+                                 parked far outside the world whenever
+                                 its player's half is not on screen
+                                 (bHidden alone was ignored by the
+                                 hardware renderer; location writes are
+                                 not). The "hop" after casting was
+                                 finally captured in a log: the pose
+                                 exit drops her through a tiny falling
+                                 dip - the mod now detects that dip and
+                                 settles her instantly, plus re-asserts
+                                 the pose exit once more as insurance
+                                 against the stuck-pose regressions.
+                                 Gamepads: if a virtual joystick steals
+                                 ID 0, the mod now scans all joystick
+                                 IDs and locks onto whichever one shows
+                                 real input (wiggle a stick or press a
+                                 button and it takes over).
+                                 v27: the v26 "hop" and "hang insurance"
+                                 guards are OFF by default - your v26
+                                 log showed the full chain + those extra
+                                 safety exits still hung the pose, while
+                                 v23's identical single-pass chain
+                                 exited. Default behavior is now exactly
+                                 v23's cast cleanup. If the pose sticks
+                                 again even with these defaults, open
+                                 hp3mod.ini and flip ONE of the
+                                 isolation knobs at a time (BodyClear=0
+                                 first, then PanePark=0) and tell me
+                                 which one fixes it - that pinpoints the
+                                 guilty subsystem in one round trip.
+                                 v28: the hop is pinned - it is the pose
+                                 SNAP when the state exit cuts the cast
+                                 pose (your report: moving CleanupDelay
+                                 moves the hop in time; no exit = stuck).
+                                 The cleanup chain is now SPLIT: the
+                                 blend-out starts first, and the state
+                                 exit lands 250ms later on an already-
+                                 faded pose. Same five calls as the
+                                 chain that always worked - just phased.
+                                 If ANY hop remains, try CleanupSplit=450;
+                                 if the pose ever sticks, CleanupSplit=0
+                                 restores v27's proven single pass.
+                                 v29: the stuck pose had a second cause,
+                                 and your log caught it - casting again
+                                 QUICKLY canceled the cleanup chain
+                                 entirely (it fired once in five casts;
+                                 the chain waited for a pause that rapid
+                                 casting never gives). The chain now
+                                 fires on schedule even while you are
+                                 already aiming the next cast, and a
+                                 rescue pass completes anything left
+                                 over at +3s. Cast as fast as you like.
+                                 v30: the split-chain experiment is
+                                 REVERTED - on your hardware it produced
+                                 TWO hops (one when the blend starts, one
+                                 at the exit) and the pose could still
+                                 stick. Default is again the single-pass
+                                 chain that always exited before (v23/
+                                 v27): one hop, pose exits, rapid casts
+                                 safe. If we attack the hop again it will
+                                 be with the game's own script data, not
+                                 more timing tricks.
+                                 v31: MEASUREMENT build for the hop.
+                                 Tap E, then within 8 seconds: cast once
+                                 with PLAYER 1 (your own mouse cast -
+                                 the game's natural cast that never
+                                 hops), and once with PLAYER 2 (Y key).
+                                 The log records the exact sequence of
+                                 script events the engine fires on each
+                                 pawn - the diff shows what the engine
+                                 does after ITS cast that we do not do
+                                 after ours. The fix lands in the next
+                                 build from that data. (The capture
+                                 hot-patches one engine function for 8
+                                 seconds and removes itself after; if
+                                 anything ever misbehaves right after
+                                 tapping E, just do not use E and tell
+                                 me.)
+                                 v32: the E-key capture paid off - the
+                                 stuck cast state re-picks the cast
+                                 animation EVERY FRAME after release.
+                                 New default: at +1.2s the mod sends
+                                 the state its end-signals (blend-out +
+                                 stop-casting) and gives it 1.6s to end
+                                 ITSELF - an exit by the engine's own
+                                 state machine has NO hop by
+                                 construction. The old proven exit
+                                 still fires at +2.8s, but only as a
+                                 safety net - a no-op if the state
+                                 already left on its own. If a hop
+                                 still appears it will come LATE (~2.8s
+                                 mark): that means the state refused to
+                                 self-exit - tap E while casting and
+                                 send the log so the next build can see
+                                 which condition it was waiting for.
+                                 CleanupSplit=0 restores the old
+                                 immediate exit at any time.
+                                 v33: the v32 experiment is withdrawn -
+                                 on your hardware the cast state simply
+                                 refuses to end itself, so waiting only
+                                 held the pose longer and added a second
+                                 small hop. Default is back to the best
+                                 proven behavior (immediate exit, one
+                                 hop). NEW DIAGNOSTIC - THE PROPERTY
+                                 DIFF: cast with player 2, wait ~2s so
+                                 she is IN the cast pose, then tap O.
+                                 The log then prints every
+                                 casting-class property whose value
+                                 differs between her and player 1 -
+                                 the state's wait-flag will be in that
+                                 list, and the next build sets it right
+                                 after the cast so the state exits
+                                 ITSELF (no hop by construction).
+                                 v34: your log showed something new -
+                                 the exit chain RAN but the cast state
+                                 simply stayed put (same chain that
+                                 worked on other boots - the exit lands
+                                 on different animation phases). The mod
+                                 now READS the pawn's current state and
+                                 RETRIES the exit until the cast state
+                                 is verifiably gone (up to 3 retries) -
+                                 the log line [castverify] shows exactly
+                                 what happened. The shaking you saw is
+                                 that stuck state vibrating her
+                                 animation 60 times a second - if v34
+                                 keeps the state gone, the shaking goes
+                                 with it.
+                                 GAMEPAD: your log shows Windows itself
+                                 did not see the controller on that
+                                 boot - no XInput pads, and the
+                                 joystick list contained only the dead
+                                 generic stick at ID 0 (the mod lists
+                                 every joystick it can see at startup;
+                                 yours showed just the one). Connect
+                                 the pad BEFORE launching the game, and
+                                 check joy.cpl (Windows "Set up USB game
+                                 controllers"): if the real pad is not
+                                 listed there, reconnect it / restart
+                                 its driver app - once Windows lists
+                                 it, the mod will lock onto it (wiggle
+                                 once).
+                                 v35: THE HOP IS DECODED - your log
+                                 shows it in raw numbers every cast:
+                                 frozen in the cast pose at Z=874.8,
+                                 the moment the pose ends she FALLS to
+                                 873.8 in one frame, then the floor
+                                 snaps her back up to 874.5. That
+                                 dip-and-bounce IS the hop (the cast
+                                 pose holds her about one unit above
+                                 standing height; physics is frozen, so
+                                 it cashes in as a micro-fall the
+                                 instant the pose ends). The mod now
+                                 remembers her last healthy standing
+                                 height and quietly puts her back on it
+                                 BEFORE ending the pose - the floor is
+                                 already under her feet, so there is
+                                 nothing to fall. Watch the [settle]
+                                 lines in hp3mod.log.
+                                 v36: found why v35 never fired on
+                                 your machine: the height fix kept
+                                 only ONE standing sample, and yours
+                                 went stale the moment you walked
+                                 stairs or ramps (the log had ZERO
+                                 settle lines - the fix silently
+                                 skipped every time). It now keeps the
+                                 last EIGHT standing samples and uses
+                                 the one nearest where you cast, and
+                                 logs exactly what it did ([settle]
+                                 lines). ALSO: every cast now records
+                                 a timestamped animation/state timeline
+                                 automatically - if any hop survives
+                                 the fixed settle, the log will show
+                                 the precise frame it comes from.
+                                 v37: the timelines caught the whole
+                                 causal chain - your exit micro-fall
+                                 makes the engine play an actual
+                                 LANDING ANIMATION (the log shows
+                                 PlayLandingAnimation firing 15
+                                 milliseconds after the fall). That
+                                 landing animation IS the hop. The
+                                 fix now records the TRUE rest height
+                                 the engine settles at after each cast
+                                 (the standing height reads about a
+                                 quarter unit higher than where
+                                 physics actually parks her - enough
+                                 to fall, penetrate the soft floor and
+                                 bounce). Every cast after the first
+                                 at any spot settles to that exact
+                                 height: no fall, no landing anim, no
+                                 hop. (The first cast somewhere new
+                                 may still show a faint blip - it is
+                                 the calibration cast.)
+                                 v38: THE HOP IS FIXED at the source.
+                                 Engine-level timelines proved the visible
+                                 hop was never physics: the moment the
+                                 mod ends the cast state, the engine
+                                 forces a Falling entry and plays an
+                                 actual falling animation plus a burst of
+                                 four landing animations in 31
+                                 milliseconds - that storm IS the hop.
+                                 v38 intercepts exactly those two
+                                 animation calls for the casting player
+                                 for 1.5 seconds after the cast ends and
+                                 swallows them (hp3mod.log shows a
+                                 [hopkill] line per swallowed call). The
+                                 character now walks out of the cast pose
+                                 instead of bouncing. Side effect, rare
+                                 and cosmetic: a real jump within 1.5s of
+                                 a cast has no falling/landing animation.
+                                 v39: the residual twitch is gone too.
+                                 Your v38 hardware log proved the storm
+                                 was swallowed on all five casts - what
+                                 remained visible was the pose SNAP: the
+                                 mod still ended the cast 550
+                                 milliseconds AFTER the game's own cast
+                                 animation had naturally ended (the
+                                 engine reports that end and the casting
+                                 state ignores it). v39 ends the cast
+                                 right after that natural animation end
+                                 instead of at a fixed delay, so the exit
+                                 lands on a finished pose - nothing left
+                                 to snap. Also new: the mod now watches
+                                 the casting state's own Tick event, so a
+                                 state that genuinely failed to exit is
+                                 detected directly (no more physics
+                                 guessing) and re-exited twice before
+                                 standing down, and a NEW cast started
+                                 quickly after the previous one is never
+                                 ripped out by a late cleanup - that was
+                                 the intermittent stuck pose. Log lines
+                                 to look for: [castverify] ... state
+                                 LEFT ok (StateCasting.Tick stopped).
+                                 v40: the leftover pose twitch after a
+                                 cast is fixed. With the hop gone, a
+                                 brief weird stance / wrong facing /
+                                 shake on player 2 remained after each
+                                 cast - the character mesh was settling
+                                 out of the early cast exit mid-blend
+                                 and nothing re-picked its animation
+                                 cleanly (the mod stopped re-picking
+                                 animations back in v23 because DURING
+                                 the exit that churn caused the hop).
+                                 v40 re-picks the animation ONCE per
+                                 cast, after the landing blend has
+                                 fully finished and only while the
+                                 character is standing still - the same
+                                 safe call used on jump landings since
+                                 v12. New tuning key CastExitAdj= in
+                                 hp3mod.ini ([actions] section, default
+                                 90) moves the cast-end moment if your
+                                 setup ever needs it - see the ini
+                                 comments. As always: if anything looks
+                                 off, send hp3mod.log; the [settlealign]
+                                 line shows the re-pick firing.
+                                 v41: the wrong facing after a cast is
+                                 found and blocked. The log caught the
+                                 engine itself swinging the character
+                                 ~85 degrees off the camera right after
+                                 the cast ended (the companion AI's
+                                 face-rotation reacting to the cast
+                                 state exit) - at low frame rates that
+                                 pull is visible as a wrong facing and
+                                 shakes while the mod pulls it back.
+                                 The mod now holds the character's
+                                 desired-facing on the camera direction
+                                 for ~2 seconds after each cast while
+                                 you stand still (the same technique
+                                 jumps use), so nothing can swing it
+                                 ([yawpin] lines in the log). A new
+                                 [yawwatch] diagnostic logs the exact
+                                 facing every 120ms through that window.
+                                 v42: the stuck-after-cast is found and
+                                 fixed. Your log caught the mod's own
+                                 old anti-quiver watchdog misreading a
+                                 normal JUMP (within a couple of
+                                 seconds after a cast) as a stuck pose,
+                                 and force-ending states mid-air - the
+                                 character then landed in a broken
+                                 physics mode where the controls went
+                                 dead. Two fixes: the watchdog now
+                                 ignores everything for 1.2s after any
+                                 airtime (it can no longer fire during
+                                 or right after a jump), and if the
+                                 game ever puts player 2 into that
+                                 dead-input physics mode anyway, the
+                                 mod now detects it and restores
+                                 walking automatically ([physfix] in
+                                 the log).
+                                 v43: the leftover wrong-facing and
+                                 the rare persistent cast pose are
+                                 explained and beaten. Your v42 log
+                                 showed the game silently putting
+                                 player 2 into a "held" physics mode
+                                 (projectile) over and over after
+                                 each cast - the previous build
+                                 restored walking each time (so you
+                                 could move) but the game kept re-
+                                 holding it between fixes, and the
+                                 held frames froze the animation
+                                 system (the pose stuck) and let the
+                                 facing drift (the wrong yaw). The
+                                 mod now holds walking preemptively
+                                 for 2.5 seconds from the first
+                                 re-hold, re-asserting it many times
+                                 per rendered frame, so the game's
+                                 hold never reaches the screen; when
+                                 the hold window ends clean, the
+                                 animation system is re-synced once
+                                 ([physrealign] in the log). The log
+                                 also records what the character was
+                                 standing on at each hold start.
+                                 v44: the last two quirks are closed.
+                                 The single returning hop was traced
+                                 to casts at spots where the mod had
+                                 no recent floor sample within its
+                                 (old) 150-unit radius - the exit dip
+                                 went undamped; the radius is now
+                                 350 units with the same strict
+                                 height-difference guard, so those
+                                 exits settle like the rest. The
+                                 standing wrong yaw turned out to be
+                                 the companion AI turning the
+                                 character a little every single
+                                 tick whenever nothing was actively
+                                 pinning her; while you stand still
+                                 the mod now locks her desired
+                                 facing onto your camera direction
+                                 every frame (the same proven
+                                 mechanism jumps and the post-cast
+                                 pin use), releasing instantly when
+                                 you move or jump ([yawhold] lines
+                                 in the log).
+                                 v45 (shipped, then pulled): the
+                                 re-pick was gated on a per-cast
+                                 clock - on real hardware rapid
+                                 re-casts re-armed that clock
+                                 against the NEXT cast and the
+                                 re-pick started interrupting
+                                 fresh casts (the stuck poses and
+                                 cut-off casts you reported).
+                                 v47: that gating is gone and the
+                                 whole re-sync is rebuilt event-
+                                 driven. The mod now watches for
+                                 the cast state's own exit event
+                                 and only then arms ONE pending
+                                 re-sync, which runs a moment
+                                 later - and only if at that
+                                 exact moment you are standing
+                                 still, no new cast has begun or
+                                 fired since the exit, the aim
+                                 glow is gone and the cast state
+                                 is quiet. Any newer cast simply
+                                 takes over and gets its own re-
+                                 sync at its own exit, so the
+                                 re-sync can no longer interrupt
+                                 a cast regardless of how fast
+                                 you chain them. Walk-away casts
+                                 still re-sync once you stop
+                                 (window up to 6 seconds). The
+                                 floor sample radius stays at the
+                                 v45 size (450 units). Trade-off:
+                                 clean casts can show the tiny
+                                 idle-restart stutter again (the
+                                 v44 baseline) - cast playback
+                                 correctness outranks it.
+                                 DIAGNOSTIC (helps the next build): hold
+                                 PLAYER 1's own aim (mouse) so the
+                                 game's real marker is on screen, then
+                                 tap D - hp3mod.log records exactly which
+                                 actor renders player 1's marker. Send
+                                 the log after doing this once.
+                                 After casting the mod exits the cast
+                                 state and leaves the animation to the
+                                 engine (v22 hw proved skipping the exit
+                                 hangs the pose; the v21 anim re-picks
+                                 caused the hop).
+                                 The rest camera sits further back and
+                                 lower than v14 (v15).
+             X / DualSense Square use
+             v12: DualSenseX is found wherever it sits - all four XInput
+             slots are scanned (v11 only ever looked at slot 0, which is why
+             DualSenseX appeared dead). Native DualSense is recognized by its
+             capabilities (13+ buttons, 6+ axes), not just by device name.
+             hp3mod.log now prints RAW pad axes every 2s, so any mapping
+             that is still wrong can be fixed from the log alone.
+
+   Set StrafeMode=1 in hp3mod.ini if you want left/right to strafe instead.
+
+  Player 1   the game's normal controls, leftmost strip.
+  Player 3   I / K / J / L move, U jump, O cast, P use.
+
+  Every one of these keys can be reassigned in hp3mod.ini - see the
+  [player2] / [player3] sections. Values are decimal virtual-key codes.
+
+  Set Players= in hp3mod.ini for 3 or more strips.
+
+
+WHAT IS VERIFIED
+  - 2- and 3-way vertical split at 1280x720.
+  - Each view bound to a different character (Harry / Hermione / Ron).
+  - Player 2 walks, runs into walls correctly (collision and gravity intact),
+    climbs stairs, and jumps with a real ballistic arc.
+  - Player 2 casts a real spell: the spell actor is spawned by the game's own
+    script, launched as a projectile, and is NOT killed after the animation.
+  - Player 2 use/interact dispatches through the pawn's script.
+  - Trailing camera slides in against walls instead of clipping through them.
+  - Each strip uses an unsqueezed FOV (vertical field matches full-screen).
+  - Verified on HP3_InsideHub, HP3_GroundsHub, HP3_DungeonHUB and
+    HP3_Adv1Express.
+
+
+KNOWN LIMITATIONS (this is a prototype)
+  - The HUD is drawn once, for player 1's strip only.
+  - The scene is rendered N+1 times per frame, so the cost scales with N.
+  - Player 2 has no aiming cursor; casts auto-target the best candidate in
+    front of the caster, then fire on release like player 1.
+  - Player 2 has no menu/inventory access.
+  - Save games are single-player and unchanged.
+  - Companion AI is released by dropping TrailingChar / LeadChar and
+    expanding TrailCharFollowRadius. UnPossess is NOT used (it broke walking).
+  - If Hermione/Ron still shakes while idle, send hp3mod.log and look for
+    phys= and dLead= in the [t+...] telemetry.
+
+
+TROUBLESHOOTING
+  The split flashes on and immediately turns off again
+      1. Set StartOn=1 in hp3mod.ini - this bypasses the toggle entirely.
+      2. Check hp3mod.log line 2 says "build v45".
+      3. Send me hp3mod.log.
+
+  Player 2's keys also move Harry
+      The mod subclasses the game window and removes player 2's keys from
+      the message queue. If hp3mod.log does not contain "SUBCLASSED window",
+      the hook did not install.
+
+  The view looks squeezed / characters look skinny
+      The mod sets the viewport size to the strip and preserves vertical FOV.
+      If it still looks wrong, try FovScale=120 in hp3mod.ini (a bit wider)
+      or FovMode=0 (raw engine FOV). Send a screenshot either way.
+
+  A spell effect sticks to player 2 / the spell dies instantly
+      Cast is hold-to-aim, release-to-fire, the projectile is not reaped.
+      matching player 1. hp3mod.log should show "[spell] p1 actor flew N units".
+
+  Nothing happens / no split
+      Check that hp3mod.log appears in system\ after launching. If it does
+      not, d3d8.dll is not being loaded - confirm it sits next to hppoa.exe.
+  The game will not start
+      Delete d3d8.dll to confirm the mod is the cause, then send hp3mod.log.
+  Set [debug] Log=0 in hp3mod.ini once everything works.

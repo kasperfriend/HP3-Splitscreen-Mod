@@ -1,0 +1,8 @@
+LIBRARY d3d8.dll
+EXPORTS
+    ; Undecorated alias for the __declspec(dllexport) stdcall symbol
+    ; (Direct3DCreate8@4). hppoa.exe / D3DDrv.dll import "Direct3DCreate8"
+    ; exactly - without this entry the export goes out decorated and the
+    ; loader cannot resolve it (seen as Wine's "unimplemented function
+    ; d3d8.dll.Direct3DCreate8" fallback).
+    Direct3DCreate8
