@@ -55,7 +55,7 @@ A preconfigured workflow (`.github/workflows/build-release.yml`) builds the same
 3. Click **Run workflow**.
 4. Optionally enter a release **tag** and **title**, then run the job. Leave the tag blank to auto-generate a unique one (for example `v47-20260906-1234567890`).
 
-The workflow compiles the DLL with the same toolchain as `build.sh`, attaches both the `.zip` and the individual `d3d8.dll` / `hp3mod.ini`, and also uploads them as run artifacts.
+The workflow compiles the DLL natively on a Windows runner using MSYS2's 32-bit MinGW-w64 toolchain (`mingw-w64-i686-gcc`), attaches both the `.zip` and the individual `d3d8.dll` / `hp3mod.ini`, and also uploads them as run artifacts.
 
 ## Repository layout
 

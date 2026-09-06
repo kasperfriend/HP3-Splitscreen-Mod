@@ -19,24 +19,33 @@ permissions:
 
 jobs:
   build:
-    name: Build release DLL + INI
-    runs-on: ubuntu-latest
+    name: Build release DLL + INI (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install 32-bit MinGW-w64 toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-mingw-w64-i686 zip
+      - name: Set up MSYS2 and 32-bit MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            git
+            mingw-w64-i686-gcc
+            zip
 
       - name: Build d3d8.dll
+        env:
+          CXX: g++
         run: |
-          chmod +x build.sh
-          ./build.sh
+          sed -i 's/\r$//' build.sh
+          bash build.sh
 
       - name: Assemble release package
-        shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
           REQUESTED_TITLE: ${{ inputs.title }}
