@@ -40,7 +40,7 @@ static int g_numPlayers = 2;
 static float g_camDist = 125.0f, g_camHeight = 50.0f;
 static int   g_camPitch = -1400;
 static BOOL  g_camCollide = TRUE;
-static BOOL  g_aimedCast  = TRUE;
+static BOOL  g_aimedCast  = FALSE;
 static int   g_glowSize   = 36;       // v24: -40% (was 60) by user request -
 static BOOL  g_aimSup[8];             // v24 body-clearance: glow hidden this frame
                                       // the sparkle's original (hardware:
@@ -140,10 +140,10 @@ static int iniKey(const char *sect, const char *key, int def, const char *ini)
 
 
 static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0; }
-static BOOL g_splitOn = FALSE;   // runtime toggle (F9 / split_on file)
+static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v11"
+#define MOD_BUILD  "v47"
 #define MOD_STAMP   "build v47 - 2026-09-02 - EVENT-DRIVEN REALIGN: the v46 Wine runs caught the polling re-pick STILL straddling casts (a skipped chain + pending overwrites left stale per-cast state; one realign fired during the next cast's aim). v47 rebuilds it event-driven: the detour sees the state's own StateCasting.EndState (the actual exit) and only ARMS a need; driveePawn executes it next frames - and only while every guard holds AT EXECUTION TIME: standing + 300ms stand-still, no aim glow (aims do not tick StateCasting), casting state quiet, same-cast binding (no newer fire), no post-exit BeginState, 1.2s..6s after the exit. No per-cast clocks anywhere in the path"
 
 static FILE *g_log = NULL;
@@ -2526,9 +2526,6 @@ static BOOL aimGlowAlive(int i)
 {
     return i >= 0 && i < 8 && g_aimFX[i] != NULL;
 }
-static DWORD g_aimFXAtDummy[1];       // (real g_aimFXAt defined above the
-                                      // castwatch loop for the v29 race fix)
-static float g_aimLastDummy[1];
 
 static BOOL destroyAimFX(int i)
 {
@@ -5598,7 +5595,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             g_log = fopen("hp3mod.log", "w");
         logf_("===========================================================");
         logf_("=== hp3mod %s", MOD_STAMP);
-        logf_("=== if this does not say 'v46' you are running an OLD d3d8.dll");
+        logf_("=== if this does not say %s you are running an OLD d3d8.dll", MOD_BUILD);
         logf_("===========================================================");
 
         int n = GetPrivateProfileIntA("split", "Players", 0, ini);
