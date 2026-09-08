@@ -14,6 +14,33 @@ WHAT IT DOES
   engine's own DrawPortal once per player.
 
 
+V52 NATIVE AIMING (HARDWARE TESTING PENDING)
+  [actions] NativeAim=1 is now the default, including existing INIs.
+  Seeking uses HP3's original SpellCursorEmitter. Hovering a castable
+  object uses SpellGesture: both particle textures come from the chosen
+  spell's SpellIcon, and the game's function sizes the aura to the target.
+  P1's own cursor is never borrowed or modified.
+
+  Keeps the working v51 projectile/hit handlers and cast recovery. Native
+  aiming uses the original 770-unit camera-relative range (v51 used 3200)
+  and active-map targets, with v51's forgiving target corridor retained.
+  It is not a complete reimplementation of the original player controller.
+
+  NativeAim=0 restores the old sprite/range policy for an A/B comparison.
+  GlowStyle=6 and GlowSize=36 now control only the legacy/fallback marker.
+  GlowStyle=0 no longer borrows P1; it also falls back to the sprite.
+  Native initialization failures fall back until the next hold.
+
+  Cross-build and host tests pass; actual native particle visibility and
+  per-pane isolation still require testing in HP3 on Windows/D3D8 hardware.
+  Look for [nativeaim] bindings OK, p2 SEEK, and p2 LOCK with a spell Texture
+  name and privateParticles=2. Test P1 and P2 aiming together, the Spongify
+  pad and Depulso triggers, releases, F10, character changes and map travel.
+  Historical controls/changelog notes below describe the older glow builds;
+  this section supersedes their rendering defaults. Full research, known
+  differences, and acceptance checklist are in docs/NATIVE_AIM.md.
+
+
 INSTALLING
   1. Copy  d3d8.dll  and  hp3mod.ini  into the game's  system\  folder,
      next to hppoa.exe.
@@ -30,7 +57,7 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v51 ...
+          === hp3mod build v52 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
       d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave

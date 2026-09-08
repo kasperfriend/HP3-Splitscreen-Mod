@@ -4,3 +4,7 @@ dist/
 # Release staging and archives produced by .github/workflows/build-release.yml
 release/
 HP3-Splitscreen-*.zip
+
+# Local Python research/test bytecode
+__pycache__/
+*.pyc

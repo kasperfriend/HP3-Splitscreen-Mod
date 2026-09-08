@@ -35,6 +35,7 @@
 #include <mmsystem.h>
 #include <stdlib.h>
 #include "cast_ground.h"
+#include "aim_policy.h"
 
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
@@ -43,6 +44,7 @@ static float g_camDist = 125.0f, g_camHeight = 50.0f;
 static int   g_camPitch = -1400;
 static BOOL  g_camCollide = TRUE;
 static BOOL  g_aimedCast  = FALSE;
+static BOOL  g_nativeAim = TRUE;      // v52: original HP3 emitter + SpellGesture
 static BOOL  g_castGameplay = TRUE;   // v50: make P2+ casts activate spell/gameplay targets, not only animate
 static int   g_glowSize   = 36;       // v24: -40% (was 60) by user request -
 static BOOL  g_aimSup[8];             // v24 body-clearance: glow hidden this frame
@@ -52,7 +54,7 @@ static int   g_glowStyle  = 6;        // v23: 6=sprite additive (default -
                                       // the only variant PROVEN visible on
                                       // the user's hardware; v22's borrowed
                                       // SpellCursor rendered in Wine only),
-                                      // 0=borrow game cursor (hw-invisible),
+                                      // 0=legacy sprite fallback (never borrow P1),
                                       // 8=v20 factory particle (hw-invisible)
 static BOOL  g_cleanupLight = FALSE;  // v21: light pose-cleanup chain (hop
 static int   g_cleanupChain = 0;      // v25 hop bisect: 0=full(v23 chain, hw
@@ -131,8 +133,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v51"
-#define MOD_STAMP   "build v51 - 2026-09-08 - CAST GAMEPLAY, PLAYER-1 FAITHFUL: player 2+ casts now follow the original cast path. Castable objects are found by their own vulnerableTo/targeting properties and spell handlers (statues, jump pads, doors - not just actors named SpellTrigger), the spell class is chosen FROM the target like the wand does, the projectile keeps the target (homing) and flies at it, and when it arrives the game's own spell ProcessTouch / trigger Touch runs the object's handler (the wand's autohit path). [castgame-scan], [castgame], [castgame-fn] and [pelog] spell/handler events show every step in hp3mod.log."
+#define MOD_BUILD  "v52"
+#define MOD_STAMP "build v52 - 2026-09-08 - NATIVE HP3 AIM: original seeking particles + target-sized SpellGesture using the chosen spell default.SpellIcon; original 770-unit range, per-player effects, active-level lookup. [nativeaim] reports bindings, particles, icon and lock transitions. Gameplay hit/exit path retained from v51."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -522,7 +524,21 @@ static const char *kCharClass[8] = {
 static void *g_pawn[8]     = {0};
 static char  g_pawnName[8][96];
 
-// Linear scan of the global object table for the first actor of a class.
+static void *g_camActor = NULL;
+static BOOL cgDeleted(void *o);
+// Only actors in the camera's current map qualify. Old HP_preamble actors
+// can remain in GObjObjects after travel without bDeleteMe set.
+static BOOL actorInCurrentLevel(void *o) {
+    if (!o || !g_camActor || IsBadReadPtr(o, 0x2C) || IsBadReadPtr(g_camActor, 0x2C)) return FALSE;
+    char a[256], c[256]; objName(o,a,sizeof(a)); objName(g_camActor,c,sizeof(c));
+    return hp3aim::samePackage(a,c);
+}
+static float g_aimViewLoc[8][3];
+static int g_aimViewRot[8][3];
+static BOOL g_aimViewValid[8] = {0};
+static float nativeAimRange(void);
+
+// Linear scan for a current-level actor, never a stale preamble instance.
 static void *findActorByClass(const char *cls)
 {
     if (!g_objArray || IsBadReadPtr(g_objArray, sizeof(TArrayLite))) return NULL;
@@ -534,7 +550,7 @@ static void *findActorByClass(const char *cls)
         void *o = g_objArray->Data[i];
         if (!o) continue;
         objName(o, buf, sizeof(buf));
-        if (!strncmp(buf, cls, L) && buf[L] == ' ') return o;
+        if (!strncmp(buf, cls, L) && buf[L] == ' ' && actorInCurrentLevel(o) && !cgDeleted(o)) return o;
     }
     return NULL;
 }
@@ -543,7 +559,12 @@ static void *findActorByClass(const char *cls)
 static void *getPawn(int i)
 {
     if (i < 0 || i > 7) return NULL;
-    if (g_pawn[i]) return g_pawn[i];
+    if (g_pawn[i] && actorInCurrentLevel(g_pawn[i]) && !cgDeleted(g_pawn[i])) {
+        char name[160]; objName(g_pawn[i],name,sizeof(name));
+        size_t len=strlen(kCharClass[i]);
+        if(!strncmp(name,kCharClass[i],len) && name[len]==' ') return g_pawn[i];
+    }
+    g_pawn[i] = NULL;
     void *o = findActorByClass(kCharClass[i]);
     if (o) {
         g_pawn[i] = o;
@@ -1090,6 +1111,25 @@ static BOOL setBoolProp(void *obj, int offset, DWORD mask, BOOL val)
     return TRUE;
 }
 
+// Exact mask for v52 native FX: let the game's bool-property implementation
+// copy all-one source bits into a zero scratch word. This yields BitMask
+// without guessing among UProperty's link pointers/net indices. The supplied
+// Core.dll CopySingleValue implementation only reads the property and touches
+// these two local words; no actor/default object is mutated.
+static DWORD nativeBoolBitMask(const char *path)
+{
+    typedef void (__fastcall *CopyBool)(void *,void *,void *,void *,void *);
+    static CopyBool copy=NULL;
+    if(!copy && g_core) copy=(CopyBool)GetProcAddress(g_core,
+        "?CopySingleValue@UBoolProperty@@UBEXPAX0PAVUObject@@@Z");
+    void *p=findObjectByPath(path); char name[240];
+    if(!copy || !p || IsBadReadPtr(p,0x2C) ||
+       strncmp(objName(p,name,sizeof(name)),"BoolProperty ",13)) return 0;
+    DWORD dest=0,source=~(DWORD)0;
+    copy(p,NULL,&dest,&source,NULL);
+    return dest && !(dest & (dest-1)) ? dest : 0;
+}
+
 static DWORD boolBitMask(const char *path)
 {
     void *p = findObjectByPath(path);
@@ -1108,6 +1148,17 @@ static DWORD boolBitMask(const char *path)
 // failure mode of a cursor emitter whose defaults carry no particles.
 static void dumpActorVisuals(void *a, const char *tag)
 {
+    if (g_propOffsetField < 0) return; // don't cache failed pre-calibration lookups
+    char actorName[240];
+    if (!a || IsBadReadPtr(a,0x2C)) return;
+    objName(a,actorName,sizeof(actorName));
+    if (!strncmp(actorName,"SpriteEmitter ",14) || !strncmp(actorName,"ParticleEmitter ",16) ||
+        !strncmp(actorName,"MeshEmitter ",12)) {
+        logf_("    %s: particle UObject (not an Actor)",actorName); return;
+    }
+    BOOL isEmitterActor=!strncmp(actorName,"SpellCursorEmitter ",19) ||
+        !strncmp(actorName,"SpellGesture ",13) || !strncmp(actorName,"Emitter ",8) ||
+        !strncmp(actorName,"SpellFlyEmitter ",16);
     static int offHidden = -2, offDrawType = -2, offTexture = -2,
                offScale = -2, offEmitters = -2, offStyle = -2,
                offUnlit = -2, offLoc = -2;
@@ -1132,7 +1183,7 @@ static void dumpActorVisuals(void *a, const char *tag)
         logf_("      bHidden=%d",
               (*(DWORD *)((BYTE *)a + (offHidden & ~3)) & maskHidden) != 0);
     if (offStyle > 0 && !IsBadReadPtr(a, offStyle + 4))
-        logf_("      Style=%d", *(int *)((BYTE *)a + offStyle));
+        logf_("      Style=%u", (unsigned)*(BYTE *)((BYTE *)a + offStyle));
     if (offUnlit > 0 && maskUnlit && !IsBadReadPtr(a, offUnlit + 4))
         logf_("      bUnlit=%d",
               (*(DWORD *)((BYTE *)a + (offUnlit & ~3)) & maskUnlit) != 0);
@@ -1141,7 +1192,7 @@ static void dumpActorVisuals(void *a, const char *tag)
         logf_("      Location=(%.0f %.0f %.0f)", al[0], al[1], al[2]);
     }
     if (offDrawType > 0 && !IsBadReadPtr(a, offDrawType + 4))
-        logf_("      DrawType=%d", *(int *)((BYTE *)a + offDrawType));
+        logf_("      DrawType=%u", (unsigned)*(BYTE *)((BYTE *)a + offDrawType));
     if (offTexture > 0 && !IsBadReadPtr(a, offTexture + 4)) {
         void *tex = *(void **)((BYTE *)a + offTexture);
         logf_("      Texture=%s", tex ? objName(tex, b, sizeof(b)) : "(none)");
@@ -1149,14 +1200,13 @@ static void dumpActorVisuals(void *a, const char *tag)
     if (offScale > 0 && !IsBadReadPtr(a, offScale + 4))
         logf_("      DrawScale=%.2f", *(float *)((BYTE *)a + offScale));
     static int offCursorParts = -2, offParticleType = -2,
-               offCtrlCursor = -2, offCtrlKCursor = -2;
+               offCtrlCursor = -2;
     if (offCursorParts == -2) {
         offCursorParts   = propOffset("hgame.SpellCursor.CursorParticles");
         offParticleType  = propOffset("hgame.SpellCursor.particleType");
         offCtrlCursor    = propOffset("KWGame.KWHeroController.Cursor");
-        offCtrlKCursor   = propOffset("KWGame.KWHeroController.KCursor");
     }
-    if (offEmitters > 0 && !IsBadReadPtr(a, offEmitters + 12)) {
+    if (isEmitterActor && offEmitters > 0 && !IsBadReadPtr(a, offEmitters + 12)) {
         void **data = *(void ***)((BYTE *)a + offEmitters);
         int num = *(int *)((BYTE *)a + offEmitters + 4);
         int max = *(int *)((BYTE *)a + offEmitters + 8);
@@ -1169,16 +1219,16 @@ static void dumpActorVisuals(void *a, const char *tag)
                 if (data && !IsBadReadPtr(data, 4 * (e + 1)) && data[e])
                     logf_("        [%d] %s", e, objName(data[e], b, sizeof(b)));
         } else {
-            logf_("      Emitters: (not an Emitter: Num=%d Max=%d)", num, max);
+            logf_("      Emitters: empty or invalid (Num=%d Max=%d)", num, max);
         }
     }
     // SpellCursor-family fields - only meaningful on SpellCursor actors
     // (class token is objName's first word), so gate on it.
     {
-        const char *spc = strchr(b, ' ');
-        size_t clt = spc ? (size_t)(spc - b) : 0;
-        BOOL isSpellCursor = (clt == 11 && !strncmp(b, "SpellCursor", 11));
-        BOOL isController  = (clt > 10 && strstr(b + clt - 10, "Controller") == b + clt - 10);
+        const char *spc = strchr(actorName, ' ');
+        size_t clt = spc ? (size_t)(spc - actorName) : 0;
+        BOOL isSpellCursor = (clt == 11 && !strncmp(actorName, "SpellCursor", 11));
+        BOOL isController  = (clt > 10 && !strncmp(actorName + clt - 10,"Controller",10));
         if (isSpellCursor && offCursorParts > 0 &&
             !IsBadReadPtr(a, offCursorParts + 4)) {
             void *cp = *(void **)((BYTE *)a + offCursorParts);
@@ -1226,6 +1276,7 @@ static void dumpCursorInstances(void)
             !(cl == 17 && !strncmp(buf, "KWHeroController", 17)) &&
             !(cl == 17 && !strncmp(buf, "HPHeroController", 17)) &&
             !(cl == 18 && !strncmp(buf, "HPPlayerController", 18))) continue;
+        if (!actorInCurrentLevel(o)) continue;
         dumpActorVisuals(o, buf);
         shown++;
     }
@@ -1426,7 +1477,7 @@ static struct {
     int  GroundSpeed, JumpZ, AccelRate;
     int  LifeSpan, Base, Floor;
     int  DesiredRotation, RotationRate;   // v12: pin during standing jump
-} F = { FALSE };
+} F = {};
 
 // Same, but with a caller-supplied parameter block (and it reports the block
 // back, so return values can be read out of it).
@@ -2061,7 +2112,7 @@ static void cgScanCandidates(void *self, BOOL force)
     char buf[300];
     for (int j = 0; j < n && g_cgNCand < CG_MAX_CAND; j++) {
         void *o = g_objArray->Data[j];
-        if (!o || o == self || IsBadReadPtr(o, 0x100) || cgIsPlayerPawn(o)) continue;
+        if (!o || o == self || IsBadReadPtr(o, 0x100) || cgIsPlayerPawn(o) || !actorInCurrentLevel(o)) continue;
         objName(o, buf, sizeof(buf));
         if (isReflection(buf)) continue;
         const char *sp = strchr(buf, ' ');
@@ -2167,7 +2218,7 @@ static BOOL cgCandAlive(CgCand *c)
     // Same slot, same class pointer = same object (slots are reused only
     // after GC, which also invalidates the class pointer we cached).
     if (c->info && cgClassOf(c->obj) != c->info->cls) return FALSE;
-    return !cgDeleted(c->obj);
+    return !cgDeleted(c->obj) && actorInCurrentLevel(c->obj);
 }
 
 // The target's aim point: Location + CentreOffset (the game's own targeting
@@ -2182,6 +2233,10 @@ static void cgAimPoint(CgCand *c, float out[3])
     if (c->info && c->info->centreOff > 0 && !IsBadReadPtr((BYTE *)c->obj + c->info->centreOff, 12)) {
         float *co = (float *)((BYTE *)c->obj + c->info->centreOff);
         if (fabsf(co[0]) < 500.0f && fabsf(co[1]) < 500.0f && fabsf(co[2]) < 500.0f) {
+            float rotated[3];
+            if (g_nativeAim && F.Rotation > 0 && !IsBadReadPtr((BYTE *)c->obj + F.Rotation,12)) {
+                hp3aim::rotate(co,(int *)((BYTE *)c->obj+F.Rotation),rotated); co=rotated;
+            }
             out[0] += co[0]; out[1] += co[1]; out[2] += co[2]; haveCentre = TRUE;
         }
     }
@@ -2219,11 +2274,36 @@ static CgCand *cgPickTarget(int i, void *pawn, float *outDist, BOOL verbose, flo
     float *pl = (float *)((BYTE *)pawn + F.Location);
     float org[3] = { pl[0] + dir[0] * 90.0f, pl[1] + dir[1] * 90.0f, pl[2] + dir[2] * 90.0f + 45.0f };
 
+    float maxT = 3200.0f;
+    if (g_nativeAim) {
+        maxT = nativeAimRange() - 90.0f;
+        if (i > 0 && i < 8 && g_aimViewValid[i]) {
+            memcpy(org,g_aimViewLoc[i],12);
+            hp3aim::direction(g_aimViewRot[i],dir);
+            maxT=hp3aim::rayLength(org,pl,dir,nativeAimRange());
+        }
+    }
     CgCand *best = NULL; float bestScore = 1.0e30f, bestT = 0, bestPerp = 0, bestAim[3] = {0,0,0};
     CgCand *nearest = NULL; float nearestD = 1.0e30f;
     for (int k = 0; k < g_cgNCand; k++) {
         CgCand *c = &g_cgCand[k];
         if (!cgCandAlive(c)) continue;
+        if (g_nativeAim) {
+            static int liveVuln = -1;
+            if (liveVuln < 0) liveVuln=propOffset("Engine.Actor.vulnerableToClass");
+            if (liveVuln < 0 || IsBadReadPtr((BYTE *)c->obj+liveVuln,4)) continue;
+            void *v=*(void **)((BYTE *)c->obj+liveVuln);
+            if (!cgIsKnownClass(v) || cgGenericSpellClass(v)) continue;
+            c->spellCls=v;
+            static int projOff=-1, collideOff=-1;
+            static DWORD projMask=0,collideMask=0;
+            if(projOff<0) {projOff=propOffset("Engine.Actor.bProjTarget");projMask=nativeBoolBitMask("Engine.Actor.bProjTarget");}
+            if(collideOff<0) {collideOff=propOffset("Engine.Actor.bCollideActors");collideMask=nativeBoolBitMask("Engine.Actor.bCollideActors");}
+            if(projOff>0 && projMask && !IsBadReadPtr((BYTE *)c->obj+(projOff&~3),4) &&
+               !(*(DWORD *)((BYTE *)c->obj+(projOff&~3)) & projMask)) continue;
+            if(collideOff>0 && collideMask && !IsBadReadPtr((BYTE *)c->obj+(collideOff&~3),4) &&
+               !(*(DWORD *)((BYTE *)c->obj+(collideOff&~3)) & collideMask)) continue;
+        }
         float tl[3]; cgAimPoint(c, tl);
         float radius = cgHitRadius(c) + 90.0f;
         if (c->info && c->info->sizeOff > 0 && !IsBadReadPtr((BYTE *)c->obj + c->info->sizeOff, 4)) {
@@ -2235,7 +2315,7 @@ static CgCand *cgPickTarget(int i, void *pawn, float *outDist, BOOL verbose, flo
         float dist = sqrtf(vx * vx + vy * vy + vz * vz);
         if (dist < nearestD) { nearestD = dist; nearest = c; }
         float t = vx * dir[0] + vy * dir[1] + vz * dir[2];
-        if (t < 40.0f || t > 3200.0f) continue;
+        if (t < 40.0f || t > maxT) continue;
         float perp2 = dist * dist - t * t; if (perp2 < 0.0f) perp2 = 0.0f;
         float perp = sqrtf(perp2);
         if (perp > radius) continue;
@@ -2673,7 +2753,7 @@ static void cgWatchP1(void)
         p1 = findActorByClass("harry");
         if (p1) g_pawn[0] = p1;
     }
-    if (!p1 || IsBadReadPtr(p1, 0x200)) return;
+    if (!F.ok || !p1 || !actorInCurrentLevel(p1) || IsBadReadPtr(p1, 0x200)) return;
     if (p1 != sLastPawn) { sLastPawn = p1; sLastTarget = NULL; sLastSpell = NULL; }
     if (!g_cgReady && g_castGameplay && F.ok) cgBuildIndex();   // one pass per level
     if (g_offSpellTarget > 0 && !IsBadReadPtr((BYTE *)p1 + g_offSpellTarget, 4)) {
@@ -3376,37 +3456,16 @@ static void finishPendingCasts(void)
 static void *g_aimFX[8]   = {0};
 static float g_aimDSmooth[8] = { 0 };   // v20: aim-distance hysteresis per player
 
-// v22: the game's OWN cursor actor, borrowed for P2 while aiming. The level
-// ships a dormant SpellCursor0 (bHidden=1) whose particles are exactly the
-// original player's aim marker - same look, size and surface behavior by
-// construction, on the game's own render path (proven visible on the
-// user's hardware, unlike our bare v20 emitter). We unhide it, take
-// ownership, drive its Location to the aim point each frame, and hide it
-// again on release. Nothing is spawned or destroyed.
-static void *g_origCursor        = NULL;
-static BOOL  g_origCursorChecked = FALSE;
-static void *g_origCursorOwner   = NULL;
-static BOOL  g_origActive[8]     = { FALSE };
-
-static void *findOrigCursor(void)
-{
-    if (g_origCursorChecked) return g_origCursor;
-    g_origCursorChecked = TRUE;
-    if (!g_objArray) return NULL;
-    char nb[160];
-    for (int i = 0; i < g_objArray->Num; i++) {
-        void *o = g_objArray->Data[i];
-        if (!o || IsBadReadPtr(o, 0x100)) continue;
-        objName(o, nb, sizeof(nb));
-        if (strncmp(nb, "SpellCursor ", 12) != 0) continue;
-        if (strstr(nb, "Emitter")) continue;         // SpellCursorEmitter
-        if (!strstr(nb, ".SpellCursor")) continue;   // full path form
-        g_origCursor = o;
-        break;
+// P1 cursor is read-only. A hidden SpellCursor is a controller actor, not
+// dormant FX to borrow. Its owned SpellGesture/particles do the drawing.
+static void *g_origCursor = NULL;
+static void *findOrigCursor(void) {
+    if (g_origCursor && actorInCurrentLevel(g_origCursor) && !cgDeleted(g_origCursor)) {
+        char name[160]; objName(g_origCursor,name,sizeof(name));
+        if(!strncmp(name,"SpellCursor ",12)) return g_origCursor;
     }
-    logf_("  [aimfx] original SpellCursor actor: %p%s", g_origCursor,
-          g_origCursor ? " (will borrow for aiming)" :
-          " NOT FOUND - falling back to sprite glow");
+    g_origCursor=findActorByClass("SpellCursor");
+    if (g_origCursor && cgDeleted(g_origCursor)) g_origCursor=NULL;
     return g_origCursor;
 }
 
@@ -3419,7 +3478,8 @@ static void *findOrigCursor(void)
 static void diagDumpAimHunt(void)
 {
     logf_("[aimhunt] === live cursor/emitter actors (D pressed) ===");
-    if (!g_objArray) { logf_("[aimhunt] no object table"); return; }
+    if (!g_objArray || !F.ok || g_propOffsetField<0) { logf_("[aimhunt] waiting for calibrated live level"); return; }
+    cgBuildIndex();
     static int sOffOwner = -2;
     if (sOffOwner == -2) sOffOwner = propOffset("Engine.Actor.Owner");
     char b[300], b2[160];
@@ -3434,8 +3494,7 @@ static void diagDumpAimHunt(void)
         // "Texture ...", "Struct ...", "*Property ..." etc.)
         {
             static const char *pre[] = { "SpellCursor ", "SpellCursorEmitter ",
-                                         "SpellFlyEmitter ", "SpriteEmitter ",
-                                         "ParticleEmitter ", "Emitter ",
+                                         "SpellFlyEmitter ", "SpellGesture ", "Emitter ",
                                          "HCursor ", "KWCursor ",
                                          "SelectCursor ", NULL };
             int match = 0;
@@ -3452,6 +3511,7 @@ static void diagDumpAimHunt(void)
                          strncmp(path + 1, "Engine.", 7) == 0 ||
                          strncmp(path + 1, "HP_FX", 5) == 0)) continue;
         }
+        if (!actorInCurrentLevel(o) || cgDeleted(o)) continue;
         dumpActorVisuals(o, b);
         if (sOffOwner > 0 && !IsBadReadPtr((BYTE *)o + sOffOwner, 4)) {
             void *ow = *(void **)((BYTE *)o + sOffOwner);
@@ -3471,7 +3531,7 @@ static void diagDumpAimHunt(void)
     // must be in THIS list while his aim is on screen.
     {
         void *p1 = g_pawn[0];
-        if (!p1) p1 = findActorByClass("harry");
+        if (!p1 || !actorInCurrentLevel(p1)) p1 = findActorByClass("harry");
         float p1l[3] = { 0, 0, 0 };
         BOOL  haveP1 = (p1 && F.Location > 0 &&
                         !IsBadReadPtr(p1, F.Location + 12));
@@ -3492,10 +3552,15 @@ static void diagDumpAimHunt(void)
             sOffDel = propOffset("Engine.Actor.bDeleteMe");
             mDel    = boolBitMask("Engine.Actor.bDeleteMe");
         }
+        int drawType=propOffset("Engine.Actor.DrawType"), scale=propOffset("Engine.Actor.DrawScale"),
+            style=propOffset("Engine.Actor.Style");
+        if(drawType<=0 || scale<=0 || style<=0 || !g_cgChainOK) return;
         int shown2 = 0;
         for (int i2 = 0; i2 < n && shown2 < 40; i2++) {
             void *o = g_objArray->Data[i2];
-            if (!o || IsBadReadPtr(o, 0x300)) continue;
+            if (!o || IsBadReadPtr(o, 0x300) || !actorInCurrentLevel(o)) continue;
+            CgClass *type=cgClassInfo(cgClassOf(o));
+            if (!type || !type->isActor) continue;
             objName(o, b, sizeof(b));
             const char *path = strchr(b, ' ');
             if (!path) continue;                     // metadata: no instance
@@ -3518,7 +3583,8 @@ static void diagDumpAimHunt(void)
             if (F.Location <= 0 || IsBadReadPtr(o, F.Location + 12)) continue;
             float *al = (float *)((BYTE *)o + F.Location);
             if (al[0] == 0.0f && al[1] == 0.0f && al[2] == 0.0f) continue;
-            if (*(float *)((BYTE *)o + 0x268) < 0.05f) continue; // scale junk
+            if (IsBadReadPtr((BYTE *)o+scale,4) || IsBadReadPtr((BYTE *)o+drawType,1) ||
+                IsBadReadPtr((BYTE *)o+style,1)) continue;
             float hd = (float)sqrt((al[0]-p1l[0])*(al[0]-p1l[0]) +
                                    (al[1]-p1l[1])*(al[1]-p1l[1]));
             if (hd > 2500.0f) continue;
@@ -3526,74 +3592,24 @@ static void diagDumpAimHunt(void)
                 (*(DWORD *)((BYTE *)o + (sOffHid & ~3)) & mHid)) continue;
             if (mDel && sOffDel > 0 &&
                 (*(DWORD *)((BYTE *)o + (sOffDel & ~3)) & mDel)) continue;
-            BYTE dt = *(BYTE *)((BYTE *)o + 0x42);   // Engine.Actor.DrawType
+            BYTE dt = *(BYTE *)((BYTE *)o + drawType);
             if (dt != 1 && dt != 8 && dt != 10) continue;  // sprite/particle
-            if (!*(void **)((BYTE *)o + 0x25C)) continue;  // no texture
             logf_("    [aimhunt2] %s  DT=%d dP1=%.0f loc=(%.0f %.0f %.0f) "
                   "style=%d scale=%.2f",
                   b, dt, hd, al[0], al[1], al[2],
-                  (int)*(BYTE *)((BYTE *)o + 0x2BC),
-                  *(float *)((BYTE *)o + 0x268));
+                  (int)*(BYTE *)((BYTE *)o + style),
+                  *(float *)((BYTE *)o + scale));
             shown2++;
         }
         logf_("[aimhunt2] %d drawable actors near P1", shown2);
         if (shown2 == 0)
-            logf_("[aimhunt2] NOTHING drawable near P1 -> his cursor is "
-                  "canvas/HUD-drawn, not an actor (v26: draw P2's glow the "
-                  "same way)");
+            logf_("[aimhunt2] no matching visible actors in this frame; hold P1 aim and retry");
     }
 }
 
-// Returns TRUE if the original cursor handled this frame (borrow or return).
-static BOOL origCursorDrive(int i, void *pawn, BOOL held, const float aim[3])
-{
-    static int sOffHidden = -2, sOffOwner = -2;
-    static DWORD sMaskHidden = 0;
-    if (sOffHidden == -2) {
-        sOffHidden   = propOffset("Engine.Actor.bHidden");
-        sMaskHidden  = boolBitMask("Engine.Actor.bHidden");
-        sOffOwner    = propOffset("Engine.Actor.Owner");
-    }
-    void *cur = findOrigCursor();
-    if (!cur || sOffHidden < 0 || !sMaskHidden || sOffOwner < 0 ||
-        IsBadWritePtr(cur, 0x200)) return FALSE;
-
-    if (!held) {
-        if (g_origActive[i]) {
-            DWORD *slot = (DWORD *)((BYTE *)cur + (sOffHidden & ~3));
-            *slot |= sMaskHidden;                       // hide again
-            *(void **)((BYTE *)cur + sOffOwner) = g_origCursorOwner;
-            g_origActive[i] = FALSE;
-            logf_("  [aimfx] p%d original cursor returned (hidden)", i);
-        }
-        return TRUE;                                    // handled either way
-    }
-
-    if (!g_origActive[i]) {
-        g_origActive[i]    = TRUE;
-        g_origCursorOwner  = *(void **)((BYTE *)cur + sOffOwner);
-        void *ctrl = (F.PawnController > 0 &&
-                      !IsBadReadPtr((BYTE *)pawn + F.PawnController, 4))
-                   ? *(void **)((BYTE *)pawn + F.PawnController) : pawn;
-        if (ctrl) *(void **)((BYTE *)cur + sOffOwner) = ctrl;
-        DWORD *slot = (DWORD *)((BYTE *)cur + (sOffHidden & ~3));
-        *slot &= ~sMaskHidden;                          // show
-        char b[160], b2[160];
-        void *parts = NULL;
-        int offParts = propOffset("hgame.SpellCursor.CursorParticles");
-        if (offParts > 0 && !IsBadReadPtr((BYTE *)cur + offParts, 4))
-            parts = *(void **)((BYTE *)cur + offParts);
-        logf_("  [aimfx] p%d ORIGINAL cursor borrowed: %s owner=%s "
-              "CursorParticles=%s", i, objName(cur, b, sizeof(b)),
-              ctrl ? objName(ctrl, b2, sizeof(b2)) : "(pawn)",
-              parts ? objName(parts, b2, sizeof(b2)) : "(none)");
-    }
-    if (F.Location > 0 && !IsBadWritePtr((BYTE *)cur + F.Location, 12)) {
-        float *cl = (float *)((BYTE *)cur + F.Location);
-        cl[0] = aim[0]; cl[1] = aim[1]; cl[2] = aim[2] + 30.0f;
-    }
-    return TRUE;
-}
+static void nativeAimForget(int i);
+static BOOL nativeAimOwnedAlive(int i);
+static BOOL g_nativeAimOwned[8] = {0};
 static BOOL aimGlowAlive(int i)
 {
     return i >= 0 && i < 8 && g_aimFX[i] != NULL;
@@ -3601,9 +3617,14 @@ static BOOL aimGlowAlive(int i)
 
 static BOOL destroyAimFX(int i)
 {
-    if (!g_aimFX[i]) return FALSE;
+    if(i<0 || i>=8) return FALSE;
+    if (!g_aimFX[i]) { nativeAimForget(i); return FALSE; }
+    if (g_nativeAimOwned[i] && !nativeAimOwnedAlive(i)) {
+        g_aimFX[i]=NULL; nativeAimForget(i); return FALSE;
+    }
     void *fx = g_aimFX[i];
     g_aimFX[i] = NULL;
+    nativeAimForget(i);
     if (IsBadReadPtr(fx, 0x10)) return FALSE;
     return destroyActorFX(fx);
 }
@@ -4070,15 +4091,16 @@ static void aimFXVisuals(int i, BOOL init)
     }
 }
 
+#include "native_aim.h"
+
 static void updateAimFX(int i, void *pawn, BOOL held,
                         const float camLoc[3], const int camRot[3])
 {
     if (i < 1 || i >= 8) return;
+    if (g_nativeAim && updateNativeAim(i,pawn,held,camLoc,camRot)) return;
     if (!held) {
         g_aimSup[i] = FALSE;              // v24: reset with the glow
         g_cgLockName[i][0] = 0;           // v51: castable lock ends with the hold
-        // v22: return the borrowed original cursor first (no-op if unused)
-        if (g_glowStyle == 0) origCursorDrive(i, g_pawn[i], FALSE, NULL);
         if (g_aimFX[i]) {
             BOOL gone = destroyAimFX(i);
             logf_("  [aimfx] p%d cast released - aim glow %s", i,
@@ -4306,14 +4328,6 @@ static void updateAimFX(int i, void *pawn, BOOL held,
     // mechanism hardware has ever honored (see notes there).
     g_aimLast[i][0] = aim[0]; g_aimLast[i][1] = aim[1];
     g_aimLast[i][2] = aim[2];
-
-    // v22: GlowStyle=0 (default) - drive the game's OWN cursor actor
-    // instead of spawning anything. Falls through to the emitter path only
-    // if the level has no SpellCursor to borrow.
-    if (g_glowStyle == 0 && origCursorDrive(i, pawn, TRUE, aim)) {
-        if (g_aimFX[i]) { destroyAimFX(i); g_aimFX[i] = NULL; }
-        return;
-    }
 
     // Live check: freed/reused emitters respawn. bDeleteMe catches one-shot
     // FX that already finished (engine sets it before garbage collection).
@@ -5250,6 +5264,7 @@ static void aiRestore(int i, void *pawn)
 // of back to its companion AI. Called on the split-off edge (key or file).
 static void handBackAllPlayers(void)
 {
+    for (int i=1;i<8;i++) { destroyAimFX(i); g_aimViewValid[i]=FALSE; }
     if (!F.ok) return;
     int N = g_numPlayers; if (N < 1) N = 1; if (N > 8) N = 8;
     for (int i = 1; i < N && i < 8; i++) {
@@ -5267,6 +5282,7 @@ static void invalidateLevelCaches(const char *reason)
 {
     logf_("*** %s: dropping cached actors and re-resolving", reason);
     for (int k = 0; k < 8; k++) {
+        destroyAimFX(k); g_aimViewValid[k]=FALSE;
         g_pawn[k] = NULL; g_pawnName[k][0] = 0;
         g_detached[k] = FALSE; g_aiReleased[k] = FALSE; g_letAI[k] = FALSE;
         g_savedCtrl[k] = NULL; g_camDistCur[k] = 0.0f;
@@ -5281,10 +5297,12 @@ static void invalidateLevelCaches(const char *reason)
         g_lastAirAt[k] = g_lastMoveAt[k] = 0;
         g_holdWalkUntil[k] = 0; g_holdArmed[k] = g_holdResync[k] = FALSE;
     }
+    nativeAimResetBindings();
+    g_nAimFXFr=0; memset(g_texAimFXFr,0,sizeof(g_texAimFXFr));
     g_fnResolved = FALSE;      // UFunctions live in packages too
     g_defaultSpell = NULL;
     cgResetLevel();            // v51: class index / candidates / pending hits
-    g_origCursor = NULL; g_origCursorChecked = FALSE;   // v51: it dies with the level
+    g_origCursor = NULL;   // v51: it dies with the level
     resetViewYaw();
     F.ok = FALSE;              // re-resolve field offsets as well
 }
@@ -6130,7 +6148,7 @@ void resetViewYaw(void)   {
 // ------------------------- captured camera state ---------------------------
 static void  *g_viewport   = NULL;
 static int    g_sizeX = 0, g_sizeY = 0;
-static void  *g_camActor   = NULL;
+
 static float  g_camLoc[3]  = {0,0,0};
 static int    g_camRot[3]  = {0,0,0};
 static float  g_camFOV     = 90.0f;
@@ -6273,8 +6291,8 @@ static void drawPortalSized(void *canvas, int x, int y, int w, int h,
 }
 
 
-// Draws the split views. Returns TRUE if it actually drew, so the caller
-// knows whether the HUD needs to be constrained to player 1's strip.
+// v52 native particles use bHidden masking only (hardware verification pending).
+// The following v26 rationale applies only to the LEGACY sprite path.
 // v26: per-pane visibility for the aim glow. The ORIGINAL game cursor is a
 // per-view element - player 1 never sees player 2's cursor. v25 tried to
 // get that by toggling bHidden around each portal draw; Wine honored it,
@@ -6289,6 +6307,7 @@ static void drawPortalSized(void *canvas, int x, int y, int w, int h,
 // bHidden is still toggled as a belt-and-suspenders measure.
 static void setAimFXPaneVisible(int panePlayer)
 {
+    nativeAimPaneVisible(panePlayer);
     if (!g_panePark) return;   // v27 isolation knob: pane parking off =
                                // glow visible in every pane (v24 behavior)
     static int   sOffH  = -2;
@@ -6299,6 +6318,7 @@ static void setAimFXPaneVisible(int panePlayer)
     }
     if (F.Location <= 0) return;
     for (int j = 1; j < 8; j++) {
+        if (g_nativeAimOwned[j]) continue; // never park native particles between ticks
         void *fx = g_aimFX[j];
         if (!fx || IsBadWritePtr((BYTE *)fx + F.Location, 12)) continue;
         float *al = (float *)((BYTE *)fx + F.Location);
@@ -6320,7 +6340,7 @@ static void setAimFXPaneVisible(int panePlayer)
     }
 }
 
-static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
+static BOOL renderSplitPortals(void *, void *, void *canvas)
 {
     LONG n = InterlockedIncrement(&g_prCount);
 
@@ -6672,9 +6692,10 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
             if (pawn && !IsBadReadPtr(pawn, 0x170)) {
                 resolveFields();
                 resolveActions();
-                thirdPersonCam(i, pawn, loc, rot);
                 takeControl(i, pawn);
                 driveePawn(i, pawn);
+                thirdPersonCam(i, pawn, loc, rot);
+                memcpy(g_aimViewLoc[i],loc,12); memcpy(g_aimViewRot[i],rot,12); g_aimViewValid[i]=TRUE;
                 {   // edge-triggered actions: "." = jump, "/" = cast
                     static BOOL prevJ[8] = {0}, prevF[8] = {0};
                     BOOL j = keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) || g_padJump[i];
@@ -6779,6 +6800,7 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
                         g_letAI[i] = !g_letAI[i];
                         if (g_letAI[i]) {
                             g_detached[i] = FALSE;
+                            destroyAimFX(i);
                             repossess(i, pawn);
                             logf_("  [debug] p%d AI repossessed (M) - split will not fight it", i);
                         } else {
@@ -6834,6 +6856,7 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
                   i, x, w, H, i == 0 ? "<engine cam>" : g_pawnName[i],
                   loc[0], loc[1], loc[2], rot[1]);
 
+        if (i>0 && (!g_pawn[i] || g_letAI[i] || !actorInCurrentLevel(g_pawn[i]))) destroyAimFX(i);
         // v25: P2+'s aim glow renders only in its owner's pane
         setAimFXPaneVisible(i);
         drawPortalSized(canvas, x, 0, w, H, g_camActor, loc, rot, TRUE);
@@ -7014,6 +7037,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             int gs = GetPrivateProfileIntA("actions", "GlowSize", 0, ini);
             if (gs >= 20 && gs <= 200) g_glowSize = gs;
         }
+        g_nativeAim = GetPrivateProfileIntA("actions", "NativeAim", 1, ini) != 0;
         g_glowStyle = GetPrivateProfileIntA("actions", "GlowStyle", 6, ini);
         {   // v23: Cleanup default full - the state exit is REQUIRED (v22
             // hardware: without it the cast pose hangs forever, even while
