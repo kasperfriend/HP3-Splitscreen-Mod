@@ -605,6 +605,14 @@ KNOWN LIMITATIONS (this is a prototype)
   - Save games are single-player and unchanged.
   - Companion AI is released by dropping TrailingChar / LeadChar and
     expanding TrailCharFollowRadius. UnPossess is NOT used (it broke walking).
+  - Turning the split OFF (F10 / split_on file / StartOn) hands every
+    player-2..N pawn back to its companion AI: the follow configuration the
+    game set at level load (LeadChar, TrailCharFollowRadius,
+    bUseDistFromLeadCharForMovement and the lead's TrailingChar back-pointer)
+    is restored, animation control and walk stats are given back, and a later
+    split toggle re-takes the pawn fresh. In single-player the companions
+    trail Harry again exactly as the unmodded game does. Look for
+    "[ai-restore] pN handed to AI" in hp3mod.log on the split-off edge.
   - If Hermione/Ron still shakes while idle, send hp3mod.log and look for
     phys= and dLead= in the [t+...] telemetry.
 
