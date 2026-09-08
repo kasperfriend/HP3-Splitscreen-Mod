@@ -491,3 +491,52 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   (class, +0xX slot, None/unreadable/wrong-family value) instead of a bare
   miss. Anchor fallback remains hgame.baseSpell.SpellIcon.
 ===========================================================================
+
+13. V54 COOPERATIVE SUSTAINED-CAST BRIDGE (2026-09-08; IN-GAME VERIFICATION PENDING)
+-------------------------------------------------------------------------------
+- The requested behavior is general: a Player-2 or Player-3 continuous cast on
+  an existing object which genuinely requires Harry, Hermione and Ron to hold
+  together. It is not a Pixie-well-specific completion or a one-shot impact.
+- No HP3 package source or installed HGame.u was available to establish a
+  class/function name for that interaction. In particular, an earlier
+  CompanionSpellTrigger name was only a hypothesis and is NOT used as a
+  hard-coded admission rule.
+- v54 therefore behavior-certifies target classes live. While the original
+  game is running (including split OFF), cgWatchP1 observes P1's real
+  SpellCursor.aCurrentTarget. A class is recorded only after P1 remains locked
+  on that exact actor for 350 ms AND both real companion pawns' spellTarget
+  fields independently equal it. This is logged as [coopcast] CERTIFIED and
+  lasts only until level-cache reset. Exact/subclass matching thereafter is
+  pointer/class-chain based, never object-name based. A throttled current-map
+  cache also finds only those certified actors when a legitimate cooperative
+  actor has no vulnerableToClass metadata and is absent from g_cgCand; the
+  same reticle corridor, object slot/class identity, and FastTrace checks apply.
+- Once certified, a P2/P3 held-cast key is a pure state machine keyed by player
+  slot + object pointer + UClass pointer + object-table slot. It requires an
+  uninterrupted interval exceeding 10,000 ms. Release, aim loss, target replacement,
+  slot reuse/class change, split shutdown and level cache reset clear it. The
+  host regression test covers continuity, reset, class identity and unsigned
+  GetTickCount wraparound.
+- At maturity, the bridge first uses the original P1 SpellCursor.LockOn only
+  when reflection sees precisely one target-named ObjectProperty and no other
+  object input (the known family shape is LockOn(Actor TargetActor)), its paired
+  UnLock/Unlock has a fully reflected no-input layout, and the live P1 cursor
+  confirms it retained the requested actor. It then
+  sets the verified target spell/target fields and starts the known
+  PressedFire -> StartCasting(class, 1.0) -> playCastAim hold path on the real
+  non-holder Harry/Hermione/Ron actors. The holder retains their actual P2/P3
+  hold. If the cursor/function/ABI bridge cannot be established, v54 restores
+  its empty provisional record and leaves the trio unchanged. This is
+  deliberately a state bridge, not a call to target Trigger,
+  Touch, ProcessTouch, a generic spell handler, repeated projectile impacts,
+  or an unknown completion boolean.
+- On cancellation, borrowed actors receive StopCasting before ReleasedFire so
+  they do not spawn duplicate projectiles; P1's cursor gets UnLock; fields are
+  restored only if they still hold the value borrowed by the bridge. A real
+  controller's intervening different target is never overwritten. If another
+  human-controlled hero is already casting at a different target, or starts a
+  normal cast while the bridge is active, the bridge restores immediately and
+  blocks the holder's still-held attempt until release/target loss/new hold.
+- Native hardware/VM behavior remains unverified. The implementation logs each
+  proof, hold start, reflected cursor call, borrowed hero state, activation and
+  restore reason so a real HP3 log can confirm or reject the inferred route.

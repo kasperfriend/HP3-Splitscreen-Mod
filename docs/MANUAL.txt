@@ -14,6 +14,46 @@ WHAT IT DOES
   engine's own DrawPortal once per player.
 
 
+V54 COOPERATIVE SUSTAINED CAST (IN-GAME TESTING PENDING)
+  This is a general fallback for real HP3 objects that require Harry,
+  Hermione and Ron to keep casting together. It is NOT a Pixie-well-only
+  solution, does not complete a minigame directly, and never calls generic
+  Trigger(), synthetic Touch(), repeated spell impacts, or a guessed target
+  property.
+
+  SAFETY / ONE-TIME PER-LEVEL CALIBRATION:
+    Before P2/P3 can use the fallback, leave the split OFF and perform the
+    normal Player-1 interaction on a genuine all-three-character object.
+    Keep P1's cursor locked/casting until Hermione and Ron have both joined
+    the same target. The mod observes that untouched game behavior and writes:
+      [coopcast] CERTIFIED P1 cooperative class ...
+    Only that observed class (and subclasses) is eligible for this map.
+    An ordinary SpellTrigger, a short cast, and an unknown class are not
+    eligible. If this line does not appear, the mod intentionally does nothing.
+
+  USE AFTER CERTIFICATION:
+    Turn split on. Player 2 or Player 3 aims at an instance of the certified
+    class and holds Cast continuously for more than 10 seconds. Then, only while that
+    hold continues, the mod invokes the real P1 SpellCursor.LockOn only when
+    its reflected one-target ABI and paired no-input UnLock are safe, and
+    when P1's cursor retains that target. It then places Harry, Hermione
+    and Ron in the game's existing held-cast state. The object's own script
+    decides what happens; the holder's normal release is the only injected
+    projectile fire.
+
+    Releasing Cast, aiming at another object, another player's normal cast,
+    target deletion, map travel, F10/split shutdown, or a missing trio
+    cancels the bridge and restores
+    fields/states borrowed from P1 and the companions. Under [actions],
+    CoopCastFallback=0 disables it. CoopCastHoldMs has a default/minimum of
+    10000; it cannot be lowered into a normal short-cast shortcut.
+
+  This deliberately reaches P1's normal controller/cursor route only after
+  the strict delay and behavior proof. Test first on a reloadable save. If it
+  differs from the stock P1 interaction, send hp3mod.log with the CERTIFIED
+  line and the later [coopcast] lines.
+
+
 V52 NATIVE AIMING (HARDWARE TESTING PENDING)
   [actions] NativeAim=1 is now the default, including existing INIs.
   Seeking uses HP3's original SpellCursorEmitter. Hovering a castable
@@ -57,7 +97,7 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v53 ...
+          === hp3mod build v54 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
       d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave

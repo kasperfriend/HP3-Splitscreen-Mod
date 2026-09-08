@@ -10,5 +10,8 @@ mkdir -p "$DIR/dist/tests"
     "$DIR/tests/aim_policy_test.cpp" -o "$DIR/dist/tests/aim_policy_test.exe"
 "$DIR/dist/tests/aim_policy_test.exe"
 "${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
+    "$DIR/tests/coop_cast_test.cpp" -o "$DIR/dist/tests/coop_cast_test.exe"
+"$DIR/dist/tests/coop_cast_test.exe"
+"${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
     "$DIR/tests/native_aim_test.cpp" -o "$DIR/dist/tests/native_aim_test.exe"
 "$DIR/dist/tests/native_aim_test.exe"
