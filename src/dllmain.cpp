@@ -33,6 +33,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <mmsystem.h>
+#include "cast_ground.h"
 
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
@@ -128,8 +129,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v48"
-#define MOD_STAMP   "build v48 - 2026-09-08 - CLEAN CAST EXIT: three symptoms, one cause. (1) STUCK POSE: the post-cast cleanup kept its per-cast state in statics that were only cleared when a cast's 4s watch expired, so casting again within 4s inherited <chain already fired> and got NO exit at all - the pose sat there until a later retry happened by luck. Now every cast gets its own run (one struct, reset at every fire, abandoned the moment a newer cast owns the pawn). (2) HOP: the exit re-enables physics and she free-falls the fraction of a unit the cast pose held her above the floor (~2.5u in ~130ms); v38 only swallowed the landing ANIMATION, so the dip stayed - and that swallow also removed the engine's landing anim, the very thing that used to re-settle pose and facing, which is why a hop that slipped through fixed both. Now the dip is cancelled at the source: for 900ms after the exit, a Falling frame that is only the exit dip is put back on her own standing height and re-glued with PHYS_Walking. (3) WRONG POSE/YAW: the anim re-pick that settles both was gated behind six conditions (v47) and expired on almost every cast; it now runs once per cast, 450ms after a verified exit, the first moment she stands still - and stays armed for the rest of the run so a walk-away still gets it. Look for [cast] run#N lines: fired / exit chain / state LEFT / anim re-pick / done. NoDip=0 in the ini disables the dip cancel."
+#define MOD_BUILD  "v49"
+#define MOD_STAMP   "build v49 - 2026-09-08 - CAST FLOOR HANDOFF: keep the v48 pose exit and one re-pick per cast. Replace the saved-Z / raw-Physics dip loop with native SetPhysics(Walking) + FindBase, then allow walking physics to validate floor contact before idle may freeze it. One attempt per exit, no height reset, no fall pinning and no default landing-animation swallow. Missing support, real jumps and ledges release to the engine. Look for [castground] reacquire / verified / released; NoDip=0 selects the legacy animation-only fallback."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -364,6 +365,7 @@ static OpDef g_ops[] = {
 };
 enum { OP_INT = 0, OP_OBJ, OP_VEC, OP_ROT, OP_TRUE, OP_FALSE, OP_END, OP_COUNT };
 static int g_opNameConst = -1;   // optional execNameConst opcode (Spawn tag)
+static int g_opByteConst = -1;   // optional: SetPhysics takes a BYTE, not an int
 
 static BOOL discoverOpcodes(void)
 {
@@ -393,6 +395,18 @@ static BOOL discoverOpcodes(void)
     }
     logf_("  %-17s = %s", "NameConst(opt)",
           g_opNameConst >= 0 ? "opcode found" : "NOT FOUND (aim glow off)");
+    // Optional as well: unavailable floor repair must not disable rendering.
+    // IntConst writes four bytes; using it for P_GET_BYTE would corrupt the
+    // native's parameter storage. Discover the correctly sized token instead.
+    g_opByteConst = -1;
+    BYTE *bc = resolveThunk((BYTE *)GetProcAddress(g_core,
+                 "?execByteConst@UObject@@QAEXAAUFFrame@@QAX@Z"));
+    if (bc) {
+        for (int op = 0; op < 256; op++)
+            if (resolveThunk((BYTE *)tbl[op]) == bc) { g_opByteConst = op; break; }
+    }
+    logf_("  %-17s = %s", "ByteConst(opt)",
+          g_opByteConst >= 0 ? "opcode found" : "NOT FOUND (floor repair off)");
     return all;
 }
 
@@ -578,6 +592,25 @@ static PFN_ProcessEvent g_ProcessEvent = NULL;
 typedef void (__fastcall *PFN_execActorFn)(void *actor, void *edx,
                                            FFrameLite *stack, void *result);
 static PFN_execActorFn g_execSpawn = NULL, g_execDestroy = NULL;
+
+// v49: do not call native SetPhysics through ProcessEvent. Like Spawn and
+// FastTrace, it consumes FFrame bytecode. The native initializes walking's
+// Base/Floor bookkeeping; writing the Physics byte bypasses that work.
+static PFN_execActorFn g_execSetPhysics = NULL;
+typedef void (__fastcall *PFN_FindBase)(void *actor, void *edx);
+static PFN_FindBase g_FindBase = NULL;
+
+static BOOL nativeSetPhysics(void *pawn, BYTE physics)
+{
+    if (!pawn || !g_opsOK || g_opByteConst < 0 || !g_execSetPhysics) return FALSE;
+    BYTE bc[] = { (BYTE)g_opByteConst, physics,
+                  (BYTE)g_ops[OP_END].op, (BYTE)g_ops[OP_END].op };
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = pawn; st.Code = bc;
+    DWORD result = 0;
+    g_execSetPhysics(pawn, NULL, &st, &result);
+    return TRUE; // invocation succeeded; the caller must VERIFY the contact
+}
 
 static void *spawnFX(void *actor, void *cls, void *owner,
                      const float loc[3], const int rot[3])
@@ -1370,7 +1403,7 @@ static struct {
     int  PawnController;      // Pawn.Controller
     int  ControllerPawn;      // Controller.Pawn
     int  GroundSpeed, JumpZ, AccelRate;
-    int  LifeSpan, Base;
+    int  LifeSpan, Base, Floor;
     int  DesiredRotation, RotationRate;   // v12: pin during standing jump
 } F = { FALSE };
 
@@ -1509,38 +1542,32 @@ static void *spellClassFor(void *pawn)
 // ===========================================================================
 typedef struct {
     int   id;         // serial, so log lines group per cast
+    void *pawn;       // never apply a run to a replacement actor in this slot
     DWORD fireAt;     // tick the spell left the caster (0 = no run)
     DWORD beginAt;    // cast-begin stamp this run belongs to
     DWORD chainAt;    // tick our exit chain fired (0 = not yet)
     DWORD exitAt;     // tick the state actually left (EndState / Tick stopped)
     DWORD lastTryAt;  // tick of the last exit we issued
     int   retries;    // extra exits issued after the chain (max 2)
-    int   dips;       // exit micro-falls cancelled (the hop fix)
-    DWORD lastDipAt;  // tick of the last cancelled dip
-    float holdZ;      // standing height when the spell left - the floor ref
-    float holdXY[2];  // where that height was measured
-    BYTE  phys0;      // physics at fire (2 = airborne: hands off the floor)
+    float fireZ;      // telemetry only; NEVER a floor reference
+    BYTE  phys0;      // physics at fire (telemetry only)
+    CastGround::Recovery ground; // one native floor handoff per exit attempt
     BOOL  rePicked;   // anim re-pick done (this settles the pose + facing)
 } CastRun;
 static CastRun g_run[8];
 static int     g_runSeq = 0;
 
-// v38 HOPKILL: per-pawn suppress window. Armed every time an exit runs for
-// that pawn; the PERMANENT ProcessEvent detour then swallows the engine's
-// PlayFalling + PlayLandingAnimation storm for this pawn until the stamp
-// expires. The v37 hw log proved the storm IS the visible hop (height was
-// acquitted: "already level" casts still fell). v48: the dip guard below
-// removes the fall itself, so this swallow is now the backstop for the frames
-// where a fall still gets through (retries, uneven ground, jumps).
+// Legacy v38 animation-only fallback, used only when NoDip=0. v49's default
+// repairs floor contact and does not swallow real falling/landing animations.
 static DWORD g_suppressLandUntil[8] = {0}; // GetTickCount()+1500 at arm
 static DWORD g_hopkillT0[8]         = {0}; // log base: the chain-fire moment
-// v39 state telemetry, harvested from the SAME permanent detour (the state
+// v39 state telemetry, harvested while the event detour is installed (the state
 // pointer lives in a heap frame - a pawn scan is useless on hw - but the
 // state's own script events are all visible there):
 static DWORD g_animEndAt[8]   = {0}; // first post-release StateCasting.AnimEnd
 static DWORD g_lastMoveAt[8]  = {0}; // v46: last tick with movement input
 static int   g_castExitAdj    = 90;  // v40: AnimEnd->exit gap (ini CastExitAdj)
-static int   g_noDip          = 1;   // v48: cancel the exit micro-fall (NoDip)
+static int   g_noDip          = 1;   // v49: native floor handoff (NoDip)
 static int   g_meshOff        = -2;  // v41: Engine.Actor.Mesh property offset
 static int   g_viewYaw[8]     = {0}; // (moved up from driveePawn for v41)
 static BOOL  g_jumpStanding[8] = {0}; // v12: a standing jump is in flight
@@ -1576,7 +1603,7 @@ static void armHopKill(int i)
 {
     if (i < 0 || i >= 8) return;
     DWORD now = GetTickCount();
-    g_suppressLandUntil[i] = now + 1500;
+    g_suppressLandUntil[i] = g_noDip ? 0 : now + 1500;
     g_hopkillT0[i]         = now;
 }
 static void *g_castActor[8]   = {NULL};
@@ -1591,85 +1618,133 @@ static DWORD g_aimFXAt[8] = {0};      // v29: glow spawn tick (race fix:
 static float g_aimLast[8][3];         // v26: real aim point (pane restore)
 
 // ---------------------------------------------------------------------------
-// v48: the cast floor hold. The cast pose freezes the pawn a fraction of a
-// unit above the floor; when the state exit re-enables physics she free-falls
-// that gap and the engine catches her with a landing - that dip is the hop
-// (v47 hw log: 874.75 -> 872.3 -> 874.5, ~130ms). Landing her back on the
-// height she was standing at when the spell left leaves nothing to fall.
-// (v35..v37 tried to guess that height from a ring of standing samples; the
-// samples were taken in the mod's own PHYS_None standing state, so they were
-// the frozen cast height, not the floor - the settle wrote 0.1 units at best.
-// The height at the moment of the cast IS a height she was standing on.)
+// v49: repair FLOOR CONTACT, not height. The v48 hardware log shows that every
+// reset was Z 874.75 -> 874.75, followed by another Falling/BaseChange on the
+// next walking tick. Idle then froze PHYS_None before physics could settle.
+// The eventual dip happened at movement start, even seconds after "done".
+//
+// Capture at EXIT (not fire: the player can walk during a cast). Re-enter
+// walking through the native and probe the CURRENT collision support. Keep
+// Walking alive for a few frames before the normal idle freeze is allowed.
+// Never copy back Location/Base/Floor, and never retry a recurrent fall.
 // ---------------------------------------------------------------------------
-static void castHoldFloor(int i, void *pawn, CastRun *r)
+static CastGround::Sample castGroundSample(int i, void *pawn)
 {
-    if (i < 0 || i >= 8 || !pawn || !r->fireAt) return;
-    if (r->phys0 == 2 || r->holdZ == 0.0f) return;   // airborne cast: hands off
-    if (F.Location <= 0 || IsBadWritePtr((BYTE *)pawn + F.Location, 12) ||
-        IsBadReadPtr(pawn, F.Location + 12))
-        return;
-    float *pl = (float *)((BYTE *)pawn + F.Location);
-    float dx = pl[0] - r->holdXY[0], dy = pl[1] - r->holdXY[1];
-    if (dx * dx + dy * dy > 80.0f * 80.0f) return;   // she moved: no reference
-    float dz = pl[2] - r->holdZ;
-    if (dz < -6.0f || dz > 6.0f) return;             // not this cast's floor
-    if (fabsf(dz) < 0.05f) return;                   // already there
-    float oldZ = pl[2];
-    pl[2] = r->holdZ;
-    if (F.Velocity > 0 && !IsBadWritePtr((BYTE *)pawn + F.Velocity, 12))
-        ((float *)((BYTE *)pawn + F.Velocity))[2] = 0.0f;
-    logf_("    [cast] p%d run#%d floor hold Z %.2f -> %.2f (%.2f to drop)",
-          i, r->id, oldZ, pl[2], dz);
+    CastGround::Sample s = {};
+    s.jumping = keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) ||
+                g_padJump[i] || g_jumpStanding[i] || g_jumpPh[i] != 0;
+    if (!pawn || F.Location <= 0 || F.Velocity <= 0 || F.Physics <= 0 ||
+        IsBadReadPtr((BYTE *)pawn + F.Location, 12) ||
+        IsBadReadPtr((BYTE *)pawn + F.Velocity, 12) ||
+        IsBadReadPtr((BYTE *)pawn + F.Physics, 1)) return s;
+    if (g_offDeleteMe > 0 && g_maskDeleteMe &&
+        !IsBadReadPtr((BYTE *)pawn + (g_offDeleteMe & ~3), 4) &&
+        (*(DWORD *)((BYTE *)pawn + (g_offDeleteMe & ~3)) & g_maskDeleteMe)) return s;
+    memcpy(s.location, (BYTE *)pawn + F.Location, 12);
+    // Basic motion validity is independent of the optional floor fields:
+    // missing floor reflection must NOT disable the proven pose re-pick.
+    if (F.Floor > 0 && !IsBadReadPtr((BYTE *)pawn + F.Floor, 12))
+        memcpy(s.floor, (BYTE *)pawn + F.Floor, 12);
+    s.vz = ((float *)((BYTE *)pawn + F.Velocity))[2];
+    s.physics = *((BYTE *)pawn + F.Physics);
+    if (F.Base > 0 && !IsBadReadPtr((BYTE *)pawn + F.Base, sizeof(void *)))
+        s.base = *(void **)((BYTE *)pawn + F.Base);
+    if (s.base && (IsBadReadPtr(s.base, 0x30) ||
+        (g_offDeleteMe > 0 && g_maskDeleteMe &&
+         !IsBadReadPtr((BYTE *)s.base + (g_offDeleteMe & ~3), 4) &&
+         (*(DWORD *)((BYTE *)s.base + (g_offDeleteMe & ~3)) & g_maskDeleteMe))))
+        s.base = NULL;
+    s.valid = true;
+    return s;
 }
 
-// ---------------------------------------------------------------------------
-// v48: THE HOP, removed at the source. Swallowing PlayFalling /
-// PlayLandingAnimation (v38) hid the hop's animation but not the dip, and it
-// also removed the engine's own landing animation - the thing that used to
-// re-settle the pose and the facing. That is why a hop that slipped through
-// the swallow "fixed" both symptoms: the landing re-picked the animation.
-// So now the fall is cancelled instead: for a short window after the exit,
-// any PHYS_Falling frame that is only the exit dip (small downward velocity,
-// still where the cast happened, nobody jumping) is put straight back on the
-// standing height and re-glued with PHYS_Walking - the state the mod keeps
-// her in while standing anyway. No fall, no landing, no hop, and the anim
-// re-pick below does the settling that the landing used to do.
-// ---------------------------------------------------------------------------
-static void castDipGuard(int i, void *pawn, CastRun *r, DWORD now)
+static void castGroundArm(int i, void *pawn, CastRun *r, DWORD now)
 {
-    if (!g_noDip || !r->exitAt || r->phys0 == 2 || r->holdZ == 0.0f) return;
-    // The exit moment only - plus a little longer while the fall keeps coming
-    // back (a step or a slope that refuses the re-glue), capped at 2s.
-    if (now - r->exitAt > 900) {
-        if (!r->dips || now - r->lastDipAt > 400) return;
-        if (now - r->exitAt > 2000) return;
+    memset(&r->ground, 0, sizeof(r->ground));
+    if (!g_noDip) return;
+    CastGround::Sample s = castGroundSample(i, pawn);
+    CastGround::arm(r->ground, s, now);
+    if (!g_opsOK || g_opByteConst < 0 || !g_execSetPhysics ||
+        F.Base <= 0 || F.Floor <= 0)
+        CastGround::release(r->ground, CastGround::Unavailable);
+    logf_("    [castground] p%d run#%d %s (%s, exitZ=%.2f phys=%u "
+          "base=%p floorZ=%.3f)", i, r->id,
+          CastGround::phaseName(r->ground.phase),
+          CastGround::reasonName(r->ground.reason), s.location[2],
+          (unsigned)s.physics, s.base, s.floor[2]);
+}
+
+// Called by driveePawn AFTER fresh input is sampled, BEFORE its airborne
+// bookkeeping and idle freeze. TRUE means leave walking physics on this frame.
+static BOOL castGroundStep(int i, void *pawn, DWORD now)
+{
+    CastRun *r = &g_run[i];
+    if (!g_noDip || !r->fireAt || r->pawn != pawn ||
+        g_beginCastAt[i] != r->beginAt || !CastGround::active(r->ground))
+        return FALSE;
+    int runId = r->id;
+    BOOL wasVerifying = r->ground.phase == CastGround::Verifying;
+    CastGround::Sample before = castGroundSample(i, pawn);
+    CastGround::Action action = CastGround::step(r->ground, before, now);
+    if (action == CastGround::Reacquire) {
+        if (!nativeSetPhysics(pawn, 1)) {
+            CastGround::release(r->ground, CastGround::Unavailable);
+        } else {
+            if (r->id != runId || r->pawn != pawn ||
+                r->beginAt != g_beginCastAt[i]) return FALSE;
+            // SetPhysics can be a no-op if the script already chose Walking.
+            // FindBase explicitly re-probes in that case as well. Its native
+            // collision query supplies the base/normal; no saved actor pointer
+            // or guessed flat-floor vector is ever installed by the mod.
+            CastGround::Sample after = castGroundSample(i, pawn);
+            if (g_FindBase && after.valid && after.physics == 1) {
+                g_FindBase(pawn, NULL);
+                if (r->id != runId || r->pawn != pawn ||
+                    r->beginAt != g_beginCastAt[i]) return FALSE;
+                after = castGroundSample(i, pawn);
+            }
+            BOOL accepted = CastGround::repaired(r->ground, after);
+            // Zero only the incidental downward velocity, and only AFTER the
+            // engine found walkable support. Positive velocity/jumps veto it.
+            if (accepted && !IsBadWritePtr((BYTE *)pawn + F.Velocity, 12))
+                ((float *)((BYTE *)pawn + F.Velocity))[2] = 0.0f;
+            logf_("    [castground] p%d run#%d reacquire phys=%u->%u "
+                  "base=%p->%p floor=(%.3f %.3f %.3f)->(%.3f %.3f %.3f) "
+                  "Z=%.2f->%.2f (%s)", i, r->id,
+                  (unsigned)before.physics, (unsigned)after.physics,
+                  before.base, after.base,
+                  before.floor[0], before.floor[1], before.floor[2],
+                  after.floor[0], after.floor[1], after.floor[2],
+                  before.location[2], after.location[2],
+                  accepted ? "verify walking" : CastGround::reasonName(r->ground.reason));
+            if (accepted) return TRUE;
+            // The probe found no floor. Undo OUR walking transition rather
+            // than letting idle freeze an unsupported pawn over a ledge.
+            if (after.valid && after.physics == 1 && !after.jumping &&
+                after.vz <= 0.0f && !CastGround::supported(after))
+                nativeSetPhysics(pawn, 2);
+        }
+    } else if (action == CastGround::KeepWalking) {
+        return TRUE;
+    } else if (action == CastGround::Settled) {
+        logf_("    [castground] p%d run#%d verified (Walking %u frames / %lums, "
+              "Z=%.2f base=%p floorZ=%.3f)", i, r->id,
+              r->ground.walkingFrames, (unsigned long)(now - r->ground.repairAt),
+              before.location[2], before.base, before.floor[2]);
+        return FALSE;
+    } else if (action != CastGround::GiveUp) {
+        return FALSE;
+    } else if (wasVerifying && before.valid && before.physics == 1 &&
+               !before.jumping && before.vz <= 0.0f &&
+               !CastGround::supported(before)) {
+        // A later frame lost its base. Do not let idle turn that unsupported
+        // Walking into None either; let the next physics tick fall normally.
+        nativeSetPhysics(pawn, 2);
     }
-    if (F.Physics <= 0 || F.Location <= 0 || F.Velocity <= 0) return;
-    if (IsBadReadPtr(pawn, F.Location + 12) ||
-        IsBadWritePtr((BYTE *)pawn + F.Location, 12)) return;
-    if (IsBadReadPtr(pawn, F.Velocity + 12) ||
-        IsBadWritePtr((BYTE *)pawn + F.Velocity, 12)) return;
-    if (IsBadWritePtr((BYTE *)pawn + F.Physics, 1)) return;
-    if (keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) || g_padJump[i]) return;
-    if (g_jumpStanding[i] || g_jumpPh[i]) return;    // never inside a jump
-    if (*((BYTE *)pawn + F.Physics) != 2) return;    // not falling: nothing to do
-    float *pl = (float *)((BYTE *)pawn + F.Location);
-    float *pv = (float *)((BYTE *)pawn + F.Velocity);
-    if (pv[2] < -300.0f) return;                     // a real fall, not the dip
-    float dx = pl[0] - r->holdXY[0], dy = pl[1] - r->holdXY[1];
-    if (dx * dx + dy * dy > 60.0f * 60.0f) return;   // she moved: no reference
-    float dz = pl[2] - r->holdZ;
-    if (dz > 1.0f || dz < -24.0f) return;            // out of the dip band
-    float oldZ = pl[2], oldVz = pv[2];
-    pl[2]  = r->holdZ;
-    pv[2]  = 0.0f;
-    *((BYTE *)pawn + F.Physics) = 1;                 // PHYS_Walking: re-glue
-    r->dips++;
-    r->lastDipAt = now;
-    if (r->dips <= 3)
-        logf_("    [nodip] p%d run#%d exit dip cancelled #%d: Z %.2f -> %.2f "
-              "vz %.0f -> 0 (exit+%lums)", i, r->id, r->dips, oldZ, pl[2],
-              oldVz, (unsigned long)(now - r->exitAt));
+    logf_("    [castground] p%d run#%d released (%s, phys=%u vz=%.1f) - "
+          "engine owns gravity", i, r->id, CastGround::reasonName(r->ground.reason),
+          (unsigned)before.physics, before.vz);
+    return FALSE;
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,12 +1752,12 @@ static void castDipGuard(int i, void *pawn, CastRun *r, DWORD now)
 //
 //   FIRE    the spell leaves; the pawn is parked in StateCasting (frozen).
 //   EXIT    at AnimEnd+CastExitAdj (fallback CleanupDelay) run the proven
-//           exit chain: floor hold, GotoDefaultGroundMovementState,
+//           exit chain: GotoDefaultGroundMovementState,
 //           blendOutCast, StopCasting, SwitchToNormalStanceAnims, AnimEnd.
 //   VERIFY  StateCasting.EndState seen, or its Tick stopped = the state is
 //           gone. While it is still alive, re-issue the exit (max 2, 700ms
 //           apart): a skipped exit is what parks the cast pose on screen.
-//   SETTLE  cancel the exit micro-fall (the hop, see castDipGuard), then - as
+//   SETTLE  hand floor contact to native walking physics (v49), then - as
 //           soon as the pawn stands still - re-pick the animation ONCE. That
 //           re-pick settles the pose and the facing; the engine used to do it
 //           inside the landing animation, which is exactly why a hop "fixed"
@@ -1705,18 +1780,17 @@ static void castRunStart(int i, void *pawn)
               r->exitAt ? "it had exited" : "IT HAD NOT EXITED YET");
     memset(r, 0, sizeof(*r));
     r->id      = ++g_runSeq;
+    r->pawn    = pawn;
     r->fireAt  = GetTickCount();
     r->beginAt = g_beginCastAt[i];
     if (pawn && F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
         float *pl = (float *)((BYTE *)pawn + F.Location);
-        r->holdZ     = pl[2];
-        r->holdXY[0] = pl[0];
-        r->holdXY[1] = pl[1];
+        r->fireZ = pl[2];
     }
-    r->phys0 = (F.Physics > 0 && !IsBadReadPtr(pawn, F.Physics))
+    r->phys0 = (F.Physics > 0 && !IsBadReadPtr((BYTE *)pawn + F.Physics, 1))
              ? *((BYTE *)pawn + F.Physics) : 0;
     logf_("    [cast] p%d run#%d fired (Z=%.2f phys=%d begin=%lu)",
-          i, r->id, r->holdZ, (unsigned)r->phys0,
+          i, r->id, r->fireZ, (unsigned)r->phys0,
           (unsigned long)r->beginAt);
 }
 
@@ -1725,22 +1799,23 @@ static void castDropRun(int i, const char *why)
     CastRun *r = &g_run[i];
     if (!r->fireAt) return;
     logf_("    [cast] p%d run#%d done (%s, age=%lums, chain=%d exit=%d "
-          "retry=%d dip=%d repick=%d)",
+          "retry=%d ground=%s repick=%d)",
           i, r->id, why, (unsigned long)(GetTickCount() - r->fireAt),
           r->chainAt ? 1 : 0, r->exitAt ? 1 : 0,
-          r->retries, r->dips, r->rePicked ? 1 : 0);
+          r->retries, CastGround::phaseName(r->ground.phase), r->rePicked ? 1 : 0);
     memset(r, 0, sizeof(*r));
     g_castActor[i]   = NULL;
 }
 
 // The exit chain. The call set is the hardware-proven v23/v30 full chain
-// (every reduction ever tried hung the pose); only the per-cast floor hold in
-// front of it is new.
+// (every reduction ever tried hung the pose). v49 changes only the physics
+// handoff around it, not the calls or the timing that fixed the pose.
 static void castExitChain(int i, void *pawn, CastRun *r, const char *tag)
 {
     BYTE p[8]; memset(p, 0, sizeof(p));
-    castHoldFloor(i, pawn, r);          // land her on her own standing height
-    armHopKill(i);                      // v38: swallow the landing storm
+    if (!g_cleanupLight && g_fnGotoGround)
+        castGroundArm(i, pawn, r, GetTickCount()); // snapshot the EXIT position
+    armHopKill(i);                      // legacy animation-only fallback
     if (!g_cleanupLight && g_fnGotoGround)
         callFn(pawn, g_fnGotoGround, "GotoDefaultGroundMovementState()");
     if (!g_cleanupLight && g_fnBlendOut && g_cleanupChain != 3)
@@ -1832,8 +1907,10 @@ static void finishPendingCasts(void)
         // Ownership first: a newer cast owns the pawn from its aim onwards and
         // gets its own run, so nothing here can ever cancel a pending exit
         // (v29's rapid-cast race, re-found in v47 as the stuck-pose cause).
-        if (g_beginCastAt[i] > r->beginAt) { castDropRun(i, "superseded"); continue; }
-        if (!pawn || IsBadReadPtr(pawn, 0x200)) { castDropRun(i, "pawn gone"); continue; }
+        if (g_beginCastAt[i] != r->beginAt) { castDropRun(i, "superseded"); continue; }
+        if (!pawn || pawn != r->pawn || IsBadReadPtr(pawn, 0x200)) {
+            castDropRun(i, "pawn gone/replaced"); continue;
+        }
 
         castTelemetry(i, pawn, age, now);
 
@@ -1879,9 +1956,8 @@ static void finishPendingCasts(void)
             }
         }
 
-        // ---- 3. SETTLE: no dip, then the anim re-pick ---------------------
+        // ---- 3. SETTLE: floor handoff runs in driveePawn, then re-pick ----
         if (r->exitAt) {
-            castDipGuard(i, pawn, r, now);
             DWORD settleAge = now - r->exitAt;
             // The anim re-pick that settles the pose and the facing. 450ms
             // after the exit the engine's own blend-out has run (v40), and it
@@ -1890,7 +1966,10 @@ static void finishPendingCasts(void)
             // version needed six gates to hold at once and expired on almost
             // every cast, which is why only the casts that happened to hop
             // came out right.
+            CastGround::Sample settled = castGroundSample(i, pawn);
             if (!r->rePicked && settleAge >= 450 &&
+                CastGround::readable(settled) && !settled.jumping && settled.physics <= 1 &&
+                settled.vz >= -1.0f && settled.vz <= 0.0f &&
                 g_p2Moving[i] == 0 && now - g_lastMoveAt[i] > 150 &&
                 !aimGlowAlive(i)) {
                 r->rePicked = TRUE;
@@ -2260,15 +2339,9 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
             }
         }
     }
-    // v38 HOPKILL - the hop fix (HANDOFF). Runs on the PERMANENT detour
-    // for EVERY event, deliberately NOT gated on g_pelogOn. Pawn match +
-    // window check first (a handful of compares); only inside an armed
-    // window do we pay for the name lookup. Exact DOT-SUFFIX match on the
-    // engine names from the v37 hw log: "KWGame.KWPawn.PlayFalling",
-    // "Engine.Pawn.PlayLandingAnimation". Swallowed = RETURN WITHOUT the
-    // trampoline: the animation player simply never runs, the state exit
-    // itself is untouched. Accepted cost: a REAL jump within 1.5s of a
-    // cast exit loses its falling/landing anim (cosmetic, rare).
+    // Legacy animation-only suppression (NoDip=0). The v49 floor handoff
+    // does not need this hook and never arms this window by default. Telemetry
+    // and the legacy swallow still share the hook while it is installed.
     if (func && !IsBadReadPtr(func, 8)) {
         DWORD nowS = GetTickCount();
         for (int p = 0; p < 8; p++) {
@@ -2302,10 +2375,12 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
                         // matters - it belongs to the running run (the state
                         // can only be in one cast at a time). It also covers
                         // the rare NATURAL exit: then no chain is needed at
-                        // all. Arm the swallow either way, because a landing
-                        // storm follows the exit either way.
+                        // all. Capture its floor handoff before EndState runs;
+                        // the next drive frame runs only after the state switch
+                        // and its ground BeginState have both completed.
                         CastRun *r = &g_run[p];
                         if (r->fireAt && !r->exitAt) {
+                            if (!r->chainAt) castGroundArm(p, self, r, nowS);
                             r->exitAt = nowS;
                             armHopKill(p);
                             logf_("    [cast] p%d run#%d state EXIT "
@@ -2982,6 +3057,9 @@ static void beginCast(int i, void *pawn)
           cls ? objName(cls, b, sizeof(b)) : "<NONE>");
     if (!cls) { logf_("    !! no spell class available - cast skipped"); return; }
 
+    castDropRun(i, "new aim");
+    g_beginCastAt[i] = GetTickCount(); // works even with pelog stopped
+    g_suppressLandUntil[i] = 0;
     if (g_offCurrentSpell > 0) *(void **)((BYTE *)pawn + g_offCurrentSpell) = cls;
 
     if (g_fnChoose) {
@@ -3405,6 +3483,7 @@ static void resolveFields(void)
     F.JumpZ          = propOffset("Engine.Pawn.JumpZ");
     F.AccelRate      = propOffset("Engine.Pawn.AccelRate");
     F.Base           = propOffset("Engine.Actor.Base");
+    F.Floor          = propOffset("Engine.Pawn.Floor");
     F.DesiredRotation= propOffset("Engine.Actor.DesiredRotation");
     F.RotationRate   = propOffset("Engine.Actor.RotationRate");
     resolveCanvasFields();
@@ -3417,6 +3496,9 @@ static void resolveFields(void)
           F.PawnController, F.ControllerPawn, F.GroundSpeed, F.JumpZ,
           F.AccelRate, F.Base, F.DesiredRotation, F.RotationRate,
           F.ok ? "OK" : "INCOMPLETE");
+    logf_("[fields] Floor=+0x%X (v49 native floor handoff %s)", F.Floor,
+          F.Floor > 0 && F.Base > 0 && g_execSetPhysics && g_opByteConst >= 0
+              ? "available" : "unavailable - engine gravity unchanged");
     // v41: the pawn's mesh COMPONENT carries its own rotation (UE2
     // Actor-derived object). A mesh yaw stuck away from the actor yaw is
     // the visible "standing in incorrect yaw". Resolved by name like every
@@ -3467,6 +3549,12 @@ static void invalidateLevelCaches(const char *reason)
         g_savedCtrl[k] = NULL; g_camDistCur[k] = 0.0f;
         g_savedGS[k] = 0; g_savedAR[k] = 0; g_pinned[k] = FALSE;
         g_aimFX[k] = NULL; g_aimFXAt[k] = 0;   // dies with the level anyway
+        memset(&g_run[k], 0, sizeof(g_run[k]));
+        g_castActor[k] = NULL;
+        g_beginCastAt[k] = g_castTickAt[k] = g_animEndAt[k] = 0;
+        g_suppressLandUntil[k] = g_hopkillT0[k] = 0;
+        g_lastAirAt[k] = g_lastMoveAt[k] = 0;
+        g_holdWalkUntil[k] = 0; g_holdArmed[k] = g_holdResync[k] = FALSE;
     }
     g_fnResolved = FALSE;      // UFunctions live in packages too
     g_defaultSpell = NULL;
@@ -4004,6 +4092,13 @@ static void driveePawn(int i, void *pawn)
         logf_("    jump launch: Walking->Falling vz=%.0f", g_jumpVz[i]);
     }
 
+    // Fresh gamepad/keyboard jump state must veto the handoff in this frame,
+    // not one frame later. A successful repair gets real walking ticks before
+    // idle can put the pawn in PHYS_None again.
+    BOOL castWalking = castGroundStep(i, pawn, now);
+    if (in.jump || keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2))
+        g_suppressLandUntil[i] = 0;
+
     // v42: airborne bookkeeping (single source of truth for the exit vetoes)
     {   BYTE phA = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
         if (phA == 2) g_lastAirAt[i] = now;
@@ -4213,8 +4308,9 @@ static void driveePawn(int i, void *pawn)
         // PHYS_None while standing still: AI accel is not integrated -> no shake.
         // Jump handler (after us this frame) will set PHYS_Falling.
         // v12: skip while a standing jump is mid-prep - it needs PHYS_Walking
-        // to survive one whole engine tick before launch.
-        if (phNow == 1 && F.Physics > 0 && g_jumpPh[i] == 0)
+        // to survive one whole engine tick before launch. v49: likewise leave
+        // Walking on until the post-cast floor handoff has been validated.
+        if (phNow == 1 && F.Physics > 0 && g_jumpPh[i] == 0 && !castWalking)
             *((BYTE *)pawn + F.Physics) = 0;
         if (g_lastPhys[i] == 2 && phNow != 2) {
             // landed from a jump: v12 calls ChangeAnimation only. PlayWaiting
@@ -4970,13 +5066,6 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
             }
         }
 
-        // (v48: the v35-v37 "rest height ring" is gone. It sampled standing
-        // heights to guess the floor and restore it at the exit, but the
-        // samples were taken in the mod's own PHYS_None standing state, i.e.
-        // they were the frozen standing height and not the floor, so the
-        // restore moved her 0.1 units at best. A cast now simply remembers
-        // the height she stood at when the spell left - see castRunStart.)
-
         // movement telemetry, so a headless run can prove the pawn responds
         // Time-based, not frame-based: at 60 fps a frame counter would write
         // several lines a second and bloat the log on real hardware.
@@ -5107,6 +5196,12 @@ static DWORD WINAPI initThread(LPVOID)
         g_engine, "?execDestroy@AActor@@QAEXAAUFFrame@@QAX@Z"));
     logf_("execSpawn = %p  execDestroy = %p",
           (void *)g_execSpawn, (void *)g_execDestroy);
+    g_execSetPhysics = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?execSetPhysics@AActor@@QAEXAAUFFrame@@QAX@Z"));
+    g_FindBase = (PFN_FindBase)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?FindBase@AActor@@QAEXXZ"));
+    logf_("execSetPhysics = %p  FindBase = %p (v49 floor handoff)",
+          (void *)g_execSetPhysics, (void *)g_FindBase);
     g_execDrawPortal = (PFN_execDrawPortal)
         resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_DRAWPORT));
     logf_("execDrawPortal = %p", (void *)g_execDrawPortal);
@@ -5170,8 +5265,8 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             // a cast leaves a weird stance on hardware, raise it (250/400)
             // to move
             // back toward the v38 timing - or lower it toward 40. The code
-            // fallback MUST equal the shipped ini default. (v48: the hop is
-            // now cancelled separately by NoDip - this knob moves WHEN the
+            // fallback MUST equal the shipped ini default. (v49: the floor
+            // handoff is separate via NoDip - this knob moves WHEN the
             // cast state ends, not how the landing looks.)
             int ca = GetPrivateProfileIntA("actions", "CastExitAdj", 90, ini);
             if (ca < 40) ca = 40;
@@ -5212,11 +5307,8 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
                                            ini);
             if (cd >= 400 && cd <= 2600) g_cleanupDelay = cd;
         }
-        {   // v48: cancel the exit micro-fall (the hop) instead of only
-            // swallowing its animation. 1 = on (default). If a cast ever
-            // leaves her hovering or glued on a step, set NoDip=0 to get
-            // the v47 behaviour back (fall + swallowed landing anim) and
-            // send me the log - the [nodip] lines say what it did.
+        {   // v49: native floor contact handoff. NoDip=0 keeps the legacy
+            // animation-only fallback; neither mode restores a saved height.
             g_noDip = GetPrivateProfileIntA("actions", "NoDip", 1, ini) != 0;
         }
         {   // v24/v26 isolation knobs for the aim glow.

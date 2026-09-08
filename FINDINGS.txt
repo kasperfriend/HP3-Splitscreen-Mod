@@ -1,6 +1,6 @@
 ===========================================================================
  HP3-SPLITSCREEN - REVERSE-ENGINEERING FINDINGS
- Accumulated while building the split-screen mod (v1 .. v48, 2026-08/09)
+ Accumulated while building the split-screen mod (v1 .. v49, 2026-08/09)
  Everything below was verified in the running game unless marked otherwise.
 ===========================================================================
 
@@ -191,7 +191,7 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       beginCast() stamps it for player casts too, so it delayed every
       ordinary cast. The pose and the facing therefore only came right
       on the casts that happened to hop.
-    * v48 (current) - three symptoms, three fixes, one owner:
+    * v48 - pose cleanup confirmed; the dip guard failed on hardware:
         - STUCK POSE: the cleanup kept its per-cast bookkeeping in
           function-local statics inside finishPendingCasts() that were
           only cleared when a cast's 4s watch expired. A cast that
@@ -206,15 +206,17 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
           re-cast. exit -> verify (EndState seen, or StateCasting.Tick
           stopped; else re-issue the exit up to twice, 700ms apart) ->
           settle -> done, all logged as [cast] run#N.
-        - HOP: cancelled at the source (castDipGuard). For 900ms after
-          the exit (longer while the fall keeps coming back, capped at
-          2s), any PHYS_Falling frame that is only the exit dip - small
-          downward velocity, still where the cast happened, nobody
-          jumping, within 24 units of the height she stood at - is put
-          back on that height with vz=0 and re-glued with PHYS_Walking
-          (the state the mod keeps her in while standing anyway). No
-          fall, no landing, no hop. The v38 swallow stays as a
-          backstop. NoDip=0 in the ini restores the old behaviour.
+        - HOP (failed attempt): castDipGuard restored the fire-time Z
+          and wrote Physics=Walking on small Falling frames near the
+          fire position. It did NOT re-establish Base/Floor through the
+          engine, and driveePawn immediately froze Walking back to None
+          while idle. The new hardware log disproves "no fall, no hop":
+          runs #1/#2/#5 have 12/13/15 cancellations, followed by a real
+          dip/landing; runs #4/#6/#8/#9 first fall on MOVEMENT, after
+          the guard or the whole run has already ended. Many resets
+          were Z 874.75 -> 874.75, vz 0 -> 0, yet the next walking tick
+          fired Falling + BaseChange again. Extending timers or the
+          60-unit radius would only keep the loop going longer.
         - POSE / YAW: the ChangeAnimation re-pick now runs once per
           cast, 450ms after a verified exit, the first moment the pawn
           stands still - and it stays armed for the rest of the run, so
@@ -222,13 +224,43 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
           Rotation and DesiredRotation are re-written to the view yaw
           at that same instant, so the animation the engine picks is
           the one facing the camera.
-    * The height to land her on is simply the height she was standing
-      at when the spell left (castRunStart). v35-v37 tried to derive a
-      "physics rest height" from a ring of standing samples; those
-      samples were taken in the mod's own PHYS_None standing state, so
-      they recorded the frozen standing height, not the floor, and the
-      pre-exit settle moved her 0.1 units at best ("already level" in
-      the v47 log, right before a 2.5-unit dip). The ring is gone.
+    * v49 (implemented; policy tested, NOT YET VERIFIED IN HP3):
+        - Preserve the working v48 exit call set, timing and one anim
+          re-pick. Remove castHoldFloor/castDipGuard entirely.
+        - Capture a ground-handoff candidate immediately BEFORE the
+          exit, not at fire (run #3 walked beyond the old fire radius).
+          After the chain and fresh input sampling, invoke the native
+          execSetPhysics(PHYS_Walking) with a discovered ByteConst token.
+          Native functions need an FFrame, not ProcessEvent parameters.
+          IntConst is NOT interchangeable with ByteConst: it writes four
+          bytes into a native byte parameter's one-byte storage.
+        - FindBase, when its C++ export is available, re-probes the
+          current collision support even if SetPhysics was a no-op.
+          Never restore Location, a saved Base pointer, or a guessed
+          Floor vector. Accept only a live Base and a walkable normal.
+        - Leave PHYS_Walking on through at least two subsequent drive
+          frames and 50ms of verification before idle may freeze it.
+          A second fall is a FAILED handoff, not another opportunity to
+          pin physics. Missing support releases to Falling; jumps and
+          special/airborne movement veto the handoff. The whole attempt
+          is bounded to 250ms, not extended until the player walks.
+        - No default animation swallowing. NoDip=0 is the legacy
+          animation-only diagnostic fallback; it does not restore Z.
+        - beginCast now drops the old run and stamps ownership itself:
+          ALL the supplied v48 fires logged begin=0 because event
+          harvesting was gated by an existing run's interest window,
+          and pelogStop actually uninstalls the purportedly permanent
+          hook. Recovery must not depend on diagnostic logging being on.
+          Runs also bind to the exact pawn and are reset on level change.
+        - [castground] logs native Base/Floor before/after and whether
+          Walking survived validation. The v48 log did NOT include these
+          field values: lost contact is the working explanation, not a
+          hardware-verified measurement of the specific field at fault.
+    * Frozen standing Z is not evidence of floor support. Both the old
+      standing-sample ring (v35-v37) and the fire-time Z (v48) sampled
+      the mod's own PHYS_None pose, not a collision query. Restoring that
+      number cannot establish a valid walking base. Neither remains in
+      the post-cast recovery path.
     * The aim glow (the game's own cursor actor) is the only reliable
       live signal of the AIM phase: StateCasting does not Tick during
       aiming on either platform, so an in-progress aim is invisible to
