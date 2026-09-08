@@ -56,30 +56,15 @@ static int   g_cleanupChain = 0;      // v25 hop bisect: 0=full(v23 chain, hw
                                       // pose-PROVEN) 1=noanimend(v24, hw HANG)
                                       // 2=min 3=exitanim(exit+AnimEnd only)
 static int   g_cleanupDelay = 1200;   // v25: ms after release before the chain
-static int   g_cleanupSplit = 0;      // v33: back to 0 (v30 behavior). The v31
-                                      // hw pelog caught the stuck loop:
-                                      // StateCasting.Tick calls ChangeAnimation
-                                      // EVERY frame after release. New plan:
-                                      // v32 hw verdict: the state REFUSED to
-                                      // self-exit (safety net fired every cast),
-                                      // the window just held the cast pose LONGER
-                                      // and added a second small hop. v30's
-                                      // immediate exit stays the best behavior
-                                      // until the state's wait-condition is
-                                      // found (O-key property diff).
-                                      // v28/v29 hw verdict: the split made it
-                                      // WORSE - anim snap at A (blend start),
-                                      // dip+snap at B (exit), and the pose
-                                      // still stuck. The single-pass full
-                                      // chain (v23/v27) is the best hw state:
-                                      // pose exits, one hop. Keep the v29
-                                      // race fix (chain fires on schedule).
-static BOOL  g_hopGuard  = FALSE;     // v27: OFF - v26 hw proved the re-exit
-                                      // during the Falling dip does NOT stop
-                                      // the visible hop, and v26-full (guards
-                                      // on) HUNG where v23-full exited.
-static BOOL  g_reAssert  = FALSE;     // v27: OFF - same hw data point; the
-                                      // extra exit pair is hang-suspect #1.
+                                      // v28/v29/v32/v33 hw verdict, condensed:
+                                      // the state REFUSES to self-exit, the
+                                      // split chain made it WORSE (snap at A,
+                                      // dip+snap at B, pose still stuck), and
+                                      // waiting for a self-exit only held the
+                                      // pose longer. The single-pass full
+                                      // chain (v23/v27) is the best hw state.
+                                      // v48 keeps that call set verbatim and
+                                      // only fixes WHEN it runs (see below).
 static BOOL  g_bodyClear = TRUE;      // v27 isolation knob (v24 delta)
 static BOOL  g_panePark  = TRUE;      // v27 isolation knob (v25/v26 delta)
                                       // A/B for hardware)
@@ -143,8 +128,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v47"
-#define MOD_STAMP   "build v47 - 2026-09-02 - EVENT-DRIVEN REALIGN: the v46 Wine runs caught the polling re-pick STILL straddling casts (a skipped chain + pending overwrites left stale per-cast state; one realign fired during the next cast's aim). v47 rebuilds it event-driven: the detour sees the state's own StateCasting.EndState (the actual exit) and only ARMS a need; driveePawn executes it next frames - and only while every guard holds AT EXECUTION TIME: standing + 300ms stand-still, no aim glow (aims do not tick StateCasting), casting state quiet, same-cast binding (no newer fire), no post-exit BeginState, 1.2s..6s after the exit. No per-cast clocks anywhere in the path"
+#define MOD_BUILD  "v48"
+#define MOD_STAMP   "build v48 - 2026-09-08 - CLEAN CAST EXIT: three symptoms, one cause. (1) STUCK POSE: the post-cast cleanup kept its per-cast state in statics that were only cleared when a cast's 4s watch expired, so casting again within 4s inherited <chain already fired> and got NO exit at all - the pose sat there until a later retry happened by luck. Now every cast gets its own run (one struct, reset at every fire, abandoned the moment a newer cast owns the pawn). (2) HOP: the exit re-enables physics and she free-falls the fraction of a unit the cast pose held her above the floor (~2.5u in ~130ms); v38 only swallowed the landing ANIMATION, so the dip stayed - and that swallow also removed the engine's landing anim, the very thing that used to re-settle pose and facing, which is why a hop that slipped through fixed both. Now the dip is cancelled at the source: for 900ms after the exit, a Falling frame that is only the exit dip is put back on her own standing height and re-glued with PHYS_Walking. (3) WRONG POSE/YAW: the anim re-pick that settles both was gated behind six conditions (v47) and expired on almost every cast; it now runs once per cast, 450ms after a verified exit, the first moment she stands still - and stays armed for the rest of the run so a walk-away still gets it. Look for [cast] run#N lines: fired / exit chain / state LEFT / anim re-pick / done. NoDip=0 in the ini disables the dip cancel."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1501,57 +1486,65 @@ static void *spellClassFor(void *pawn)
 // the caster -- the "bright red light stuck under player 2". The game normally
 // ends the cast from its own state machine, which companions do not run while
 // we are driving them, so we close it ourselves a beat later.
-static DWORD g_castPending[8] = {0};
-static float g_restZ[8]  = {0};        // v35: last healthy standing height
-static float g_restXY[8][2];           // v35: where that height was sampled
-static float g_restRing[8][8][3];      // v36 [player][slot] x,y,z samples
-static BYTE   g_restRingPost[8][8];    // v37: slot sampled AFTER a cast
-                                       // settled = the TRUE physics-rest Z
-                                       // (standing-idle Z reads ~0.25 high;
-                                       // the v36 hw "already level" cast
-                                       // STILL fell 2.25u and bounced)
-static int    g_restRingN[8];           // v36: fills per healthy frame, wraps
-static BOOL   g_postPush[8];            // v37: post-exit sample latch/cast
-// v38 HOPKILL: per-pawn suppress window. Armed every time OUR cleanup chain
-// fires for that pawn (single-pass exit / phase B / retry / flap-retry /
-// rescue); the PERMANENT pelogDetour then swallows the engine's
+// ===========================================================================
+// v48: ONE RECOVERY RUN PER CAST.
+//
+// Every post-cast fix used to live in function-local statics inside
+// finishPendingCasts() that were only cleared when a cast's 4s watch window
+// expired. A cast that began before the previous one's window ended therefore
+// inherited "chain already fired / already verified" and got NO exit at all:
+// the pawn sat in the cast pose until some later retry happened to fire. That
+// is the "stuck in the casting pose from time to time" report, and it is easy
+// to hit - just cast again within four seconds (v47 hw log, second cast of
+// the first window: no [castclean] line at all, pose parked for 3 seconds
+// until a stale retry rescued it).
+//
+// The rules now:
+//   * a run is created the moment the spell leaves the caster;
+//   * it is abandoned the instant a newer cast owns the pawn (the cast-begin
+//     stamp moves) - the newer cast gets its own run and its own exit;
+//   * every step is bound to that run, so nothing can ever act on another
+//     cast's timebase.
+// One struct, one place, reset on every cast.
+// ===========================================================================
+typedef struct {
+    int   id;         // serial, so log lines group per cast
+    DWORD fireAt;     // tick the spell left the caster (0 = no run)
+    DWORD beginAt;    // cast-begin stamp this run belongs to
+    DWORD chainAt;    // tick our exit chain fired (0 = not yet)
+    DWORD exitAt;     // tick the state actually left (EndState / Tick stopped)
+    DWORD lastTryAt;  // tick of the last exit we issued
+    int   retries;    // extra exits issued after the chain (max 2)
+    int   dips;       // exit micro-falls cancelled (the hop fix)
+    DWORD lastDipAt;  // tick of the last cancelled dip
+    float holdZ;      // standing height when the spell left - the floor ref
+    float holdXY[2];  // where that height was measured
+    BYTE  phys0;      // physics at fire (2 = airborne: hands off the floor)
+    BOOL  rePicked;   // anim re-pick done (this settles the pose + facing)
+} CastRun;
+static CastRun g_run[8];
+static int     g_runSeq = 0;
+
+// v38 HOPKILL: per-pawn suppress window. Armed every time an exit runs for
+// that pawn; the PERMANENT ProcessEvent detour then swallows the engine's
 // PlayFalling + PlayLandingAnimation storm for this pawn until the stamp
-// expires. The v37 hw log proved the storm IS the visible hop
-// (BaseChange -> PlayFalling +15ms -> landing x4 in 31ms; height acquitted:
-// "already level" casts still fell). Window 1500ms covers
-// exit(+0) -> PlayFalling(+15) -> landing storm(+100..300) with margin.
+// expires. The v37 hw log proved the storm IS the visible hop (height was
+// acquitted: "already level" casts still fell). v48: the dip guard below
+// removes the fall itself, so this swallow is now the backstop for the frames
+// where a fall still gets through (retries, uneven ground, jumps).
 static DWORD g_suppressLandUntil[8] = {0}; // GetTickCount()+1500 at arm
 static DWORD g_hopkillT0[8]         = {0}; // log base: the chain-fire moment
 // v39 state telemetry, harvested from the SAME permanent detour (the state
-// pointer lives in a heap frame - pawn scan useless on hw - but the state's
-// own script events are all visible here; this is the InState()-style API
-// the handoff called the future one):
+// pointer lives in a heap frame - a pawn scan is useless on hw - but the
+// state's own script events are all visible there):
 static DWORD g_animEndAt[8]   = {0}; // first post-release StateCasting.AnimEnd
-static BOOL  g_settleAlign[8] = {0}; // v40: one anim re-pick per cast
-static DWORD g_chainAbsAt[8]  = {0}; // v46: ABSOLUTE tick of the last exit
-                                     // attempt (stamped in armHopKill); the
-                                     // re-pick runs on this, never on the
-                                     // pending clock a re-cast resets
-static DWORD g_chainFireAt[8] = {0}; // v46: the pending stamp this exit
-                                     // belongs to; a newer fire vetoes
-static BOOL  g_realignNeed[8] = {0}; // v47: ARMED by the detour when it sees
-                                     // OUR StateCasting.EndState; executed by
-                                     // driveePawn when every guard holds
-static DWORD g_ownCastAt[8] = {0};  // v47: tick of the mod's OWN beginCast()
-                                     // (the cleanup chain re-cast). The
-                                     // settle re-sync must never run during
-                                     // one of OUR casts - this clock is
-                                     // written by the caller itself, so it
-                                     // needs no engine telemetry at all.
-static DWORD g_needAt[8]    = {0};  // v47: ARM-TIME binding of the need - the
-static DWORD g_needBegin[8] = {0};  // need belongs to ONE exit; chainAbs can
-static DWORD g_needBind[8]  = {0};  // be re-stamped by a later chain, so the
-                                     // executor compares against THESE, never
-                                     // against the live clocks.
 static DWORD g_lastMoveAt[8]  = {0}; // v46: last tick with movement input
 static int   g_castExitAdj    = 90;  // v40: AnimEnd->exit gap (ini CastExitAdj)
+static int   g_noDip          = 1;   // v48: cancel the exit micro-fall (NoDip)
 static int   g_meshOff        = -2;  // v41: Engine.Actor.Mesh property offset
 static int   g_viewYaw[8]     = {0}; // (moved up from driveePawn for v41)
+static BOOL  g_jumpStanding[8] = {0}; // v12: a standing jump is in flight
+static int   g_jumpPh[8]       = {0}; // v12: 0 none, 1 walk-prep, 2 airborne
 static DWORD g_lastAirAt[8]   = {0}; // v42: last tick the pawn was airborne
                                      // (phys==2); forced exits need a 1.2s
                                      // clearance after the last air frame
@@ -1575,19 +1568,19 @@ static int meshYawDelta(void *pawn, int actorYaw)
     return d;
 }
 static DWORD g_castTickAt[8]  = {0}; // last StateCasting.Tick seen (alive = stuck)
-static DWORD g_beginCastAt[8] = {0}; // last StateCasting.BeginState (fresh cast)
+static DWORD g_beginCastAt[8] = {0}; // last cast begin (StateCasting.BeginState
+                                     // OR the 100%-reliable HPCharacter.
+                                     // StartCasting - Wine only logs
+                                     // BeginState ~50% of the time)
 static void armHopKill(int i)
 {
     if (i < 0 || i >= 8) return;
     DWORD now = GetTickCount();
     g_suppressLandUntil[i] = now + 1500;
     g_hopkillT0[i]         = now;
-    g_chainAbsAt[i]        = now;   // v46: re-pick + late re-sync base
-    g_chainFireAt[i]       = g_castPending[i];   // v46: exit<-cast binding
 }
 static void *g_castActor[8]   = {NULL};
 static float g_castSpawnLoc[8][3];
-static BYTE  g_castPhys0[8]   = {0};    // v20: phys at fire time (blip guard)
 static BOOL  g_castLoggedFly[8] = {0};
 extern volatile LONG g_p2Moving[8];   // set per frame by driveePawn (below)
 static BOOL aimGlowAlive(int i);      // fwd: glow actor alive == aiming now
@@ -1597,701 +1590,348 @@ static DWORD g_aimFXAt[8] = {0};      // v29: glow spawn tick (race fix:
                                       // next aim and must not)
 static float g_aimLast[8][3];         // v26: real aim point (pane restore)
 
-// v35: PRE-EXIT FLOOR SETTLE - the hop, decoded from the v34 hw log:
-//   frozen in cast at Z=874.8 (phys=0, cast pose holds her ~1 unit up)
-//   -> exit re-engages physics -> she FALLS to 873.8 in one frame
-//   -> floor snaps her back up to 874.5. That dip-and-bounce IS the
-//   visible hop. Restoring her last healthy standing height BEFORE the
-//   exit makes the floor check pass on frame one: no fall, no snap.
-//   A bounded Location write (the one class hardware honors), once per
-//   cast - physics itself is never touched (v21 lesson).
-static void settleBeforeExit(int i, void *pawn)
+// ---------------------------------------------------------------------------
+// v48: the cast floor hold. The cast pose freezes the pawn a fraction of a
+// unit above the floor; when the state exit re-enables physics she free-falls
+// that gap and the engine catches her with a landing - that dip is the hop
+// (v47 hw log: 874.75 -> 872.3 -> 874.5, ~130ms). Landing her back on the
+// height she was standing at when the spell left leaves nothing to fall.
+// (v35..v37 tried to guess that height from a ring of standing samples; the
+// samples were taken in the mod's own PHYS_None standing state, so they were
+// the frozen cast height, not the floor - the settle wrote 0.1 units at best.
+// The height at the moment of the cast IS a height she was standing on.)
+// ---------------------------------------------------------------------------
+static void castHoldFloor(int i, void *pawn, CastRun *r)
 {
-    if (i < 0 || i >= 8 || !pawn) return;
-    if (F.Location <= 0 || IsBadWritePtr((BYTE *)pawn + F.Location, 12))
+    if (i < 0 || i >= 8 || !pawn || !r->fireAt) return;
+    if (r->phys0 == 2 || r->holdZ == 0.0f) return;   // airborne cast: hands off
+    if (F.Location <= 0 || IsBadWritePtr((BYTE *)pawn + F.Location, 12) ||
+        IsBadReadPtr(pawn, F.Location + 12))
         return;
     float *pl = (float *)((BYTE *)pawn + F.Location);
-    // v36: pick the NEAREST standing sample (ring of last 8) - the v35
-    // single-sample version silently skipped on hardware because the
-    // user walks stairs/ramps and the last sample went stale or out of
-    // range (zero [settle] lines in the whole hw log).
-    int   best = -1, bestPost = -1;
-    float bestD = 1e30f, bestPostD = 1e30f;
-    if (g_restRingN[i] > 0) {
-        for (int k = 0; k < 8; k++) {
-            int slot = (g_restRingN[i] - 1 - k + 64) % 8;
-            float dx = pl[0] - g_restRing[i][slot][0];
-            float dy = pl[1] - g_restRing[i][slot][1];
-            float d2 = dx*dx + dy*dy;
-            if (d2 < bestD) { bestD = d2; best = slot; }
-            if (g_restRingPost[i][slot] && d2 < bestPostD)
-                { bestPostD = d2; bestPost = slot; }
-        }
-    }
-    // v37: a post-exit sample IS the physics-rest height at that spot -
-    // prefer it (the engine itself settled there after the last cast).
-    BOOL bestIsPost = FALSE;                 // v38: damper flag
-    if (bestPost >= 0 && bestPostD <= 450.0f*450.0f) {
-        best  = bestPost;
-        bestD = bestPostD;
-        bestIsPost = TRUE;
-    }
-    if (best < 0) {
-        logf_("    [settle] p%d skip: no standing samples yet "
-              "(exitZ=%.2f)", i, pl[2]);
-        return;
-    }
-    if (bestD > 450.0f*450.0f) {
-        logf_("    [settle] p%d skip: nearest sample %.0f units away "
-              "(exitZ=%.2f)", i, sqrtf(bestD), pl[2]);
-        return;
-    }
-    // v38 damper (HANDOFF item 2): at exit sit a hair (0.1u) BELOW the
-    // physics-rest sample so the state exit's forced Falling frame
-    // re-glues to the floor almost instantly (smaller raw oscillation).
-    // Suppression ([hopkill]) is the primary fix; this only shrinks the
-    // raw dip that remains visible before/around the swallowed frames.
-    float targetZ = g_restRing[i][best][2];
-    if (bestIsPost) targetZ -= 0.1f;
+    float dx = pl[0] - r->holdXY[0], dy = pl[1] - r->holdXY[1];
+    if (dx * dx + dy * dy > 80.0f * 80.0f) return;   // she moved: no reference
+    float dz = pl[2] - r->holdZ;
+    if (dz < -6.0f || dz > 6.0f) return;             // not this cast's floor
+    if (fabsf(dz) < 0.05f) return;                   // already there
     float oldZ = pl[2];
-    float dz = oldZ - targetZ;
-    if (dz < -4.0f || dz > 4.0f) {
-        logf_("    [settle] p%d skip: dz=%.2f out of sanity range "
-              "(sample %.2f vs now %.2f)", i, dz,
-              g_restRing[i][best][2], oldZ);
-        return;   // v45: need-flag stays TRUE -> re-pick will cover it
-    }
-    if (fabsf(dz) < 0.05f) {
-        logf_("    [settle] p%d already level (%.2f)", i, oldZ);
-        return;
-    }
-    pl[2] = targetZ;
-    logf_("    [settle] p%d Z %.2f -> %.2f (pre-exit floor settle%s, "
-          "%.2f to drop, sample %.0fu away)", i, oldZ, pl[2],
-          bestIsPost ? ", damper -0.1" : "", dz,
-          sqrtf(bestD));
+    pl[2] = r->holdZ;
+    if (F.Velocity > 0 && !IsBadWritePtr((BYTE *)pawn + F.Velocity, 12))
+        ((float *)((BYTE *)pawn + F.Velocity))[2] = 0.0f;
+    logf_("    [cast] p%d run#%d floor hold Z %.2f -> %.2f (%.2f to drop)",
+          i, r->id, oldZ, pl[2], dz);
 }
 
-// v34: the chain fired but the state did not leave (v33 hw log: stuck
-// with chain=full delay=1200 present). Same chain, different boots,
-// different outcomes - the exit lands on varying anim/state phases. Fix:
-// READ the pawn's current-state pointer and retry the exit until it
-// actually leaves StateCasting (verification, not blind extra exits -
-// v26 proved blind extra exits hang). Discovery: find the StateCasting
-// state object, scan the pawn for a pointer to it (also try the ground
-// state; states may live in a heap frame instead - then we fall back).
-static void *s_stateCasting = NULL;
-static void *s_stateGround  = NULL;
-static int   s_stateOff     = -2;   // -2 undiscovered, -1 not found
-
-static void discoverStateField(void *pawn)
+// ---------------------------------------------------------------------------
+// v48: THE HOP, removed at the source. Swallowing PlayFalling /
+// PlayLandingAnimation (v38) hid the hop's animation but not the dip, and it
+// also removed the engine's own landing animation - the thing that used to
+// re-settle the pose and the facing. That is why a hop that slipped through
+// the swallow "fixed" both symptoms: the landing re-picked the animation.
+// So now the fall is cancelled instead: for a short window after the exit,
+// any PHYS_Falling frame that is only the exit dip (small downward velocity,
+// still where the cast happened, nobody jumping) is put straight back on the
+// standing height and re-glued with PHYS_Walking - the state the mod keeps
+// her in while standing anyway. No fall, no landing, no hop, and the anim
+// re-pick below does the settling that the landing used to do.
+// ---------------------------------------------------------------------------
+static void castDipGuard(int i, void *pawn, CastRun *r, DWORD now)
 {
-    if (s_stateOff != -2 || !pawn) return;
-    s_stateCasting = findObjectByPath("hgame.HPCharacter.StateCasting");
-    s_stateGround  = findObjectByPath("KWGame.KWPawn.StateGroundMovement");
-    if (!s_stateCasting && !s_stateGround) {
-        s_stateOff = -1;
-        logf_("[castverify] state objects not found - verify off");
-        return;
+    if (!g_noDip || !r->exitAt || r->phys0 == 2 || r->holdZ == 0.0f) return;
+    // The exit moment only - plus a little longer while the fall keeps coming
+    // back (a step or a slope that refuses the re-glue), capped at 2s.
+    if (now - r->exitAt > 900) {
+        if (!r->dips || now - r->lastDipAt > 400) return;
+        if (now - r->exitAt > 2000) return;
     }
-    for (int pass = 0; pass < 2 && s_stateOff < 0; pass++) {
-        void *want = pass ? s_stateGround : s_stateCasting;
-        if (!want) continue;
-        for (int off = 0x40; off < 0x1800; off += 4) {
-            if (IsBadReadPtr((BYTE *)pawn + off, 4)) break;
-            if (*(void **)((BYTE *)pawn + off) == want) {
-                s_stateOff = off;
-                logf_("[castverify] state field at +%#x (%s now)",
-                      off, pass ? "ground" : "StateCasting");
-                return;
-            }
+    if (F.Physics <= 0 || F.Location <= 0 || F.Velocity <= 0) return;
+    if (IsBadReadPtr(pawn, F.Location + 12) ||
+        IsBadWritePtr((BYTE *)pawn + F.Location, 12)) return;
+    if (IsBadReadPtr(pawn, F.Velocity + 12) ||
+        IsBadWritePtr((BYTE *)pawn + F.Velocity, 12)) return;
+    if (IsBadWritePtr((BYTE *)pawn + F.Physics, 1)) return;
+    if (keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) || g_padJump[i]) return;
+    if (g_jumpStanding[i] || g_jumpPh[i]) return;    // never inside a jump
+    if (*((BYTE *)pawn + F.Physics) != 2) return;    // not falling: nothing to do
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    float *pv = (float *)((BYTE *)pawn + F.Velocity);
+    if (pv[2] < -300.0f) return;                     // a real fall, not the dip
+    float dx = pl[0] - r->holdXY[0], dy = pl[1] - r->holdXY[1];
+    if (dx * dx + dy * dy > 60.0f * 60.0f) return;   // she moved: no reference
+    float dz = pl[2] - r->holdZ;
+    if (dz > 1.0f || dz < -24.0f) return;            // out of the dip band
+    float oldZ = pl[2], oldVz = pv[2];
+    pl[2]  = r->holdZ;
+    pv[2]  = 0.0f;
+    *((BYTE *)pawn + F.Physics) = 1;                 // PHYS_Walking: re-glue
+    r->dips++;
+    r->lastDipAt = now;
+    if (r->dips <= 3)
+        logf_("    [nodip] p%d run#%d exit dip cancelled #%d: Z %.2f -> %.2f "
+              "vz %.0f -> 0 (exit+%lums)", i, r->id, r->dips, oldZ, pl[2],
+              oldVz, (unsigned long)(now - r->exitAt));
+}
+
+// ---------------------------------------------------------------------------
+// v48: the whole post-cast recovery, in one place, one run per cast.
+//
+//   FIRE    the spell leaves; the pawn is parked in StateCasting (frozen).
+//   EXIT    at AnimEnd+CastExitAdj (fallback CleanupDelay) run the proven
+//           exit chain: floor hold, GotoDefaultGroundMovementState,
+//           blendOutCast, StopCasting, SwitchToNormalStanceAnims, AnimEnd.
+//   VERIFY  StateCasting.EndState seen, or its Tick stopped = the state is
+//           gone. While it is still alive, re-issue the exit (max 2, 700ms
+//           apart): a skipped exit is what parks the cast pose on screen.
+//   SETTLE  cancel the exit micro-fall (the hop, see castDipGuard), then - as
+//           soon as the pawn stands still - re-pick the animation ONCE. That
+//           re-pick settles the pose and the facing; the engine used to do it
+//           inside the landing animation, which is exactly why a hop "fixed"
+//           both. It stays armed for the rest of the run, so a player who
+//           walks away and stops later still gets it.
+//   DONE    4s after the fire, or the moment a newer cast takes the pawn.
+// ---------------------------------------------------------------------------
+#define CAST_WATCH_MS  4000     // how long a run stays alive after the fire
+#define CAST_EXIT_MAX  1600     // hard ceiling on the scheduled exit delay
+
+// A new cast begins its own run. Called from fireCast(), the one place where
+// we know a spell actually left the caster (SpawnSpell returned a live actor).
+static void castRunStart(int i, void *pawn)
+{
+    CastRun *r = &g_run[i];
+    if (r->fireAt)      // a cast fired before the previous one finished
+        logf_("    [cast] p%d run#%d dropped (new cast fired over it, "
+              "age=%lums, %s)", i, r->id,
+              (unsigned long)(GetTickCount() - r->fireAt),
+              r->exitAt ? "it had exited" : "IT HAD NOT EXITED YET");
+    memset(r, 0, sizeof(*r));
+    r->id      = ++g_runSeq;
+    r->fireAt  = GetTickCount();
+    r->beginAt = g_beginCastAt[i];
+    if (pawn && F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
+        float *pl = (float *)((BYTE *)pawn + F.Location);
+        r->holdZ     = pl[2];
+        r->holdXY[0] = pl[0];
+        r->holdXY[1] = pl[1];
+    }
+    r->phys0 = (F.Physics > 0 && !IsBadReadPtr(pawn, F.Physics))
+             ? *((BYTE *)pawn + F.Physics) : 0;
+    logf_("    [cast] p%d run#%d fired (Z=%.2f phys=%d begin=%lu)",
+          i, r->id, r->holdZ, (unsigned)r->phys0,
+          (unsigned long)r->beginAt);
+}
+
+static void castDropRun(int i, const char *why)
+{
+    CastRun *r = &g_run[i];
+    if (!r->fireAt) return;
+    logf_("    [cast] p%d run#%d done (%s, age=%lums, chain=%d exit=%d "
+          "retry=%d dip=%d repick=%d)",
+          i, r->id, why, (unsigned long)(GetTickCount() - r->fireAt),
+          r->chainAt ? 1 : 0, r->exitAt ? 1 : 0,
+          r->retries, r->dips, r->rePicked ? 1 : 0);
+    memset(r, 0, sizeof(*r));
+    g_castActor[i]   = NULL;
+}
+
+// The exit chain. The call set is the hardware-proven v23/v30 full chain
+// (every reduction ever tried hung the pose); only the per-cast floor hold in
+// front of it is new.
+static void castExitChain(int i, void *pawn, CastRun *r, const char *tag)
+{
+    BYTE p[8]; memset(p, 0, sizeof(p));
+    castHoldFloor(i, pawn, r);          // land her on her own standing height
+    armHopKill(i);                      // v38: swallow the landing storm
+    if (!g_cleanupLight && g_fnGotoGround)
+        callFn(pawn, g_fnGotoGround, "GotoDefaultGroundMovementState()");
+    if (!g_cleanupLight && g_fnBlendOut && g_cleanupChain != 3)
+        callFnP(pawn, g_fnBlendOut, p, 4, "blendOutCast()");
+    if (g_fnStopCast && g_cleanupChain != 3)
+        callFnP(pawn, g_fnStopCast, p, 4, "StopCasting()");
+    if (g_fnSwitchNormal && g_cleanupChain == 0)
+        callFnP(pawn, g_fnSwitchNormal, p, 4, "SwitchToNormalStanceAnims()");
+    if (g_fnAnimEnd && (g_cleanupChain == 0 || g_cleanupChain == 3))
+        callFn(pawn, g_fnAnimEnd, "AnimEnd");
+    logf_("    [cast] p%d run#%d exit chain (%s, fire+%lums)", i, r->id, tag,
+          (unsigned long)(GetTickCount() - r->fireAt));
+}
+
+// When does this cast's exit run? Right after the cast animation's own end
+// (AnimEnd + CastExitAdj) when we saw one - that timing is what removed the
+// pose snap - otherwise the configured delay. Bounded both ways so a missing
+// AnimEnd (Wine never emits one, v39) or a very late one can never push the
+// exit out of reach.
+static DWORD castExitDelay(int i, CastRun *r)
+{
+    DWORD d = (DWORD)g_cleanupDelay;
+    if (g_animEndAt[i] > r->fireAt && g_animEndAt[i] - r->fireAt < 6000) {
+        DWORD endAge = (g_animEndAt[i] - r->fireAt) + (DWORD)g_castExitAdj;
+        if (endAge >= 400 && endAge < d) d = endAge;
+    }
+    if (d < 450)            d = 450;
+    if (d > CAST_EXIT_MAX)  d = CAST_EXIT_MAX;
+    return d;
+}
+
+// Telemetry only: the raw values a hardware log is judged by. Grouped here so
+// the state machine above stays readable.
+static void castTelemetry(int i, void *pawn, DWORD age, DWORD now)
+{
+    // [castwatch]: the caster's own physics through the whole window. This is
+    // the ground truth for the hop - it is how the ~2.5 unit dip was found.
+    if (age < 3000 && F.Location > 0 && !IsBadReadPtr(pawn, F.Location + 12)) {
+        static DWORD sWAt[8] = { 0 };
+        if (now - sWAt[i] >= 100) {
+            sWAt[i] = now;
+            float *wl = (float *)((BYTE *)pawn + F.Location);
+            float wv = (F.Velocity > 0 && !IsBadReadPtr(pawn, F.Velocity + 12))
+                     ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
+            BYTE wph = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+            logf_("  [castwatch] p%d +%lums loc=(%.0f %.0f Z=%.1f) "
+                  "vz=%.0f phys=%d", i, (unsigned long)age,
+                  wl[0], wl[1], wl[2], wv, wph);
         }
     }
-    s_stateOff = -1;
-    logf_("[castverify] state pointer not in pawn memory - verify off "
-          "(state lives in a heap frame; next step would be InState())");
+    // Prove the projectile actually left the caster.
+    void *sa = g_castActor[i];
+    if (sa && !g_castLoggedFly[i] && age >= 400 && F.Location > 0 &&
+        !IsBadReadPtr(sa, F.Location + 12)) {
+        float *sl = (float *)((BYTE *)sa + F.Location);
+        float dx = sl[0] - g_castSpawnLoc[i][0];
+        float dy = sl[1] - g_castSpawnLoc[i][1];
+        float dz = sl[2] - g_castSpawnLoc[i][2];
+        logf_("    [spell] p%d actor flew %.0f units in %lums "
+              "(now=(%.0f %.0f %.0f))", i,
+              sqrtf(dx * dx + dy * dy + dz * dz), (unsigned long)age,
+              sl[0], sl[1], sl[2]);
+        g_castLoggedFly[i] = TRUE;
+    }
+    // [yawwatch]: the actor's yaw against the view it should be facing.
+    if (age >= 200 && age <= 3400 && F.Rotation > 0 &&
+        !IsBadReadPtr(pawn, F.Rotation + 12)) {
+        static DWORD sLastYawLog[8] = { 0 };
+        if (now - sLastYawLog[i] >= 120) {
+            sLastYawLog[i] = now;
+            int ay = *(int *)((BYTE *)pawn + F.Rotation + 4);
+            int md = meshYawDelta(pawn, ay);
+            logf_("  [yawwatch] p%d +%lums actor=%d view=%d mesh=%d delta=%d",
+                  i, (unsigned long)age, ay & 65535, g_viewYaw[i] & 65535,
+                  (ay + md) & 65535, md);
+        }
+    }
 }
 
 static void finishPendingCasts(void)
 {
     DWORD now = GetTickCount();
     for (int i = 1; i < 8; i++) {
-        if (!g_castPending[i]) continue;
+        CastRun *r = &g_run[i];
+        if (!r->fireAt) continue;
         void *pawn = g_pawn[i];
-        DWORD age = now - g_castPending[i];
+        DWORD age  = now - r->fireAt;
 
-        // v20: watch the caster for ~1.6s after every cast - the v19
-        // hardware report was "she plays a slight jump animation, as if she
-        // falls through the ground for a second", and the hw log carried a
-        // phys=2 (Falling) blip with vz=-31 right at the +1.2s cleanup
-        // moment. Sample every 100ms so the next hardware log shows the
-        // whole story even at 2s telemetry granularity.
-        if (pawn && F.Location > 0 && age < 3000 &&
-            !IsBadReadPtr(pawn, F.Location + 12)) {
-            static DWORD sWAt[8] = { 0 };
-            // v20 continuous Falling-blip guard: any moment in the 1.6s
-            // window where she goes Falling with a small downward vz while
-            // nobody is jumping (and she was NOT Falling when the spell
-            // left) gets put straight back - covers both the cast script's
-            // own state exit and the +1.2s cleanup chain.
-            BYTE cgPh = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
-            BOOL jumping = keyDown(g_pk[i].jump) || keyDown(g_pk[i].jump2) ||
-                           g_padJump[i];
-            // v22: no phys intervention here (see the guard-removal note in
-            // the cleanup chain) - the watch below only RECORDS.
-            (void)cgPh; (void)jumping;
-            if (now - sWAt[i] >= 100) {
-                sWAt[i] = now;
-                float *wl = (float *)((BYTE *)pawn + F.Location);
-                float wv = (F.Velocity > 0 &&
-                            !IsBadReadPtr(pawn, F.Velocity + 12))
-                         ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
-                BYTE wph = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
-                logf_("  [castwatch] p%d +%lums loc=(%.0f %.0f Z=%.1f) "
-                      "vz=%.0f phys=%d", i, (unsigned long)age,
-                      wl[0], wl[1], wl[2], wv, wph);
-            }
+        // Ownership first: a newer cast owns the pawn from its aim onwards and
+        // gets its own run, so nothing here can ever cancel a pending exit
+        // (v29's rapid-cast race, re-found in v47 as the stuck-pose cause).
+        if (g_beginCastAt[i] > r->beginAt) { castDropRun(i, "superseded"); continue; }
+        if (!pawn || IsBadReadPtr(pawn, 0x200)) { castDropRun(i, "pawn gone"); continue; }
+
+        castTelemetry(i, pawn, age, now);
+
+        // ---- 1. EXIT ------------------------------------------------------
+        if (!r->chainAt && !r->exitAt) {
+            // v29: only THIS cast's own aim glow may delay the exit - a newer
+            // one belongs to the next cast (and superseded us already).
+            if (aimGlowAlive(i) && g_aimFXAt[i] && g_aimFXAt[i] < r->fireAt)
+                continue;
+            if (now - g_lastAirAt[i] < 1200) continue;   // never force mid-air
+            if (age < castExitDelay(i, r)) continue;
+            r->chainAt   = now;
+            r->lastTryAt = now;
+            castExitChain(i, pawn, r, "scheduled");
         }
 
-        // Prove the projectile actually left the caster: log location 400ms later.
-        void *sa = g_castActor[i];
-        if (sa && !g_castLoggedFly[i] && age >= 400 && F.Location > 0 &&
-            !IsBadReadPtr(sa, F.Location + 12)) {
-            float *sl = (float *)((BYTE *)sa + F.Location);
-            float dx = sl[0] - g_castSpawnLoc[i][0];
-            float dy = sl[1] - g_castSpawnLoc[i][1];
-            float dz = sl[2] - g_castSpawnLoc[i][2];
-            float d  = sqrtf(dx * dx + dy * dy + dz * dz);
-            logf_("    [spell] p%d actor flew %.0f units in %lums (now=(%.0f %.0f %.0f))",
-                  i, d, (unsigned long)age, sl[0], sl[1], sl[2]);
-            g_castLoggedFly[i] = TRUE;
-        }
-
-        // Only end the caster's AIM POSE. Never reap the projectile - that was
-        // why casts "just played an animation and died".
-        // If the player is ALREADY aiming again (glow alive), defer: the state
-        // exit would interrupt the fresh cast-hold.
-        // v29 RACE FIX: was `if (aimGlowAlive(i)) continue;` - that asked
-        // for 1200ms of GLOW-FREE time after every cast, but re-aiming
-        // within the window spawns the NEXT cast's glow, so a rapid
-        // caster NEVER got a glow-free moment -> the cleanup chain never
-        // fired -> pose stuck (v28 hw log: chain fired once in 5 casts;
-        // castwatch ran past +1579ms with no chain line). Only block
-        // while the glow of THIS cast (spawned before this fire) lives;
-        // a NEWER glow (next aim already held) must not block.
-        if (aimGlowAlive(i) && g_aimFXAt[i] != 0 &&
-            g_aimFXAt[i] < g_castPending[i]) continue;
-        // v39 ANIMEND-TIMED EXIT: fire the chain right after the state's
-        // own AnimEnd instead of a fixed 1200ms past the release. The v38
-        // hw log showed the natural AnimEnd at release+~650ms and our exit
-        // at release+1200 - the 550ms gap on a frozen cast pose IS the
-        // residual hop (the snap) now that the storm is swallowed. Exiting
-        // at the anim boundary = nothing to snap from. Fallback: the
-        // configured delay (unchanged) when no AnimEnd is observed.
-        DWORD effDelay = (DWORD)g_cleanupDelay;
-        if (g_animEndAt[i] > g_castPending[i]) {
-            DWORD endAge = (g_animEndAt[i] - g_castPending[i])
-                         + (DWORD)g_castExitAdj;
-            if (endAge >= 400 && endAge < effDelay) effDelay = endAge;
-        }
-        if (age < effDelay) continue;
-        if (!pawn || IsBadReadPtr(pawn, 0x200)) {
-            g_castPending[i] = 0;
-            continue;
-        }
-        // v21: run the chain ONCE, then keep re-asserting the idle anim
-        // until +1.6s. v20 hardware: phys never blipped (castwatch proved
-        // Z/vz/phys constant), yet the user still saw a hop - it is the
-        // ANIMATION layer: the engine re-picks ChangeAnimation->PlayWaiting
-        // right after our chain and the transition churn reads as a dip.
-        // A steady idle re-assert settles it; Cleanup=light (ini) also
-        // skips the two state-exit calls in case they carry the dip.
-        {
-            static BOOL  sPhaseA[8]   = { FALSE };
-            static BOOL  sPhaseB[8]   = { FALSE };
-            static DWORD sChainAt[8]  = { 0 };
-            static BOOL  sReExit[8]   = { FALSE };
-            static BOOL  sReAssert[8] = { FALSE };
-            int   mode  = g_cleanupChain;
-            DWORD split = (mode == 0 && !g_cleanupLight)
-                        ? (DWORD)g_cleanupSplit : 0;
-            BYTE  p[8]; memset(p, 0, sizeof(p));
-            if (!sPhaseA[i]) {
-                sPhaseA[i] = TRUE;
-                if (split > 0) {
-                    // v28 PHASE A - start the blend while she is STILL in
-                    // the cast state. v27 hardware: delay moves the hop in
-                    // time; no hop = stuck pose; the Z dip is only ~0.5
-                    // units (invisible). The visible hop is the pose SNAP
-                    // of the state exit cutting the cast pose mid-anim.
-                    // Blending first and exiting ~250ms later lands the
-                    // state change on an already-faded pose.
-                    if (g_fnBlendOut)
-                        callFnP(pawn, g_fnBlendOut, p, 4,
-                                "blendOutCast() [A]");
-                    if (g_fnStopCast)
-                        callFnP(pawn, g_fnStopCast, p, 4,
-                                "StopCasting() [A]");
-                    logf_("    [castclean] p%d chain=full split-A: blend "
-                          "started (+%lums, exit in %dms)", i,
-                          (unsigned long)age, g_cleanupSplit);
+        // ---- 2. VERIFY ----------------------------------------------------
+        if (r->chainAt && !r->exitAt) {
+            DWORD chainAge = now - r->chainAt;
+            if (chainAge >= 450) {
+                // StateCasting.Tick still flowing = the state never left.
+                // (No tick telemetry for this cast at all - Wine stops
+                // ticking at the fire - simply means "cannot verify": trust
+                // the chain rather than leaving the pose parked.)
+                BOOL alive = g_castTickAt[i] >= r->fireAt &&
+                             (now - g_castTickAt[i] < 250);
+                if (alive) {
+                    if (r->retries < 2 && now - r->lastTryAt > 700 &&
+                        now - g_lastAirAt[i] >= 1200) {
+                        r->retries++;
+                        r->lastTryAt = now;
+                        logf_("    [cast] p%d run#%d StateCasting still alive "
+                              "(+%lums) - exit retry %d", i, r->id,
+                              (unsigned long)age, r->retries);
+                        castExitChain(i, pawn, r, "retry");
+                    }
                 } else {
-                sChainAt[i] = age;
-                if (effDelay < (DWORD)g_cleanupDelay)
-                    logf_("    [castclean] p%d AnimEnd-timed exit (+%lums; "
-                          "natural AnimEnd at +%lums, exit = AnimEnd+%d)",
-                          i, (unsigned long)age,
-                          (unsigned long)(g_animEndAt[i] - g_castPending[i]),
-                          g_castExitAdj);
-                armHopKill(i);               // v38: swallow the landing storm
-                settleBeforeExit(i, pawn);   // v35: kill the exit micro-fall
-                if (!g_cleanupLight && g_fnGotoGround)
-                    callFn(pawn, g_fnGotoGround,
-                           "GotoDefaultGroundMovementState()");
-                // v25 CleanupChain modes (hw data: full = the ONLY chain
-                // that exits; every reduction hung - noanimend v24,
-                // exitanim v25, light v22):
-                //   full(0) exit+blendOut+StopCasting+Switch+AnimEnd
-                //   noanimend(1)/min(2)/exitanim(3) = hang-bait tests
-                if (!g_cleanupLight && g_fnBlendOut && mode != 3)
-                    callFnP(pawn, g_fnBlendOut, p, 4, "blendOutCast()");
-                if (g_fnStopCast && mode != 3)
-                    callFnP(pawn, g_fnStopCast, p, 4, "StopCasting()");
-                if (g_fnSwitchNormal && mode == 0)
-                    callFnP(pawn, g_fnSwitchNormal, p, 4,
-                            "SwitchToNormalStanceAnims()");
-                if (g_fnAnimEnd && (mode == 0 || mode == 3))
-                    callFn(pawn, g_fnAnimEnd, "AnimEnd");
-                if (g_cleanupLight)
-                    logf_("    [castclean] p%d light cleanup (no "
-                          "GotoDefault/blendOut)", i);
-                else
-                    logf_("    [castclean] p%d chain=%s delay=%dms", i,
-                          g_cleanupChain == 0 ? "full" :
-                          (g_cleanupChain == 1 ? "noanimend" :
-                          (g_cleanupChain == 2 ? "min" : "exitanim")),
-                          g_cleanupDelay);
+                    r->exitAt = now;
+                    logf_("    [cast] p%d run#%d state LEFT (fire+%lums, "
+                          "chain+%lums)", i, r->id, (unsigned long)age,
+                          (unsigned long)chainAge);
                 }
-            }
-            if (split > 0 && !sPhaseB[i] &&
-                age >= (DWORD)g_cleanupDelay + split) {
-                // v28 PHASE B - the state exit (plus the stance/anim end
-                // bookkeeping) lands AFTER the blend had time to fade the
-                // cast pose. Same five calls as the proven full chain,
-                // just phased in time - the call SET is unchanged.
-                sPhaseB[i]  = TRUE;
-                sChainAt[i] = age;
-                armHopKill(i);               // v38: the state exit is here
-                if (g_fnGotoGround)
-                    callFn(pawn, g_fnGotoGround,
-                           "GotoDefaultGroundMovementState() [B]");
-                if (g_fnSwitchNormal)
-                    callFnP(pawn, g_fnSwitchNormal, p, 4,
-                            "SwitchToNormalStanceAnims() [B]");
-                if (g_fnAnimEnd)
-                    callFn(pawn, g_fnAnimEnd, "AnimEnd [B]");
-                logf_("    [castclean] p%d chain=full split-B: state "
-                      "exited (+%lums)", i, (unsigned long)age);
-            }
-            // v21: idle re-assert REMOVED (v22): on hardware it stacked a
-            // second anim on top of the engine's own post-cast churn and
-            // contributed to the stuck "flying" pose. LESS interference is
-            // more: the chain above runs once, then we leave her alone.
-            // v26 HOPGUARD: the v25 hw log finally caught the hop - the
-            // state exit drops her through a brief PHYS_Falling dip
-            // (phys=2, vz=-14..-44, ~1 unit, ~100ms) right after the chain
-            // fires. If that blip appears, re-fire the state exit ONCE to
-            // settle her straight into ground movement instead of letting
-            // the fall+land play out on screen. (Physics itself is never
-            // touched - v21 proved patching it freezes her.)
-            if (g_hopGuard && sChainAt[i] && !sReExit[i] &&
-                age >= sChainAt[i] + 40 && age <= sChainAt[i] + 2000 &&
-                F.Physics > 0 && F.Velocity > 0 &&
-                !IsBadReadPtr(pawn, F.Velocity + 12)) {
-                BYTE ph = *((BYTE *)pawn + F.Physics);
-                float vz = ((float *)((BYTE *)pawn + F.Velocity))[2];
-                BOOL jumping = keyDown(g_pk[i].jump) ||
-                               keyDown(g_pk[i].jump2) || g_padJump[i];
-                if (ph == 2 && vz > -250.0f && vz < 0.0f && !jumping &&
-                    g_fnGotoGround) {
-                    callFn(pawn, g_fnGotoGround,
-                           "GotoDefaultGroundMovementState() [hop re-exit]");
-                    sReExit[i] = TRUE;
-                    logf_("    [hop] p%d Falling blip after chain (vz=%.0f)"
-                          " - re-exited state", i, vz);
-                }
-            }
-            // v26 hang insurance: re-assert the exit pair once more, well
-            // after the chain. v27: OFF by default - v26 hardware hung WITH
-            // full chain + this re-assert (v23-full exited), making the
-            // guard itself the prime suspect. ReAssert=1 in the ini to
-            // re-enable the experiment.
-            if (g_reAssert && sChainAt[i] && !sReAssert[i] && age >= sChainAt[i] + 1400) {
-                sReAssert[i] = TRUE;
-                if (g_fnGotoGround)
-                    callFn(pawn, g_fnGotoGround,
-                           "GotoDefaultGroundMovementState() [re-assert]");
-                if (g_fnAnimEnd)
-                    callFn(pawn, g_fnAnimEnd, "AnimEnd [re-assert]");
-                logf_("    [castclean] p%d re-asserted exit pair at +%lums"
-                      " (hang insurance)", i, (unsigned long)age);
-            }
-            // v34 VERIFIED RETRY: check the state pointer after the chain;
-            // retry the SAME exit until StateCasting is actually gone.
-            {
-                static BOOL sVerified[8] = { FALSE };
-                static int  sRetries[8]  = { 0 };
-                BOOL verdict = FALSE;
-                if (s_stateOff >= 0 && sChainAt[i] && !sVerified[i] &&
-                    age >= sChainAt[i] + 400 &&
-                    !IsBadReadPtr((BYTE *)pawn + s_stateOff, 4)) {
-                    void *st = *(void **)((BYTE *)pawn + s_stateOff);
-                    verdict = (st == s_stateCasting);
-                    if (verdict && g_beginCastAt[i] >
-                                   g_castPending[i] + (DWORD)sChainAt[i]) {
-                        // v39: a NEW cast began after our chain - never rip
-                        // it out (the cast-3 hw pattern: re-cast at +409ms).
-                        sVerified[i] = TRUE;
-                        logf_("    [castverify] p%d new cast began - "
-                              "standing down (+%lums)", i,
-                              (unsigned long)age);
-                    } else if (verdict) {
-                        if (sRetries[i] < 3 &&
-                            now - g_lastAirAt[i] >= 1200) {
-                            sRetries[i]++;
-                            logf_("    [castverify] p%d STILL StateCasting "
-                                  "(+%lums) - retry %d", i,
-                                  (unsigned long)age, sRetries[i]);
-                            armHopKill(i);       // v38: a retry re-storms
-                            BYTE rp[8]; memset(rp, 0, sizeof(rp));
-                            if (g_fnGotoGround)
-                                callFn(pawn, g_fnGotoGround,
-                                       "GotoDefaultGroundMovementState() "
-                                       "[retry]");
-                            if (g_fnSwitchNormal)
-                                callFnP(pawn, g_fnSwitchNormal, rp, 4,
-                                        "SwitchToNormalStanceAnims() [retry]");
-                            if (g_fnAnimEnd)
-                                callFn(pawn, g_fnAnimEnd, "AnimEnd [retry]");
-                        } else {
-                            sVerified[i] = TRUE;
-                            logf_("    [castverify] p%d gave up after 3 "
-                                  "retries (state stuck deep)", i);
-                        }
-                    } else {
-                        sVerified[i] = TRUE;
-                        logf_("    [castverify] p%d state LEFT ok (+%lums)%s",
-                              i, (unsigned long)age,
-                              sRetries[i] ? " (after retries)" : "");
-                    }
-                } else if (s_stateOff < 0 && sChainAt[i] && !sVerified[i] &&
-                           age >= sChainAt[i] + 400 &&
-                           F.Physics > 0 && !g_hopGuard) {
-                    // v34 FALLBACK verification: the v33 hw log showed the
-                    // stuck state FLAPS physics 0<->2 at idle (the visible
-                    // quiver). Healthy exits never flap. Count flips; two
-                    // within the window = still stuck -> retry the exit.
-                    static BYTE sLastPh[8] = { 0 };
-                    static int  sFlips[8]  = { 0 };
-                    BYTE ph = *((BYTE *)pawn + F.Physics);
-                    BOOL jumping = keyDown(g_pk[i].jump) ||
-                                   keyDown(g_pk[i].jump2) || g_padJump[i] ||
-                                   (now - g_lastAirAt[i] < 1200);
-                    if (sLastPh[i] && sLastPh[i] != ph &&
-                        ((sLastPh[i] == 2) != (ph == 2)) && !jumping)
-                        sFlips[i]++;
-                    sLastPh[i] = ph;
-                    if (sFlips[i] >= 2 && now - g_lastAirAt[i] < 1200) {
-                        // v42: flips during/just after a jump are the JUMP,
-                        // not a stuck quiver (v41 hw proof: mid-air forced
-                        // exit stranded the pawn in PHYS_Rotating). Drop them.
-                        sFlips[i] = 0;
-                    }
-                    if (sFlips[i] >= 2) {
-                        sFlips[i] = 0;
-                        if (g_beginCastAt[i] >
-                            g_castPending[i] + (DWORD)sChainAt[i]) {
-                            // v39: fresh cast - stand down (see tick-retry)
-                            sVerified[i] = TRUE;
-                            logf_("    [castverify] p%d new cast began - "
-                                  "standing down (+%lums)", i,
-                                  (unsigned long)age);
-                        } else if (sRetries[i] < 3) {
-                            sRetries[i]++;
-                            logf_("    [castverify] p%d physics flap x2 "
-                                  "(stuck quiver, +%lums) - retry %d", i,
-                                  (unsigned long)age, sRetries[i]);
-                            armHopKill(i);       // v38: retry re-storms
-                            settleBeforeExit(i, pawn);   // v35
-                            BYTE rp[8]; memset(rp, 0, sizeof(rp));
-                            if (g_fnGotoGround)
-                                callFn(pawn, g_fnGotoGround,
-                                       "GotoDefaultGroundMovementState() "
-                                       "[flap retry]");
-                            if (g_fnSwitchNormal)
-                                callFnP(pawn, g_fnSwitchNormal, rp, 4,
-                                        "SwitchToNormalStanceAnims() [flap "
-                                        "retry]");
-                            if (g_fnAnimEnd)
-                                callFn(pawn, g_fnAnimEnd, "AnimEnd [flap "
-                                       "retry]");
-                        } else {
-                            sVerified[i] = TRUE;
-                            logf_("    [castverify] p%d flaps persist after 3"
-                                  " retries", i);
-                        }
-                    }
-                    if (age >= 3000) {
-                        sLastPh[i] = 0;
-                        sFlips[i]  = 0;
-                    }
-                }
-                // v39 TICK-ALIVE verification (hw-proof): s_stateOff is -1
-                // on hardware (state ptr lives in a heap frame) and the v34
-                // flap heuristic never fired there - but the detour SEES the
-                // state's own Tick. Tick still flowing 500ms after our chain
-                // = the state never left (v31: it ignores its own AnimEnd).
-                // Two bounded re-exits, then a loud log line. When the ticks
-                // STOP we finally have a real "state LEFT ok" verdict.
-                {
-                    static BOOL   sTickVerdict[8]    = { 0 };
-                    static int    sTickRetries[8]    = { 0 };
-                    static DWORD  sLastTickRetry[8]  = { 0 };
-                    if (sChainAt[i] && !sTickVerdict[i] &&
-                        age >= sChainAt[i] + 500 &&
-                        age <= sChainAt[i] + 2600) {
-                        DWORD chainAbs = g_castPending[i] + (DWORD)sChainAt[i];
-                        BOOL  fresh    = (g_beginCastAt[i] > chainAbs);
-                        BOOL  alive    = (g_castTickAt[i] &&
-                                          now - g_castTickAt[i] < 250);
-                        if (alive && !fresh &&
-                            now - g_lastAirAt[i] >= 1200) {
-                            // v42: never force exits while airborne/recent
-                            if (sTickRetries[i] < 2 &&
-                                now - sLastTickRetry[i] > 700) {
-                                sTickRetries[i]++;
-                                sLastTickRetry[i] = now;
-                                logf_("    [castverify] p%d StateCasting."
-                                      "Tick STILL ALIVE (+%lums) - tick-"
-                                      "retry %d", i, (unsigned long)age,
-                                      sTickRetries[i]);
-                                armHopKill(i);   // a retry re-storms
-                                settleBeforeExit(i, pawn);
-                                BYTE rp[8]; memset(rp, 0, sizeof(rp));
-                                if (g_fnGotoGround)
-                                    callFn(pawn, g_fnGotoGround,
-                                           "GotoDefaultGroundMovementState()"
-                                           " [tick retry]");
-                                if (g_fnSwitchNormal)
-                                    callFnP(pawn, g_fnSwitchNormal, rp, 4,
-                                            "SwitchToNormalStanceAnims() "
-                                            "[tick retry]");
-                                if (g_fnAnimEnd)
-                                    callFn(pawn, g_fnAnimEnd,
-                                           "AnimEnd [tick retry]");
-                            }
-                        } else if (!alive &&
-                                   g_castTickAt[i] >= g_castPending[i]) {
-                            // ticks WERE seen during this cast (the state was
-                            // alive post-fire) and have now stopped = it left.
-                            // (The last tick always lands just BEFORE the
-                            // chain - ticks stop at the exit itself.)
-                            sTickVerdict[i] = TRUE;
-                            logf_("    [castverify] p%d state LEFT ok "
-                                  "(StateCasting.Tick stopped, +%lums)%s",
-                                  i, (unsigned long)age,
-                                  sTickRetries[i] ? " (after tick-retry)" : "");
-                        }
-                    }
-                    // v40 SETTLE RE-ALIGN: the v39 hw report (hop GONE,
-                    // user-confirmed) left "weird pose, standing in
-                    // incorrect yaw, shaking" after casts. Actor data is
-                    // clean (camera yaw == pawn yaw, state verdicts ok,
-                    // storms swallowed) - the residue is MESH-level: the
-                    // early exit settles the anim system mid-transition
-                    // (landing blend -> idle) and nothing re-picks it (the
-                    // v23 re-pick removal). The v12 lesson: ChangeAnimation
-                    // is the SAFE re-pick (PlayWaiting was the yaw swinger).
-                    // Once per cast, after the landing blend has finished
-                    // (~exit+450ms) and ONLY if the pawn is standing and no
-                    // new cast owns it.
-                    // v47: the settle re-pick moved to driveePawn
-                    // (event-driven, see g_realignNeed). The yaw watch
-                    // stays here.
-                    // v41 YAW WATCH: actor vs view vs mesh yaw through
-                    // the post-cast window (~8 samples/s, cast ages
-                    // 200..3400). Plus the AUTO-FIX: while STANDING and the
-                    // mesh yaw is stuck >~5.5 deg away from the actor yaw,
-                    // write the actor yaw into the mesh (max 2 per cast).
-                    // Bounded + fully logged; if the engine fights the
-                    // write, the log will show the delta snapping back.
-                    {
-                        static DWORD sLastYawLog[8] = { 0 };
-                        if (age >= 200 && age <= 3400 &&
-                            now - sLastYawLog[i] >= 120 &&
-                            F.Rotation > 0 &&
-                            !IsBadReadPtr(pawn, F.Rotation + 12)) {
-                            sLastYawLog[i] = now;
-                            int ay = *(int *)((BYTE *)pawn + F.Rotation + 4);
-                            int md = meshYawDelta(pawn, ay);
-                            if (md != -99999)
-                                logf_("  [yawwatch] p%d +%lums actor=%d "
-                                      "view=%d mesh=%d delta=%d",
-                                      i, (unsigned long)age, ay & 65535,
-                                      g_viewYaw[i] & 65535,
-                                      (ay + md) & 65535, md);
-                        }
-                        // (v41 note: the mesh auto-write was removed
-                        // before shipping - Engine.Actor.Mesh in UE2 is the
-                        // ASSET reference, not a transform component; its
-                        // "rotation" bytes are asset data. Wine proved it:
-                        // mesh yaw reads constant 0 there. NEVER write it.)
-                    }
-                    // v41 POST-CAST ROTATION PIN: while standing in the
-                    // post-cast window, hold DesiredRotation on the view
-                    // yaw and zero RotationRate, so a trailing-AI
-                    // FaceRotation pull cannot swing the actor away from
-                    // where the user left it (the same bounded pattern the
-                    // v12 standing-jump pin uses). Saved RotationRate is
-                    // restored when the window ends or movement resumes.
-                    {
-                        static BYTE sYawPinOn[8]   = { 0 };
-                        static int  sSavedRR[8][3] = {{0}};
-                        BOOL wantPin = (sChainAt[i] &&
-                                        age >= sChainAt[i] + 400 &&
-                                        age <= sChainAt[i] + 2400 &&
-                                        g_p2Moving[i] == 0 &&
-                                        F.DesiredRotation > 0 &&
-                                        F.RotationRate > 0 &&
-                                        !IsBadReadPtr(pawn, F.RotationRate + 12) &&
-                                        !IsBadWritePtr(pawn, F.RotationRate + 12));
-                        if (wantPin && !sYawPinOn[i]) {
-                            int *rr = (int *)((BYTE *)pawn + F.RotationRate);
-                            sSavedRR[i][0] = rr[0];
-                            sSavedRR[i][1] = rr[1];
-                            sSavedRR[i][2] = rr[2];
-                            sYawPinOn[i] = TRUE;
-                            logf_("  [yawpin] p%d engaged (+%lums)",
-                                  i, (unsigned long)age);
-                        }
-                        if (sYawPinOn[i]) {
-                            if (wantPin) {
-                                int *dr = (int *)((BYTE *)pawn +
-                                                  F.DesiredRotation);
-                                dr[0] = 0; dr[1] = g_viewYaw[i]; dr[2] = 0;
-                                int *rr = (int *)((BYTE *)pawn +
-                                                  F.RotationRate);
-                                rr[0] = 0; rr[1] = 0; rr[2] = 0;
-                            } else {
-                                sYawPinOn[i] = FALSE;
-                                if (F.RotationRate > 0 &&
-                                    !IsBadWritePtr(pawn, F.RotationRate + 12)) {
-                                    int *rr = (int *)((BYTE *)pawn +
-                                                      F.RotationRate);
-                                    rr[0] = sSavedRR[i][0];
-                                    rr[1] = sSavedRR[i][1];
-                                    rr[2] = sSavedRR[i][2];
-                                }
-                                logf_("  [yawpin] p%d released (+%lums)",
-                                      i, (unsigned long)age);
-                            }
-                        }
-                        if (age >= 3000 && sYawPinOn[i]) {
-                            sYawPinOn[i] = FALSE;
-                            if (F.RotationRate > 0 &&
-                                !IsBadWritePtr(pawn, F.RotationRate + 12)) {
-                                int *rr = (int *)((BYTE *)pawn +
-                                                  F.RotationRate);
-                                rr[0] = sSavedRR[i][0];
-                                rr[1] = sSavedRR[i][1];
-                                rr[2] = sSavedRR[i][2];
-                            }
-                            logf_("  [yawpin] p%d released (window end)",
-                                  i);
-                        }
-                    }
-                    if (age >= 3000) {
-                        sTickVerdict[i]   = FALSE;
-                        sTickRetries[i]   = 0;
-                        sLastTickRetry[i] = 0;
-                    }
-                }
-                if (age >= 3000) {
-                    sVerified[i] = FALSE;
-                    sRetries[i]  = 0;
-                }
-            }
-            // v37: after the exit has settled (~2.3s), record the TRUE
-            // physics-rest Z here - the next cast at this spot settles to
-            // exactly this height (no fall, no landing anim, no hop).
-            if (!g_postPush[i] && age >= 2300 && age <= 2600 &&
-                F.Physics > 0 && !IsBadReadPtr(pawn, F.Physics + 1)) {
-                BYTE php = *((BYTE *)pawn + F.Physics);
-                if ((php == 0 || php == 1) && F.Location > 0 &&
-                    !IsBadReadPtr(pawn, F.Location + 12)) {
-                    float *pl = (float *)((BYTE *)pawn + F.Location);
-                    int slot = g_restRingN[i] % 8;
-                    g_restRing[i][slot][0] = pl[0];
-                    g_restRing[i][slot][1] = pl[1];
-                    g_restRing[i][slot][2] = pl[2];
-                    g_restRingPost[i][slot] = 1;       // physics-rest truth
-                    g_restRingN[i]++;
-                    g_postPush[i] = TRUE;
-                    logf_("    [settle] p%d physics-rest sample Z=%.2f "
-                          "recorded (+%lums)", i, pl[2], (unsigned long)age);
-                }
-            }
-            if (age >= 4000) {
-                // v29 RESCUE: if the chain never completed (rapid casts,
-                // odd glow lifetimes, anything), fire it NOW in one
-                // condensed pass - the pose must never be left parked.
-                {
-                    BOOL aRan = sPhaseA[i];
-                    BOOL bRan = (g_cleanupSplit > 0) ? sPhaseB[i]
-                                                     : sPhaseA[i];
-                    if (!g_cleanupLight && (!aRan || !bRan) &&
-                        g_beginCastAt[i] >
-                        g_castPending[i] + (DWORD)sChainAt[i]) {
-                        // v39: a new cast owns the pawn - its own chain will
-                        // clean up; forcing this exit would murder it.
-                        logf_("    [castclean] p%d rescue skipped: new cast "
-                              "owns the pawn (+%lums)", i,
-                              (unsigned long)age);
-                    } else if (!g_cleanupLight && (!aRan || !bRan)) {
-                        armHopKill(i);       // v38: rescue exits re-storm too
-                        BYTE rp[8]; memset(rp, 0, sizeof(rp));
-                        if (!aRan) {
-                            if (g_fnBlendOut)
-                                callFnP(pawn, g_fnBlendOut, rp, 4,
-                                        "blendOutCast() [rescue]");
-                            if (g_fnStopCast)
-                                callFnP(pawn, g_fnStopCast, rp, 4,
-                                        "StopCasting() [rescue]");
-                        }
-                        if (g_fnGotoGround)
-                            callFn(pawn, g_fnGotoGround,
-                                   "GotoDefaultGroundMovementState() "
-                                   "[rescue]");
-                        if (g_fnSwitchNormal)
-                            callFnP(pawn, g_fnSwitchNormal, rp, 4,
-                                    "SwitchToNormalStanceAnims() [rescue]");
-                        if (g_fnAnimEnd)
-                            callFn(pawn, g_fnAnimEnd, "AnimEnd [rescue]");
-                        logf_("    [castclean] p%d RESCUE: chain completed "
-                              "at watch end (+%lums)", i,
-                              (unsigned long)age);
-                    }
-                }
-                g_castPending[i] = 0;
-                g_castActor[i]   = NULL;
-                sPhaseA[i]       = FALSE;
-                sPhaseB[i]       = FALSE;
-                sChainAt[i]      = 0;
-                sReExit[i]       = FALSE;
-                sReAssert[i]     = FALSE;
             }
         }
-        // currentSpell stays selected, like player 1 - so the next cast just works.
+
+        // ---- 3. SETTLE: no dip, then the anim re-pick ---------------------
+        if (r->exitAt) {
+            castDipGuard(i, pawn, r, now);
+            DWORD settleAge = now - r->exitAt;
+            // The anim re-pick that settles the pose and the facing. 450ms
+            // after the exit the engine's own blend-out has run (v40), and it
+            // waits for a quiet, standing pawn so it can never land inside
+            // the exit churn. It stays armed for the rest of the run - v47's
+            // version needed six gates to hold at once and expired on almost
+            // every cast, which is why only the casts that happened to hop
+            // came out right.
+            if (!r->rePicked && settleAge >= 450 &&
+                g_p2Moving[i] == 0 && now - g_lastMoveAt[i] > 150 &&
+                !aimGlowAlive(i)) {
+                r->rePicked = TRUE;
+                int md = (F.Rotation > 0 && !IsBadReadPtr(pawn, F.Rotation + 12))
+                       ? meshYawDelta(pawn,
+                             *(int *)((BYTE *)pawn + F.Rotation + 4))
+                       : -99999;
+                // Put the actor on the view yaw at the same moment the new
+                // animation is picked, so the pose the engine chooses is the
+                // one we want and not whatever the cast animation left.
+                if (F.Rotation > 0 && !IsBadWritePtr((BYTE *)pawn + F.Rotation, 12)) {
+                    int *pr = (int *)((BYTE *)pawn + F.Rotation);
+                    pr[0] = 0; pr[1] = g_viewYaw[i]; pr[2] = 0;
+                }
+                if (F.DesiredRotation > 0 &&
+                    !IsBadWritePtr((BYTE *)pawn + F.DesiredRotation, 12)) {
+                    int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                    dr[0] = 0; dr[1] = g_viewYaw[i]; dr[2] = 0;
+                }
+                if (g_fnChangeAnim)
+                    callFn(pawn, g_fnChangeAnim, "ChangeAnimation [castsettle]");
+                logf_("    [cast] p%d run#%d anim re-pick (exit+%lums, "
+                      "meshDelta=%d)", i, r->id, (unsigned long)settleAge, md);
+            }
+            if (r->rePicked && settleAge >= 1200) {
+                castDropRun(i, "settled");
+                continue;
+            }
+        }
+
+        // ---- 4. BACKSTOP + END OF RUN -------------------------------------
+        if (!r->exitAt && age >= 2600 && now - g_lastAirAt[i] >= 1200) {
+            // Never verified: one last exit, then let the settle stage run.
+            // The pose must not be left parked. (Airborne: wait for her to
+            // land - v42 showed a forced exit mid-air strands the pawn.)
+            logf_("    [cast] p%d run#%d no verified exit (+%lums) - rescue",
+                  i, r->id, (unsigned long)age);
+            r->exitAt = now;
+            castExitChain(i, pawn, r, "rescue");
+        }
+        if (age >= CAST_WATCH_MS) castDropRun(i, "watch end");
     }
 }
 
@@ -2637,8 +2277,8 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
             // "interest" window (fire .. +4.2s) in which the state's own
             // events are harvested. Outside both: zero name lookups.
             BOOL suppress = (nowS < g_suppressLandUntil[p]);
-            BOOL interest = (g_castPending[p] &&
-                             nowS < g_castPending[p] + 4200);
+            BOOL interest = (g_run[p].fireAt &&
+                             nowS < g_run[p].fireAt + 4200);
             if (suppress || interest) {
                 char nb[120];
                 objName(func, nb, sizeof(nb));
@@ -2658,24 +2298,26 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
                 if (interest) {
                     if (L >= 21 && !strncmp(nb + L - 21,
                                             "StateCasting.EndState", 21)) {
-                        // v47: the ACTUAL exit event. Arm the anim re-sync
-                        // only for OUR exits (a chain ran within 2.5s).
-                        if (nowS - g_chainAbsAt[p] < 2500 &&
-                            !g_realignNeed[p]) {
-                            g_realignNeed[p]  = TRUE;
-                            g_needAt[p]       = nowS;
-                            g_needBegin[p]    = g_beginCastAt[p];
-                            g_needBind[p]     = g_castPending[p];
-                            logf_("    [realign] p%d ARMED by EndState "
-                                  "(exit-age %lums)", p,
-                                  (unsigned long)(nowS - g_chainAbsAt[p]));
+                        // v48: the ACTUAL exit event, and the only one that
+                        // matters - it belongs to the running run (the state
+                        // can only be in one cast at a time). It also covers
+                        // the rare NATURAL exit: then no chain is needed at
+                        // all. Arm the swallow either way, because a landing
+                        // storm follows the exit either way.
+                        CastRun *r = &g_run[p];
+                        if (r->fireAt && !r->exitAt) {
+                            r->exitAt = nowS;
+                            armHopKill(p);
+                            logf_("    [cast] p%d run#%d state EXIT "
+                                  "(EndState, fire+%lums)", p, r->id,
+                                  (unsigned long)(nowS - r->fireAt));
                         }
                     } else if (L >= 20 && !strncmp(nb + L - 20,
                                             "StateCasting.AnimEnd", 20)) {
                         // v39 ANIMEND EXIT anchor: the cast anim's natural
                         // end (hw: release+~650ms; the state ignores it,
                         // v31). First post-release one wins.
-                        if (g_animEndAt[p] < g_castPending[p])
+                        if (g_animEndAt[p] < g_run[p].fireAt)
                             g_animEndAt[p] = nowS;
                     } else if (L >= 17 &&
                                !strncmp(nb + L - 17,
@@ -2688,16 +2330,11 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
                     } else if (L >= 30 &&
                                !strncmp(nb + L - 24,
                                         "HPCharacter.StartCasting", 24)) {
-                        // v47: StartCasting fires on EVERY cast (the aim
-                        // start) - Wine skips StateCasting.BeginState about
-                        // half the time, so the no-new-cast veto needs this
-                        // 100%-reliable stamp too.
+                        // StartCasting fires on EVERY cast (the aim start) -
+                        // Wine skips StateCasting.BeginState about half the
+                        // time, so the "a newer cast owns the pawn" test
+                        // needs this 100%-reliable stamp too.
                         g_beginCastAt[p] = nowS;
-                        logf_("    [realign] p%d SCstamp p=%d slot=%lu "
-                              "chainAbs=%lu raw=%lu", p, p,
-                              (unsigned long)g_beginCastAt[p],
-                              (unsigned long)g_chainAbsAt[p],
-                              (unsigned long)nowS);
                     }
                 }
             }
@@ -3339,8 +2976,6 @@ static void aimFXDiagnose(void *pawn, void *fx, const float at[3])
 // Release: actually fire. The projectile is left alive to fly and hit things.
 static void beginCast(int i, void *pawn)
 {
-    if (i >= 0 && i < 8) g_ownCastAt[i] = GetTickCount();   // v47: own-cast clock
-
     char b[160];
     void *cls = spellClassFor(pawn);
     logf_("  [cast-begin] p%d pawn=%s spellClass=%s", i, g_pawnName[i],
@@ -3410,14 +3045,8 @@ static void fireCast(int i, void *pawn)
         *(void **)(p + 0x04) = target;
         callFnP(pawn, g_fnSpawnSpell, p, 12, "SpawnSpell(cls,target)");
         void *spawned = *(void **)(p + 0x08);
-        g_castPending[i]  = GetTickCount();
-        g_postPush[i]     = FALSE;       // v37: one physics-rest sample/cast
-        g_settleAlign[i]  = FALSE;       // v40: one anim re-pick per cast
-        g_realignNeed[i]  = FALSE;       // v47: newer cast owns the pawn
-        discoverStateField(pawn);
+        castRunStart(i, pawn);           // v48: one recovery run for this cast
         if (i > 0) pelogAuto();          // v36: timeline around every cast
-        g_castPhys0[i]    = (F.Physics > 0 && !IsBadReadPtr(pawn, F.Physics))
-                          ? *((BYTE *)pawn + F.Physics) : 0;
         g_castActor[i]    = spawned;
         g_castLoggedFly[i] = FALSE;
         logf_("    SpawnSpell -> %s",
@@ -4314,8 +3943,6 @@ static int   g_lookYaw[8]  = {0};          // right-stick camera yaw offset
 static int   g_lookPitch[8]= {0};          // right-stick camera pitch offset
 static int   g_jumpYawLock[8] = {0};
 static DWORD g_jumpLockUntil[8] = {0};
-static BOOL  g_jumpStanding[8] = {0};
-static int   g_jumpPh[8]        = {0};   // v12: 0 none, 1 walk-prep, 2 airborne
 static DWORD g_jumpLaunchAt[8]  = {0};
 static float g_jumpVz[8]        = {0};
 static DWORD g_jumpLogUntil[8]  = {0};   // v12: per-frame jump telemetry
@@ -4528,8 +4155,8 @@ static void driveePawn(int i, void *pawn)
     // lose frames, so while STANDING (not moving, not airborne) this holds
     // the full pin every frame: DesiredRotation = view yaw AND
     // RotationRate = 0, so the engine's own rotation logic has nothing to
-    // advance - the exact mechanism of the (hw-proven) post-cast yawpin
-    // and the v12 jump pin. Saved RotationRate is restored the moment the
+    // advance - the same mechanism as the v12 jump pin. Saved RotationRate
+    // is restored the moment the
     // pawn moves or goes airborne; transition lines are logged.
     {
         static BOOL sYawLockOn[8]  = { 0 };
@@ -4566,60 +4193,6 @@ static void driveePawn(int i, void *pawn)
                 }
                 logf_("  [yawhold] p%d released (moving/airborne)", i);
             }
-        }
-    }
-    // v47 EVENT-DRIVEN SETTLE RE-SYNC: armed by the detour when OUR
-    // StateCasting.EndState flows by (the actual exit). Executed here -
-    // every frame, fresh context - only while EVERY guard holds at
-    // execution time: 1.2s..6s since the exit (late window covers
-    // walk-aways), standing with a 300ms stand-still debounce (no
-    // mid-blend snaps), no aim glow (aims do not tick StateCasting), the
-    // casting state quiet for 300ms (never yank a live cast), same-cast
-    // binding (a newer fire cancels), no post-exit BeginState/StartCasting,
-    // and never during the mod's OWN cleanup-chain cast (g_ownCastAt - the
-    // cleanup re-cast is the mod's own doing; its exit re-arms the sync
-    // anyway). If a
-    // guard cannot be satisfied the need simply expires - a skipped
-    // re-sync is always safer than a mis-timed one.
-    if (g_realignNeed[i] && g_needAt[i] && F.ok) {
-        DWORD since = now - g_needAt[i];
-        BOOL standing = g_p2Moving[i] == 0 &&
-                        now - g_lastMoveAt[i] > 300;
-        if (since > 6000) {
-            g_realignNeed[i] = FALSE;
-        } else if (standing &&
-                   since >= 1200 &&
-                   g_beginCastAt[i] == g_needBegin[i] &&  // NOTHING began
-                                                          // since the arm
-                                                          // (player aim, our
-                                                          // own chain cast)
-                   g_castPending[i] == g_needBind[i] &&   // nothing fired
-                   now - g_ownCastAt[i] > 3000 &&   // never during OUR chain
-                                                    // cast (aim+fire+exit)
-                   !aimGlowAlive(i) &&
-                   now - g_castTickAt[i] > 300 &&
-                   F.Rotation > 0 &&
-                   !IsBadReadPtr(pawn, F.Rotation + 12)) {
-            g_realignNeed[i] = FALSE;
-            logf_("    [realign] p%d FIRE i=%d pend=%lu needBind=%lu "
-                  "tickAge=%lu glow=%d begin=%lu needBegin=%lu own=%lu "
-                  "now=%lu", i, i,
-                  (unsigned long)g_castPending[i],
-                  (unsigned long)g_needBind[i],
-                  (unsigned long)(now - g_castTickAt[i]),
-                  aimGlowAlive(i) ? 1 : 0,
-                  (unsigned long)g_beginCastAt[i],
-                  (unsigned long)g_needBegin[i],
-                  (unsigned long)g_ownCastAt[i],
-                  (unsigned long)now);
-            int mdc = meshYawDelta(pawn,
-                *(int *)((BYTE *)pawn + F.Rotation + 4));
-            if (g_fnChangeAnim)
-                callFn(pawn, g_fnChangeAnim,
-                       "ChangeAnimation [settlealign]");
-            logf_("    [settlealign] p%d anim re-picked at cast settle "
-                  "(exit+%lums, meshDelta=%d)", i,
-                  (unsigned long)since, mdc);
         }
     }
     rot[1] = g_viewYaw[i];   // always face the view, like the original player
@@ -5397,29 +4970,12 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
             }
         }
 
-        // v35: remember her last healthy standing height. Sample when she
-        // is OUT of the cast state entirely (no pending cast, no aim glow)
-        // and not falling: standing idle (phys=0) or walking (phys=1).
-        // Idle-standing samples are the true floor-rest height - a walking
-        // sample can carry a footfall bob (observed 170.8 vs rest 170.5),
-        // so the LAST sample before she aims (usually idle) is the right
-        // one to restore at the exit.
-        if (i > 0 && i < 8 && g_pawn[i] && F.ok && F.Physics > 0 &&
-            F.Location > 0 && !g_castPending[i] && !aimGlowAlive(i) &&
-            !IsBadReadPtr(g_pawn[i], F.Location + 12)) {
-            BYTE ph = *((BYTE *)g_pawn[i] + F.Physics);
-            if (ph == 0 || ph == 1) {
-                float *pl = (float *)((BYTE *)g_pawn[i] + F.Location);
-                g_restZ[i]     = pl[2];
-                g_restXY[i][0] = pl[0]; g_restXY[i][1] = pl[1];
-                int slot = g_restRingN[i] % 8;
-                g_restRing[i][slot][0] = pl[0];
-                g_restRing[i][slot][1] = pl[1];
-                g_restRing[i][slot][2] = pl[2];
-                g_restRingPost[i][slot] = 0;      // organic standing sample
-                g_restRingN[i]++;
-            }
-        }
+        // (v48: the v35-v37 "rest height ring" is gone. It sampled standing
+        // heights to guess the floor and restore it at the exit, but the
+        // samples were taken in the mod's own PHYS_None standing state, i.e.
+        // they were the frozen standing height and not the floor, so the
+        // restore moved her 0.1 units at best. A cast now simply remembers
+        // the height she stood at when the spell left - see castRunStart.)
 
         // movement telemetry, so a headless run can prove the pawn responds
         // Time-based, not frame-based: at 60 fps a frame counter would write
@@ -5610,10 +5166,13 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         g_freeLook   = GetPrivateProfileIntA("camera",  "FreeCamera", 0, ini) != 0;
         g_aimedCast  = GetPrivateProfileIntA("actions", "AimedCast", 0, ini) != 0;
         {   // v40: gap between the state's natural AnimEnd and our exit.
-            // 90 (default) = the v39 timing that killed the hop. If a cast
-            // leaves a weird stance on hardware, raise it (250/400) to move
+            // 90 (default) = the v39 timing that removed the pose snap. If
+            // a cast leaves a weird stance on hardware, raise it (250/400)
+            // to move
             // back toward the v38 timing - or lower it toward 40. The code
-            // fallback MUST equal the shipped ini default.
+            // fallback MUST equal the shipped ini default. (v48: the hop is
+            // now cancelled separately by NoDip - this knob moves WHEN the
+            // cast state ends, not how the landing looks.)
             int ca = GetPrivateProfileIntA("actions", "CastExitAdj", 90, ini);
             if (ca < 40) ca = 40;
             if (ca > 600) ca = 600;
@@ -5645,30 +5204,22 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             else if (_stricmp(cc, "min")       == 0) g_cleanupChain = 2;
             else if (_stricmp(cc, "exitanim")  == 0) g_cleanupChain = 3;
         }
-        {   // v25: ms after release before the cleanup chain fires. If the
-            // chain interrupts the cast anim mid-phase (the hop), a later
-            // fire may let the engine finish it cleanly. Try 2200.
+        {   // v25: fallback delay - ms after the fire before the exit chain
+            // runs, used when the cast animation's own AnimEnd is not
+            // visible (Wine never emits one). When it IS visible the chain
+            // runs at AnimEnd + CastExitAdj instead (v40). Range 400..2600.
             int cd = GetPrivateProfileIntA("actions", "CleanupDelay", 1200,
                                            ini);
             if (cd >= 400 && cd <= 2600) g_cleanupDelay = cd;
         }
-        {   // v28: split-chain hop fix. Phase A (blendOut+StopCasting)
-            // fires at CleanupDelay, phase B (state exit+Switch+AnimEnd)
-            // CleanupSplit ms later - the exit lands on a faded pose
-            // instead of snapping the cast pose mid-anim. 0 = v27's
-            // single-pass chain (hop but proven no-hang).
-            int cs = GetPrivateProfileIntA("actions", "CleanupSplit", 0,
-                                           ini);   // fallback MUST equal the
-                                           // shipped default (v31 lesson)
-            if (cs >= 0 && cs <= 2600) g_cleanupSplit = cs;
+        {   // v48: cancel the exit micro-fall (the hop) instead of only
+            // swallowing its animation. 1 = on (default). If a cast ever
+            // leaves her hovering or glued on a step, set NoDip=0 to get
+            // the v47 behaviour back (fall + swallowed landing anim) and
+            // send me the log - the [nodip] lines say what it did.
+            g_noDip = GetPrivateProfileIntA("actions", "NoDip", 1, ini) != 0;
         }
-        {   // v27 isolation knobs - defaults reproduce v23's proven-exiting
-            // behavior exactly (guards OFF). Only flip ONE at a time on
-            // hardware, and note what changed in the report.
-            g_hopGuard  = GetPrivateProfileIntA("actions", "HopGuard",  0,
-                                                ini) != 0;
-            g_reAssert  = GetPrivateProfileIntA("actions", "ReAssert",  0,
-                                                ini) != 0;
+        {   // v24/v26 isolation knobs for the aim glow.
             g_bodyClear = GetPrivateProfileIntA("actions", "BodyClear", 1,
                                                 ini) != 0;
             g_panePark  = GetPrivateProfileIntA("actions", "PanePark",  1,

@@ -1,6 +1,6 @@
 ===========================================================================
  HP3-SPLITSCREEN - REVERSE-ENGINEERING FINDINGS
- Accumulated while building the split-screen mod (v1 .. v47, 2026-08/09)
+ Accumulated while building the split-screen mod (v1 .. v48, 2026-08/09)
  Everything below was verified in the running game unless marked otherwise.
 ===========================================================================
 
@@ -166,39 +166,73 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
     * Wine never emits StateCasting.AnimEnd (hardware does, ~650ms after
       fire).
 - The post-cast problems and their fixes, in order of discovery:
-    * HOP: a fresh-spawn micro-fall at the cast exit dips below the floor
-      and the engine plays PlayFalling/PlayLandingAnimation - swallow
-      those two calls for ~1.5s after each exit. Hardware-proven 100%
-      swallow rate.
-    * STUCK POSES / WRONG MESH YAW after casts: the exit can leave the
-      mesh (animation) out of sync with the actor; walking away during
-      the wind-down used to miss the fix window entirely.
-    * The fix is ONE ChangeAnimation re-pick shortly after the cast
-      settles. v40-v46 tried polling designs (fixed window after the
-      exit, gated by cast-activity clocks). They failed in a specific,
-      reproducible way: rapid re-casts re-armed the window/clocks against
-      the WRONG cast, and the re-pick interrupted a fresh cast mid-aim -
-      on hardware this shipped as a regression (v45) and was pulled.
-    * v47 (final): EVENT-DRIVEN. The ProcessEvent detour watches for the
-      state's own StateCasting.EndState, arms ONE pending re-sync and
-      snapshots the arm context (arm time, current begin-stamp, current
-      fire-stamp). Every frame it executes only if, AT EXECUTION TIME:
-      >=1.2s and <6s since the arm, the player is standing still
-      (300ms stand-still debounce), NO new cast began since the arm
-      (begin-stamp unchanged - covers player aims AND the mod's own
-      cleanup re-cast), nothing fired since the arm (fire-stamp
-      unchanged), the aim glow is dead, and the cast state is quiet
-      300ms. Otherwise the need expires - a skipped re-sync is always
-      safer than a mis-timed one. Any newer cast simply gets its own
-      re-sync at its own exit.
+    * HOP: the state exit re-enables physics and the pawn free-falls the
+      fraction of a unit the cast pose held her above the floor.
+      MEASURED on hardware (v47 log, every cast): 874.75 -> 872.3 in
+      ~130ms (vz -61, phys 2) -> snapped back to 874.5 by the landing.
+      v38 swallowed PlayFalling + PlayLandingAnimation for 1.5s after
+      each exit (100% swallow rate, hardware-proven) - that hid the
+      ANIMATION but not the dip, and it also removed the engine's own
+      landing animation, i.e. the very thing that used to re-settle the
+      pose and the facing. That is why a hop that slipped through the
+      swallow "fixed" everything, and why the user could describe the
+      hop as the cure.
+    * STUCK POSES / WRONG MESH YAW after casts: the exit leaves the mesh
+      (animation) out of sync with the actor; the fix is ONE
+      ChangeAnimation re-pick shortly after the cast settles.
+    * v40-v46 tried polling designs (fixed window after the exit, gated
+      by cast-activity clocks). They failed reproducibly: rapid re-casts
+      re-armed the window/clocks against the WRONG cast, and the re-pick
+      interrupted a fresh cast mid-aim (shipped as v45, pulled).
+    * v47 went event-driven with six execution-time gates. Correct, but
+      too strict: in the v47 hardware log the re-pick FIRED ONCE IN TEN
+      casts. One gate is the visible reason - g_ownCastAt ("3s after a
+      cast began") was meant for the mod's own cleanup re-cast, but
+      beginCast() stamps it for player casts too, so it delayed every
+      ordinary cast. The pose and the facing therefore only came right
+      on the casts that happened to hop.
+    * v48 (current) - three symptoms, three fixes, one owner:
+        - STUCK POSE: the cleanup kept its per-cast bookkeeping in
+          function-local statics inside finishPendingCasts() that were
+          only cleared when a cast's 4s watch expired. A cast that
+          began before the previous one's window ended inherited
+          "chain already fired / already verified" and got NO exit at
+          all (v47 hw log, second cast of the first window: no
+          [castclean] line, pose parked 3s until a stale tick-retry).
+          Now there is ONE CastRun per cast: created when the spell
+          leaves (castRunStart), dropped the moment a newer cast owns
+          the pawn (g_beginCastAt moves) or the 4s watch ends. Every
+          step is bound to that run, so no stale state can survive a
+          re-cast. exit -> verify (EndState seen, or StateCasting.Tick
+          stopped; else re-issue the exit up to twice, 700ms apart) ->
+          settle -> done, all logged as [cast] run#N.
+        - HOP: cancelled at the source (castDipGuard). For 900ms after
+          the exit (longer while the fall keeps coming back, capped at
+          2s), any PHYS_Falling frame that is only the exit dip - small
+          downward velocity, still where the cast happened, nobody
+          jumping, within 24 units of the height she stood at - is put
+          back on that height with vz=0 and re-glued with PHYS_Walking
+          (the state the mod keeps her in while standing anyway). No
+          fall, no landing, no hop. The v38 swallow stays as a
+          backstop. NoDip=0 in the ini restores the old behaviour.
+        - POSE / YAW: the ChangeAnimation re-pick now runs once per
+          cast, 450ms after a verified exit, the first moment the pawn
+          stands still - and it stays armed for the rest of the run, so
+          a walk-away still gets it when she stops. The actor's
+          Rotation and DesiredRotation are re-written to the view yaw
+          at that same instant, so the animation the engine picks is
+          the one facing the camera.
+    * The height to land her on is simply the height she was standing
+      at when the spell left (castRunStart). v35-v37 tried to derive a
+      "physics rest height" from a ring of standing samples; those
+      samples were taken in the mod's own PHYS_None standing state, so
+      they recorded the frozen standing height, not the floor, and the
+      pre-exit settle moved her 0.1 units at best ("already level" in
+      the v47 log, right before a 2.5-unit dip). The ring is gone.
     * The aim glow (the game's own cursor actor) is the only reliable
       live signal of the AIM phase: StateCasting does not Tick during
       aiming on either platform, so an in-progress aim is invisible to
       state-tick telemetry and is pre-fire on the fire stamp.
-    * The mod's OWN casts (the cleanup chain feature re-casts
-      ~0.7-1.1s after each exit by design) are invisible to engine
-      telemetry side-effects - stamp them at the call site and veto on
-      that clock (3000ms covers aim+fire+exit).
 - Engineering lessons, generalized:
     * Compare against SNAPSHOTS taken when the need was armed, never
       against live clocks: a "chain stamp" set at every exit is
@@ -212,6 +246,17 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       bug silently disabled a whole detection path for a day of runs.
     * Single-variable discipline for animation changes; prefer reverting
       to proven behavior over adding new gating.
+    * NEVER keep per-event state in function-local statics whose reset
+      is tied to a different event's timeline. v48's stuck-pose bug is
+      the textbook case: "clear the per-cast flags when the watch window
+      expires" is not the same event as "a new cast started", and the
+      two diverge exactly when the user does the thing users do - cast
+      again quickly. Model the lifetime explicitly (one struct, reset
+      where the event happens).
+    * A guard that fires on 1 of 10 casts is a bug, not a safety margin.
+      Count outcomes in the log before calling a fix done: the v47 log
+      holds one [realign] FIRE for ten casts, and that single number is
+      the entire user report.
 
 8. PHYSICS NOTES
 ----------------
@@ -234,8 +279,10 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
 - Behavioral differences that mattered (see §7): BeginState logging ~50%
   on Wine, Tick stops at fire on Wine (~1.7s on hw), AnimEnd never on
   Wine. A veto stack tuned on Wine alone can still be wrong on hardware;
-  the final design (event-driven + snapshots + own-cast clock) is
-  platform-neutral because it depends on none of the shaky signals.
+  the v48 design (one run per cast, verified by the state's OWN events
+  plus tick silence, with an explicit "no telemetry = trust the chain"
+  branch for Wine) is platform-neutral because it depends on none of
+  the shaky signals.
 - Wine runs die silently late in long sessions every time - environment,
   not the mod; judge by log completeness.
 
@@ -258,10 +305,14 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
 - Far-hall crash (pre-existing; phys=5 harbinger) - root cause unknown.
 - The "D-hunt" (an unidentified object/field named D in early dumps).
 - Per-player HUD (the vanilla HUD is single-player aware only).
-- The tiny idle-restart stutter on CLEAN casts: the re-sync re-picks the
-  idle animation ~1.2s after every cast even when the exit settled
-  perfectly. Removing it needs need-gating built ON TOP of the v47
-  arm-snapshot design (the v45 attempt failed because it gated on live
-  clocks - see §7). Cast playback correctness outranks this cosmetic.
+- The tiny idle-restart stutter on CLEAN casts (the re-sync re-picks the
+  idle animation after every cast even when the exit settled perfectly).
+  v48 re-picks on every cast by design - pose and yaw correctness
+  outranks this cosmetic. The honest gate, if it ever annoys, is a real
+  mesh-yaw measurement: Engine.Actor.Mesh is an ASSET reference, so the
+  current meshYawDelta() reads garbage (it reports mesh=0 in every hw
+  log - see the v41 note in §7). Finding the real mesh component
+  offset would let the re-pick fire only when the pose is actually
+  wrong.
 - upkg2.py v129 export table.
 ===========================================================================
