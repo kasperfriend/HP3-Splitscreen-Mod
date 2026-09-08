@@ -33,6 +33,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <mmsystem.h>
+#include <stdlib.h>
 #include "cast_ground.h"
 
 // ------------------------------- config ------------------------------------
@@ -130,8 +131,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v50"
-#define MOD_STAMP   "build v50 - 2026-09-08 - CAST GAMEPLAY: keep the v49 floor/pose recovery, but make player 2+ spells hit gameplay targets like player 1. Each release now traces along the camera spell line for SpellTrigger/cast objects, passes that target through castSpell/playCast/SpawnSpell, and directly invokes the target spell/trigger script as a safety net so doors, buttons and lesson objects activate instead of only playing the cast animation. [castgame] lines show target acquisition and activation."
+#define MOD_BUILD  "v51"
+#define MOD_STAMP   "build v51 - 2026-09-08 - CAST GAMEPLAY, PLAYER-1 FAITHFUL: player 2+ casts now follow the original cast path. Castable objects are found by their own vulnerableTo/targeting properties and spell handlers (statues, jump pads, doors - not just actors named SpellTrigger), the spell class is chosen FROM the target like the wand does, the projectile keeps the target (homing) and flies at it, and when it arrives the game's own spell ProcessTouch / trigger Touch runs the object's handler (the wand's autohit path). [castgame-scan], [castgame], [castgame-fn] and [pelog] spell/handler events show every step in hp3mod.log."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -437,6 +438,25 @@ static const char *objName(void *o, char *out, int cch)
     if (!w || IsBadReadPtr((void *)w, 2)) { strcpy(out, "<noname>"); return out; }
     WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cch, NULL, NULL);
     out[cch - 1] = 0;
+    return out;
+}
+
+// Just the object's own name ("ProcessTouch"), no outer chain: far cheaper
+// than GetFullName, for hot-path filters.
+static const char *objShortName(void *o, char *out, int cch)
+{
+    out[0] = 0;
+    if (!o || !g_GetName || IsBadReadPtr(o, 0x30)) return out;
+    const wchar_t *w = g_GetName(o, NULL);
+    if (!w || IsBadReadPtr((void *)w, 2)) return out;
+    int k = 0;
+    for (; k < cch - 1; k++) {
+        if (k && (((ULONG_PTR)(w + k)) & 0xFFF) == 0 && IsBadReadPtr((void *)(w + k), 2)) break;
+        if (!w[k]) break;
+        if (w[k] < 0x20 || w[k] > 0x7E) { out[0] = 0; return out; }   // not a name
+        out[k] = (char)w[k];
+    }
+    out[k] = 0;
     return out;
 }
 
@@ -1465,220 +1485,1291 @@ static BOOL functionPath(void *fn, char *out, int cch)
     return TRUE;
 }
 
-// Find a script method declared directly on an actor's runtime class. This is
-// safer than calling Engine.Actor.Trigger for everything: ProcessEvent executes
-// the UFunction object we hand it, so for script overrides we want the class's
-// own Function object when it exists.
-static void *findActorMethod(void *actor, const char *method)
+// ===========================================================================
+// v51: CAST GAMEPLAY, PLAYER-1 FAITHFUL.
+//
+// How the original player's cast activates statues, pads, doors and lesson
+// objects (KnowWonder KWGame framework, confirmed against the Shrek 2 KWGame
+// export and the HP2 script decompile - both the same engine family):
+//
+//   1. TARGETING: every KW actor carries a "Reaction/Targeting" property
+//      block: vulnerableToClass (Class<Projectile> - the SPELL CLASS the
+//      object reacts to), SizeModifier, CentreOffset, GestureDistance,
+//      bMustClickToTarget. The SelectCursor/SpellCursor traces the camera
+//      line and accepts only actors whose vulnerableToClass != None.
+//   2. SPELL CHOICE: the spell is CHOSEN FROM THE TARGET (baseWand.
+//      ChooseSpell(target.eVulnerableToSpell) in HP2 -> the class stored on
+//      the object in HP3). HP3 has no manual spell selection for a reason.
+//   3. ACTIVATION: the projectile flies with TargetActor set (homing) and on
+//      collision runs spell.ProcessTouch(Other, HitLocation), which calls the
+//      object's HandleSpell<Name>(spell, hitLoc) / OnSpellHit(spell, hitLoc)
+//      handler; SpellTrigger-family actors fire through Trigger.Touch(spell)
+//      + IsRelevant (spell type must match). Close targets get an immediate
+//      spell.ProcessTouch(target, target.Location) ("autohit").
+//
+// v50 had none of this: it fired the DEFAULT spell (Rictusempra) with no
+// TargetActor, only recognised actors literally named "SpellTrigger", and
+// its fallback was a plain Trigger(caster, caster) - which a spell trigger
+// ignores. Statues and jump pads therefore never qualified, never got the
+// right spell class, and never received a spell touch.
+//
+// v51 replicates the real path with reflection only (no source needed):
+//   * one pass over the object table indexes the vulnerable/targeting
+//     properties and the spell-handler functions of every class, and
+//     calibrates UObject::Class + UStruct::SuperField so an actor's class
+//     chain can be walked (cgClassInfo);
+//   * candidates = actors whose vulnerableToClass value is a live class
+//     (plus SpellTrigger-family actors); the release ray picks the one under
+//     the camera spell line (CentreOffset/SizeModifier honoured, LOS
+//     checked), exactly like the cursor;
+//   * the spell class comes from the target (ChooseSpell/StartCasting/
+//     castSpell/SpawnSpell all get it), the target goes in as TargetActor;
+//   * after the projectile leaves, a pending "hit" watches it: when it
+//     reaches the target (or the flight deadline passes with it still
+//     alive) the mod runs the game's own spell.ProcessTouch(target, loc) -
+//     the autohit path - so the object's handler runs through the game's
+//     code, not ours. Trigger-family targets also get Touch(spell).
+//   * everything is logged as [castgame] / [castgame-scan] / [castgame-fn]
+//     so a hardware log shows the class, the property, the chosen spell,
+//     the flight and the exact handler that ran.
+// ===========================================================================
+#define CG_MAX_IDX   2560
+#define CG_MAX_CLS   1024
+#define CG_MAX_CAND  384
+#define CG_MAX_KCLS  4096
+
+enum { CGK_VULNCLS = 1, CGK_VULNBYTE, CGK_SPELLCLS, CGK_SIZE, CGK_CENTRE,
+       CGK_FN_HANDLE, CGK_FN_PTOUCH, CGK_FN_TOUCH, CGK_FN_TRIGGER };
+enum { CGC_NONE = 0, CGC_VULN, CGC_VULNBYTE, CGC_TRIG, CGC_FN, CGC_NAME };
+
+struct CgIdx { void *obj; int kind; int off; DWORD declHash; BOOL stateFn;
+               char decl[80]; char name[40]; };
+struct CgClass {
+    void *cls; char token[48]; char path[96];
+    BOOL isActor, isPawn, isHero, isProjectile, isTrigger, nameSpellTrigger,
+         nameTrigger;
+    int  vulnOff, vulnByteOff, spellClsOff, sizeOff, centreOff;
+    char vulnName[40];
+    void *fnPTouch, *fnTouch, *fnTrigger;
+    char  pTouchDecl[80], touchDecl[80];
+    BOOL  handlerSpellTried;
+    void *fnGen[4];  char genName[4][40];  char genDecl[4][80];  BOOL genState[4];  int nGen;  // OnSpellHit..
+    void *fnSpec[8]; char specName[8][40]; char specDecl[8][80]; BOOL specState[8]; int nSpec; // HandleSpell<Name>
+    void *handlerSpell;   // spell class implied by the HandleSpell<Name> handlers
+    char  handlerSpellFrom[40];
+};
+struct CgCand {
+    void *obj; int slot; char name[96]; CgClass *info; void *spellCls;
+    int kind; float loc[3];
+};
+struct CgPending {
+    BOOL active; int player;
+    void *spell; int spellSlot; char spellName[96]; void *spellClsPtr;
+    void *target; int targetSlot; char targetName[96]; CgClass *tinfo;
+    void *spellCls; void *caster;
+    DWORD fireAt, deadline; float hitR; float aim[3]; float d0;
+};
+struct CgFnLayout {
+    void *fn; int n; int total;
+    struct { int off; int kind; char name[32]; } p[12];
+};
+
+static CgIdx    g_cgIdx[CG_MAX_IDX];  static int g_cgNIdx = 0;
+static CgClass  g_cgCls[CG_MAX_CLS];  static int g_cgNCls = 0;
+static CgCand   g_cgCand[CG_MAX_CAND]; static int g_cgNCand = 0;
+static void    *g_cgKCls[CG_MAX_KCLS]; static int g_cgNKCls = 0;
+static CgPending g_cgPend[8];
+static CgFnLayout g_cgLay[24]; static int g_cgNLay = 0;
+static BOOL  g_cgReady = FALSE, g_cgChainOK = FALSE, g_cgScanLogged = FALSE;
+static DWORD g_cgScanAt = 0;
+static int   g_offObjClass = -1, g_offSuper = -1;
+static void *g_clsActor = NULL, *g_clsPawn = NULL, *g_clsHPChar = NULL,
+            *g_clsTrigger = NULL, *g_clsProjectile = NULL;
+static int   g_cgNVulnDecl = 0, g_cgNHandlerDecl = 0;
+static void *g_cgBeginCls[8] = {0};      // spell class chosen at aim start
+static char  g_cgLockName[8][96];        // aim-glow lock change logging
+static BOOL  g_castAutoHit = TRUE;       // ini [actions] CastAutoHit
+static int   g_cgPelogExtra = 0;         // spell/handler events per window
+static int   g_cgP1Windows = 0;          // telemetry windows opened for P1 casts (per level)
+static BOOL  g_pelogOn    = FALSE;       // ProcessEvent capture window (see pelog)
+
+static void cgResetLevel(void)
 {
-    if (!actor || !method || !g_objArray) return NULL;
-    char cls[96];
-    if (!objectClassToken(actor, cls, sizeof(cls))) return NULL;
+    g_cgReady = FALSE; g_cgChainOK = FALSE; g_cgScanLogged = FALSE;
+    g_cgNIdx = g_cgNCls = g_cgNCand = g_cgNKCls = g_cgNLay = 0;
+    g_cgScanAt = 0; g_offObjClass = g_offSuper = -1;
+    g_clsActor = g_clsPawn = g_clsHPChar = g_clsTrigger = g_clsProjectile = NULL;
+    g_cgNVulnDecl = g_cgNHandlerDecl = 0;
+    memset(g_cgPend, 0, sizeof(g_cgPend));
+    memset(g_cgBeginCls, 0, sizeof(g_cgBeginCls));
+    memset(g_cgLockName, 0, sizeof(g_cgLockName));
+    g_cgP1Windows = 0;
+}
+
+static const char *cgLastComp(const char *path)
+{
+    const char *d = strrchr(path, '.');
+    return d ? d + 1 : path;
+}
+static DWORD cgHash(const char *s)
+{
+    DWORD h = 5381;
+    while (*s) h = ((h << 5) + h) ^ (BYTE)*s++;
+    return h;
+}
+
+// Known-class set: the ONLY pointers we ever treat as UClass objects. A
+// property value or a struct field is never dereferenced through the name
+// helpers unless it is one of these (GetFullName on garbage would crash).
+static int cgKClsCmp(const void *a, const void *b)
+{
+    const void *x = *(void *const *)a, *y = *(void *const *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+static BOOL cgIsKnownClass(void *p)
+{
+    if (!p || g_cgNKCls <= 0) return FALSE;
+    int lo = 0, hi = g_cgNKCls - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (g_cgKCls[mid] == p) return TRUE;
+        if (g_cgKCls[mid] < p) lo = mid + 1; else hi = mid - 1;
+    }
+    return FALSE;
+}
+static void *cgClassOf(void *o)
+{
+    if (g_offObjClass < 0 || !o || IsBadReadPtr(o, g_offObjClass + 4)) return NULL;
+    void *c = *(void **)((BYTE *)o + g_offObjClass);
+    return cgIsKnownClass(c) ? c : NULL;
+}
+static void *cgSuper(void *c)
+{
+    if (g_offSuper < 0 || !c || IsBadReadPtr(c, g_offSuper + 4)) return NULL;
+    void *s = *(void **)((BYTE *)c + g_offSuper);
+    return (s != c && cgIsKnownClass(s)) ? s : NULL;
+}
+
+// Find the one dword offset at which every (instance, expected pointer) pair
+// agrees. Same calibration idea as UProperty::Offset (FINDINGS section 4).
+static int cgCalibratePtrField(void *inst[], void *want[], int n, int maxOff,
+                               const char *what)
+{
+    int cand[4][48], nc[4] = {0, 0, 0, 0}, used = 0;
+    for (int k = 0; k < n && k < 4; k++) {
+        if (!inst[k] || !want[k] || IsBadReadPtr(inst[k], maxOff + 4)) continue;
+        for (int off = 0; off <= maxOff && nc[used] < 48; off += 4)
+            if (*(void **)((BYTE *)inst[k] + off) == want[k]) cand[used][nc[used]++] = off;
+        if (nc[used]) used++;
+    }
+    if (used == 0) { logf_("  [castgame] %s: no calibration pairs available", what); return -1; }
+    int found = -1, hits = 0;
+    for (int a = 0; a < nc[0]; a++) {
+        BOOL all = TRUE;
+        for (int k = 1; k < used && all; k++) {
+            BOOL any = FALSE;
+            for (int b = 0; b < nc[k]; b++) if (cand[k][b] == cand[0][a]) { any = TRUE; break; }
+            all = any;
+        }
+        if (all) { found = cand[0][a]; hits++; }
+    }
+    if (hits != 1) {
+        logf_("  [castgame] %s: %d consistent offsets across %d pairs - unusable",
+              what, hits, used);
+        return -1;
+    }
+    logf_("  [castgame] %s = +0x%X (%d pairs agree)", what, found, used);
+    return found;
+}
+
+// One pass over the object table: class set, calibration anchors, and the
+// property/function index the whole feature runs on.
+static void cgBuildIndex(void)
+{
+    if (g_cgReady) return;
+    if (g_propOffsetField < 0) calibratePropertyOffset();
+    if (g_propOffsetField < 0) {
+        static DWORD sSaidAt = 0;
+        if (GetTickCount() - sSaidAt > 10000) {
+            sSaidAt = GetTickCount();
+            logf_("  [castgame] property offsets not calibrated yet - index deferred");
+        }
+        return;
+    }
+    g_cgReady = TRUE;
+    g_cgNIdx = g_cgNCls = g_cgNKCls = g_cgNLay = 0; g_cgNCand = 0;
+    g_cgNVulnDecl = g_cgNHandlerDecl = 0;
+    g_cgChainOK = FALSE; g_offObjClass = g_offSuper = -1;
+    if (!g_objArray || IsBadReadPtr(g_objArray, sizeof(TArrayLite))) return;
     int n = g_objArray->Num;
-    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return NULL;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+    void *clsFunction = NULL, *clsStructProp = NULL, *clsByteProp = NULL,
+         *clsController = NULL, *clsPlayerCtrl = NULL, *clsFloatProp = NULL;
+    void *instLoc = NULL, *instTrig = NULL, *instPhys = NULL, *instGS = NULL;
+    DWORD t0 = GetTickCount();
     char buf[300];
     for (int i = 0; i < n; i++) {
         void *o = g_objArray->Data[i];
         if (!o) continue;
         objName(o, buf, sizeof(buf));
-        if (strncmp(buf, "Function ", 9)) continue;
-        const char *path = buf + 9;
-        const char *last = strrchr(path, '.');
-        if (!last || _stricmp(last + 1, method)) continue;
-        const char *prev = last;
-        while (prev > path && prev[-1] != '.') prev--;
-        int clen = (int)(last - prev);
-        if ((int)strlen(cls) == clen && _strnicmp(prev, cls, clen) == 0)
-            return o;
-        // Many level actors are subclasses whose visible class token carries
-        // a map/game-specific prefix, while the useful handler lives on the
-        // shared SpellTrigger class. Accept that base handler only for the
-        // spell-trigger family.
-        if (ciHas(cls, "SpellTrigger") && clen == 12 &&
-            _strnicmp(prev, "SpellTrigger", clen) == 0)
-            return o;
+        char *sp = strchr(buf, ' ');
+        if (!sp) continue;
+        *sp = 0;
+        const char *tok = buf, *path = sp + 1;
+        if (!strcmp(tok, "Class")) {
+            if (g_cgNKCls < CG_MAX_KCLS) g_cgKCls[g_cgNKCls++] = o;
+            if      (!strcmp(path, "Engine.Actor"))            g_clsActor = o;
+            else if (!strcmp(path, "Engine.Pawn"))             g_clsPawn = o;
+            else if (!strcmp(path, "Engine.Controller"))       clsController = o;
+            else if (!strcmp(path, "Engine.PlayerController")) clsPlayerCtrl = o;
+            else if (!strcmp(path, "Engine.Trigger"))          g_clsTrigger = o;
+            else if (!strcmp(path, "Engine.Projectile"))       g_clsProjectile = o;
+            else if (!_stricmp(path, "hgame.HPCharacter"))     g_clsHPChar = o;
+            else if (!strcmp(path, "Core.Function"))           clsFunction = o;
+            else if (!strcmp(path, "Core.StructProperty"))     clsStructProp = o;
+            else if (!strcmp(path, "Core.ByteProperty"))       clsByteProp = o;
+            else if (!strcmp(path, "Core.FloatProperty"))      clsFloatProp = o;
+            continue;
+        }
+        int dots = 0;
+        for (const char *c = path; *c; c++) if (*c == '.') dots++;
+        BOOL isFn = !strcmp(tok, "Function");
+        // Pkg.Class.Member, plus Pkg.Class.State.Handler for spell handlers
+        // (HP2's SpongifyPad keeps HandleSpellSpongify inside a state).
+        if (dots != 2 && !(dots == 3 && isFn)) continue;
+        const char *name = cgLastComp(path);
+        int kind = 0;
+        if (!strcmp(tok, "ClassProperty")) {
+            if (ciHas(name, "vulnerable")) kind = CGK_VULNCLS;
+            else if (ciHas(name, "spell") && (ciHas(name, "react") || ciHas(name, "activ") ||
+                     ciHas(name, "require") || ciHas(name, "need") || ciHas(name, "trigger") ||
+                     ciHas(name, "accept") || ciHas(name, "open") || ciHas(name, "unlock")))
+                kind = CGK_SPELLCLS;
+        } else if (!strcmp(tok, "ByteProperty")) {
+            if (ciHas(name, "vulnerable")) kind = CGK_VULNBYTE;
+            else if (!strcmp(path, "Engine.Actor.Physics")) instPhys = o;
+        } else if (!strcmp(tok, "FloatProperty")) {
+            if (!_stricmp(name, "SizeModifier")) kind = CGK_SIZE;
+            else if (!strcmp(path, "Engine.Pawn.GroundSpeed")) instGS = o;
+        } else if (!strcmp(tok, "StructProperty")) {
+            if (!_stricmp(name, "CentreOffset") || !_stricmp(name, "CenterOffset"))
+                kind = CGK_CENTRE;
+            else if (!strcmp(path, "Engine.Actor.Location")) instLoc = o;
+        } else if (isFn) {
+            if (!strcmp(path, "Engine.Actor.Trigger")) instTrig = o;
+            if (!_strnicmp(name, "HandleSpell", 11) || !_stricmp(name, "OnHandleSpell") ||
+                !_stricmp(name, "OnSpellHit") || !_stricmp(name, "SpellHit") ||
+                !_strnicmp(name, "HitBySpell", 10) || !_strnicmp(name, "OnHitBySpell", 12))
+                kind = CGK_FN_HANDLE;
+            else if (dots == 3)                       continue; // class-level only below
+            else if (!_stricmp(name, "ProcessTouch")) kind = CGK_FN_PTOUCH;
+            else if (!_stricmp(name, "Touch"))        kind = CGK_FN_TOUCH;
+            else if (!_stricmp(name, "Trigger"))      kind = CGK_FN_TRIGGER;
+        }
+        if (!kind || g_cgNIdx >= CG_MAX_IDX) continue;
+        CgIdx *e = &g_cgIdx[g_cgNIdx];
+        e->obj = o; e->kind = kind; e->off = -1; e->stateFn = (dots == 3);
+        if (kind <= CGK_CENTRE) {
+            if (g_propOffsetField < 0 || IsBadReadPtr(o, g_propOffsetField + 4)) continue;
+            e->off = (int)*(DWORD *)((BYTE *)o + g_propOffsetField);
+            if (e->off < 0 || e->off > 0x4000) continue;
+        }
+        // decl = Pkg.Class (cut at the second dot)
+        const char *d1 = strchr(path, '.');
+        const char *d2 = d1 ? strchr(d1 + 1, '.') : NULL;
+        int dl = d2 ? (int)(d2 - path) : 0;
+        if (dl <= 0 || dl >= (int)sizeof(e->decl)) continue;
+        memcpy(e->decl, path, dl); e->decl[dl] = 0;
+        e->declHash = cgHash(e->decl);
+        strncpy(e->name, name, sizeof(e->name) - 1); e->name[sizeof(e->name) - 1] = 0;
+        if (kind == CGK_VULNCLS || kind == CGK_VULNBYTE) g_cgNVulnDecl++;
+        if (kind == CGK_FN_HANDLE) g_cgNHandlerDecl++;
+        g_cgNIdx++;
+    }
+    qsort(g_cgKCls, g_cgNKCls, sizeof(void *), cgKClsCmp);
+    if (g_cgNKCls >= CG_MAX_KCLS)
+        logf_("  [castgame] WARNING: class set capped at %d - some actors will be ignored", CG_MAX_KCLS);
+
+    // UObject::Class - the pointer inside an instance that names its class.
+    {
+        void *inst[4] = { instLoc, instTrig, instPhys, instGS };
+        void *want[4] = { clsStructProp, clsFunction, clsByteProp, clsFloatProp };
+        g_offObjClass = cgCalibratePtrField(inst, want, 4, 0x60, "UObject::Class");
+    }
+    // UStruct::SuperField - the parent class pointer inside a UClass.
+    {
+        void *inst[3] = { g_clsPawn, clsPlayerCtrl, g_clsProjectile };
+        void *want[3] = { g_clsActor, clsController, g_clsActor };
+        g_offSuper = cgCalibratePtrField(inst, want, 3, 0xE0, "UStruct::SuperField");
+    }
+    // Prove the chain on a pawn we know: its class must reach Engine.Pawn
+    // and Engine.Actor, or the whole chain feature is disabled (name-only
+    // fallback) instead of trusting a wrong dword.
+    if (g_offObjClass >= 0 && g_offSuper >= 0 && g_clsActor && g_clsPawn) {
+        void *probe = g_pawn[1] ? g_pawn[1] : (g_pawn[0] ? g_pawn[0] : findActorByClass("harry"));
+        void *c = cgClassOf(probe);
+        BOOL sawPawn = FALSE, sawActor = FALSE; int depth = 0;
+        while (c && depth++ < 32) {
+            if (c == g_clsPawn) sawPawn = TRUE;
+            if (c == g_clsActor) sawActor = TRUE;
+            c = cgSuper(c);
+        }
+        g_cgChainOK = sawPawn && sawActor;
+        char cb[160];
+        logf_("  [castgame] class chain %s (probe %s: depth=%d pawn=%d actor=%d)",
+              g_cgChainOK ? "VERIFIED" : "FAILED - name-only fallback",
+              probe ? objName(probe, cb, sizeof(cb)) : "<none>", depth, sawPawn, sawActor);
+    } else {
+        logf_("  [castgame] class chain unavailable (Class=+0x%X Super=+0x%X "
+              "Actor=%p Pawn=%p) - name-only fallback", g_offObjClass, g_offSuper,
+              g_clsActor, g_clsPawn);
+    }
+    int nv = 0, nb = 0, ns = 0, nh = 0, npt = 0;
+    for (int k = 0; k < g_cgNIdx; k++) {
+        switch (g_cgIdx[k].kind) {
+            case CGK_VULNCLS: nv++; break;   case CGK_VULNBYTE: nb++; break;
+            case CGK_SPELLCLS: ns++; break;  case CGK_FN_HANDLE: nh++; break;
+            case CGK_FN_PTOUCH: npt++; break; default: break;
+        }
+    }
+    logf_("  [castgame] index: %d classes, %d entries (vulnerableToClass-like=%d "
+          "vulnerable bytes=%d spell ClassProps=%d spell handlers=%d ProcessTouch=%d) "
+          "in %lums", g_cgNKCls, g_cgNIdx, nv, nb, ns, nh, npt,
+          (unsigned long)(GetTickCount() - t0));
+    int shown = 0;
+    for (int k = 0; k < g_cgNIdx && shown < 14; k++) {
+        CgIdx *e = &g_cgIdx[k];
+        if (e->kind == CGK_VULNCLS || e->kind == CGK_VULNBYTE || e->kind == CGK_FN_PTOUCH) {
+            logf_("      %s.%s (+0x%X)", e->decl, e->name, e->off);
+            shown++;
+        }
+    }
+    shown = 0;
+    for (int k = 0; k < g_cgNIdx && shown < 24; k++) {
+        CgIdx *e = &g_cgIdx[k];
+        if (e->kind == CGK_FN_HANDLE) { logf_("      handler %s.%s", e->decl, e->name); shown++; }
+    }
+}
+
+// Everything the cast path needs to know about one class, resolved by walking
+// its class chain against the index (most-derived declaration wins, so the
+// function object we later hand to ProcessEvent is the real override).
+static CgClass *cgClassInfo(void *cls)
+{
+    if (!cls) return NULL;
+    for (int k = 0; k < g_cgNCls; k++) if (g_cgCls[k].cls == cls) return &g_cgCls[k];
+    if (g_cgNCls >= CG_MAX_CLS) {
+        static BOOL sWarned = FALSE;
+        if (!sWarned) { sWarned = TRUE; logf_("  [castgame] class cache full (%d) - later classes ignored", CG_MAX_CLS); }
+        return NULL;
+    }
+    CgClass *ci = &g_cgCls[g_cgNCls++];
+    memset(ci, 0, sizeof(*ci));
+    ci->cls = cls;
+    ci->vulnOff = ci->vulnByteOff = ci->spellClsOff = ci->sizeOff = ci->centreOff = -1;
+    char buf[300];
+    objName(cls, buf, sizeof(buf));
+    const char *sp = strchr(buf, ' ');
+    if (sp) {
+        strncpy(ci->path, sp + 1, sizeof(ci->path) - 1);
+        strncpy(ci->token, cgLastComp(sp + 1), sizeof(ci->token) - 1);
+    }
+    void *c = cls; int depth = 0;
+    while (c && depth++ < 32) {
+        objName(c, buf, sizeof(buf));
+        const char *csp = strchr(buf, ' ');
+        const char *cpath = csp ? csp + 1 : buf;
+        const char *ctok = cgLastComp(cpath);
+        if (c == g_clsActor)      ci->isActor = TRUE;
+        if (c == g_clsPawn)       ci->isPawn = TRUE;
+        if (c == g_clsHPChar)     ci->isHero = TRUE;
+        if (c == g_clsTrigger)    ci->isTrigger = TRUE;
+        if (c == g_clsProjectile) ci->isProjectile = TRUE;
+        if (ciHas(ctok, "SpellTrigger")) ci->nameSpellTrigger = TRUE;
+        if (ciHas(ctok, "Trigger"))      ci->nameTrigger = TRUE;
+        DWORD ph = cgHash(cpath);
+        for (int k = 0; k < g_cgNIdx; k++) {
+            CgIdx *e = &g_cgIdx[k];
+            if (e->declHash != ph || strcmp(e->decl, cpath)) continue;
+            switch (e->kind) {
+            case CGK_VULNCLS:
+                if (ci->vulnOff < 0) { ci->vulnOff = e->off;
+                    strncpy(ci->vulnName, e->name, sizeof(ci->vulnName) - 1); }
+                break;
+            case CGK_VULNBYTE: if (ci->vulnByteOff < 0) ci->vulnByteOff = e->off; break;
+            case CGK_SPELLCLS: if (ci->spellClsOff < 0) ci->spellClsOff = e->off; break;
+            case CGK_SIZE:     if (ci->sizeOff < 0)     ci->sizeOff = e->off; break;
+            case CGK_CENTRE:   if (ci->centreOff < 0)   ci->centreOff = e->off; break;
+            case CGK_FN_PTOUCH:  if (!ci->fnPTouch) { ci->fnPTouch = e->obj;
+                                     strncpy(ci->pTouchDecl, e->decl, 79); } break;
+            case CGK_FN_TOUCH:   if (!ci->fnTouch) { ci->fnTouch = e->obj;
+                                     strncpy(ci->touchDecl, e->decl, 79); } break;
+            case CGK_FN_TRIGGER: if (!ci->fnTrigger) ci->fnTrigger = e->obj; break;
+            case CGK_FN_HANDLE: {
+                BOOL spec = (_strnicmp(e->name, "HandleSpell", 11) == 0 && strlen(e->name) > 11);
+                if (spec) {
+                    int dup = -1;
+                    for (int s = 0; s < ci->nSpec; s++)
+                        if (!_stricmp(ci->specName[s], e->name)) { dup = s; break; }
+                    if (dup >= 0) {
+                        // same class, class-level declaration beats a state's
+                        if (!e->stateFn && ci->specState[dup] && !strcmp(ci->specDecl[dup], e->decl)) {
+                            ci->fnSpec[dup] = e->obj; ci->specState[dup] = FALSE;
+                        }
+                    } else if (ci->nSpec < 8) {
+                        ci->fnSpec[ci->nSpec] = e->obj;
+                        ci->specState[ci->nSpec] = e->stateFn;
+                        strncpy(ci->specName[ci->nSpec], e->name, 39);
+                        strncpy(ci->specDecl[ci->nSpec], e->decl, 79);
+                        ci->nSpec++;
+                    }
+                } else {
+                    int dup = -1;
+                    for (int s = 0; s < ci->nGen; s++)
+                        if (!_stricmp(ci->genName[s], e->name)) { dup = s; break; }
+                    if (dup >= 0) {
+                        if (!e->stateFn && ci->genState[dup] && !strcmp(ci->genDecl[dup], e->decl)) {
+                            ci->fnGen[dup] = e->obj; ci->genState[dup] = FALSE;
+                        }
+                    } else if (ci->nGen < 4) {
+                        ci->fnGen[ci->nGen] = e->obj;
+                        ci->genState[ci->nGen] = e->stateFn;
+                        strncpy(ci->genName[ci->nGen], e->name, 39);
+                        strncpy(ci->genDecl[ci->nGen], e->decl, 79);
+                        ci->nGen++;
+                    }
+                }
+                break; }
+            default: break;
+            }
+        }
+        c = cgSuper(c);
+    }
+    return ci;
+}
+
+// Handler declarations on the shared bases say nothing about ONE object:
+// HP2's HPawn declares every HandleSpell<Name> as a stub and the real work is
+// in the subclass override. Only handlers declared below these count as
+// "this object reacts to that spell".
+static BOOL cgSharedBaseDecl(const char *decl)
+{
+    if (!decl) return TRUE;
+    if (!_strnicmp(decl, "Engine.", 7) || !_strnicmp(decl, "Core.", 5)) return TRUE;
+    static const char *shared[] = { "hgame.HPPawn", "hgame.HPCharacter", "hgame.HPHeroPawn",
+        "hgame.HPProp", "KWGame.KWPawn", "KWGame.KWPawnNative", "hgame.HPHeroController",
+        "hgame.HPAIController", NULL };
+    for (int k = 0; shared[k]; k++) if (!_stricmp(decl, shared[k])) return TRUE;
+    return FALSE;
+}
+static int cgOwnSpecHandlers(CgClass *ci)
+{
+    int n = 0;
+    if (!ci) return 0;
+    for (int s = 0; s < ci->nSpec; s++) if (!cgSharedBaseDecl(ci->specDecl[s])) n++;
+    return n;
+}
+
+// A Class object by its last path component (case-insensitive), e.g.
+// "LapiforsSpell" -> Class hgame.LapiforsSpell. Known-class set only.
+static void *cgFindClassByToken(const char *tok)
+{
+    if (!tok || !tok[0]) return NULL;
+    char buf[200];
+    for (int k = 0; k < g_cgNKCls; k++) {
+        objName(g_cgKCls[k], buf, sizeof(buf));
+        const char *sp = strchr(buf, ' ');
+        if (!sp) continue;
+        if (!_stricmp(cgLastComp(sp + 1), tok)) return g_cgKCls[k];
     }
     return NULL;
 }
 
-static BOOL looksLikeSpellGameplayTarget(const char *fullName)
+// Statues and pads name the spell they react to in their handler:
+// HandleSpellLapifors -> hgame.LapiforsSpell (or spellLapifors). This is the
+// spell player 1's wand ends up choosing for that object; use it whenever the
+// object does not carry an explicit spell class.
+static void cgResolveHandlerSpell(CgClass *ci)
 {
-    // The map actors player 1 opens/lights/pushes with spells are normally
-    // SpellTrigger-family actors. Keep this intentionally narrow: arbitrary
-    // Trigger actors are use/overlap/cutscene machinery and should not be
-    // fired by a missed spell.
-    return ciHas(fullName, "SpellTrigger") ||
-           (ciHas(fullName, "Cast") && ciHas(fullName, "Trigger"));
+    if (!ci || ci->handlerSpell || !ci->nSpec || ci->handlerSpellTried) return;
+    ci->handlerSpellTried = TRUE;
+    for (int s = 0; s < ci->nSpec && !ci->handlerSpell; s++) {
+        if (cgSharedBaseDecl(ci->specDecl[s])) continue;   // stubs prove nothing
+        const char *tok = ci->specName[s] + 11;
+        if (!tok[0]) continue;
+        char cand[64];
+        _snprintf(cand, sizeof(cand) - 1, "%sSpell", tok); cand[sizeof(cand) - 1] = 0;
+        void *c = cgFindClassByToken(cand);
+        if (!c) { _snprintf(cand, sizeof(cand) - 1, "spell%s", tok); cand[sizeof(cand) - 1] = 0;
+                  c = cgFindClassByToken(cand); }
+        if (!c) c = cgFindClassByToken(tok);
+        if (c) { ci->handlerSpell = c; strncpy(ci->handlerSpellFrom, ci->specName[s], 39); }
+    }
 }
 
-// Player-1-style gameplay targeting for P2+: a spell release should select
-// the castable object sitting under this camera's spell line, even when
-// AimedCast=0 (straight projectiles). The old cone targeter was optional and
-// yaw-only; it helped homing spells but did not reliably activate doors or
-// lesson objects. This is a tight 3D ray corridor from the actual spell origin.
-static void *findCastGameplayTarget(int i, void *pawn, float *outDist, BOOL verbose)
+// Abstract/generic classes must not be cast: baseSpell / Projectile as a
+// vulnerableTo value means "any spell", not a class to spawn.
+static BOOL cgGenericSpellClass(void *cls)
 {
-    if (!g_castGameplay || !g_objArray || !pawn || F.Location <= 0) return NULL;
-    int n = g_objArray->Num;
-    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return NULL;
-    if (IsBadReadPtr(pawn, F.Location + 12)) return NULL;
+    if (!cls) return TRUE;
+    char buf[200]; objName(cls, buf, sizeof(buf));
+    const char *sp = strchr(buf, ' ');
+    const char *tok = cgLastComp(sp ? sp + 1 : buf);
+    return !_stricmp(tok, "baseSpell") || !_stricmp(tok, "Projectile") ||
+           !_stricmp(tok, "Actor") || !_stricmp(tok, "Spell");
+}
 
+static BOOL cgIsPlayerPawn(void *o)
+{
+    for (int p = 0; p < 8; p++) if (g_pawn[p] && g_pawn[p] == o) return TRUE;
+    return FALSE;
+}
+
+static BOOL cgDeleted(void *o)
+{
+    if (g_offDeleteMe <= 0 || !g_maskDeleteMe || IsBadReadPtr((BYTE *)o + (g_offDeleteMe & ~3), 4))
+        return FALSE;
+    return (*(DWORD *)((BYTE *)o + (g_offDeleteMe & ~3)) & g_maskDeleteMe) != 0;
+}
+
+// v50's name heuristic, kept only for the no-chain fallback.
+static BOOL cgNameLooksCastable(const char *full)
+{
+    if (ciHas(full, "SpellTrigger")) return TRUE;
+    if (ciHas(full, "Cast") && ciHas(full, "Trigger")) return TRUE;
+    static const char *hint[] = { "Statue", "SpongifyPad", "JumpPad", "BouncePad",
+        "Spongify", "Lapifors", "Draconifors", "Carpe", "Depulso", "Flipendo",
+        "Glacius", "Alohomora", "Rictusempra", NULL };
+    for (int k = 0; hint[k]; k++) if (ciHas(full, hint[k])) return TRUE;
+    return FALSE;
+}
+
+// The level's castable actors. Rebuilt on demand (aim start) and at most
+// every 4 s while aiming; the per-frame ray test only walks this list.
+static void cgScanCandidates(void *self, BOOL force)
+{
+    DWORD now = GetTickCount();
+    if (!force && g_cgScanAt && now - g_cgScanAt < 6000) return;
+    cgBuildIndex();
+    g_cgScanAt = now;
+    int prevN = g_cgNCand;
+    g_cgNCand = 0;
+    if (!g_objArray || F.Location <= 0) return;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+    int examined = 0, actors = 0;
+    char buf[300];
+    for (int j = 0; j < n && g_cgNCand < CG_MAX_CAND; j++) {
+        void *o = g_objArray->Data[j];
+        if (!o || o == self || IsBadReadPtr(o, 0x100) || cgIsPlayerPawn(o)) continue;
+        objName(o, buf, sizeof(buf));
+        if (isReflection(buf)) continue;
+        const char *sp = strchr(buf, ' ');
+        if (!sp || !strchr(sp + 1, '.')) continue;
+        examined++;
+        int kind = CGC_NONE; void *spellCls = NULL; CgClass *info = NULL;
+        if (g_cgChainOK) {
+            void *cls = cgClassOf(o);
+            info = cgClassInfo(cls);
+            if (!info || !info->isActor || info->isProjectile) continue;
+            actors++;
+            // never the playable trio (any instance), spell effects, cursors
+            BOOL trio = FALSE;
+            for (int t = 0; t < 8 && kCharClass[t]; t++)
+                if (!_stricmp(info->token, kCharClass[t])) { trio = TRUE; break; }
+            if (trio || ciHas(info->token, "Cursor") || ciHas(info->token, "Emitter")) continue;
+            if (IsBadReadPtr(o, F.Location + 12) || cgDeleted(o)) continue;
+            if (info->vulnOff > 0 && !IsBadReadPtr((BYTE *)o + info->vulnOff, 4)) {
+                void *v = *(void **)((BYTE *)o + info->vulnOff);
+                if (cgIsKnownClass(v)) { kind = CGC_VULN; spellCls = v; }
+            }
+            if (!kind && info->vulnByteOff > 0 && !IsBadReadPtr((BYTE *)o + info->vulnByteOff, 1) &&
+                *((BYTE *)o + info->vulnByteOff) != 0)
+                kind = CGC_VULNBYTE;
+            if (!kind && info->nameSpellTrigger) kind = CGC_TRIG;
+            // Objects that override a specific HandleSpell<Name> below the
+            // shared bases react to that spell even when their vulnerable
+            // property is unset (a statue's own Lapifors handler, a pad's
+            // Spongify). The generic OnSpellHit stubs do not count.
+            if (!kind && g_cgNVulnDecl == 0) {
+                int own = cgOwnSpecHandlers(info);
+                if (own > 0 && own <= 2) kind = CGC_FN;
+            }
+            if (kind && (!spellCls || cgGenericSpellClass(spellCls)) && info->spellClsOff > 0 &&
+                !IsBadReadPtr((BYTE *)o + info->spellClsOff, 4)) {
+                void *v = *(void **)((BYTE *)o + info->spellClsOff);
+                if (cgIsKnownClass(v) && !cgGenericSpellClass(v)) spellCls = v;
+            }
+            if (kind && (!spellCls || cgGenericSpellClass(spellCls)) && info->nSpec) {
+                cgResolveHandlerSpell(info);
+                if (info->handlerSpell) spellCls = info->handlerSpell;
+            }
+            if (spellCls && cgGenericSpellClass(spellCls)) spellCls = NULL;
+        } else {
+            if (!cgNameLooksCastable(buf) || IsBadReadPtr(o, F.Location + 12)) continue;
+            kind = CGC_NAME;
+        }
+        if (!kind) continue;
+        CgCand *c = &g_cgCand[g_cgNCand++];
+        c->obj = o; c->slot = j; c->info = info; c->spellCls = spellCls; c->kind = kind;
+        strncpy(c->name, buf, sizeof(c->name) - 1); c->name[sizeof(c->name) - 1] = 0;
+        memcpy(c->loc, (BYTE *)o + F.Location, 12);
+    }
+    if (!g_cgScanLogged || force || g_cgNCand != prevN) {
+        BOOL firstTime = !g_cgScanLogged;
+        g_cgScanLogged = TRUE;
+        float *pl = (self && !IsBadReadPtr(self, F.Location + 12))
+                  ? (float *)((BYTE *)self + F.Location) : NULL;
+        logf_("  [castgame-scan] %d castable actors (%d objects, %d actors examined, "
+              "chain=%d vulnDecl=%d handlerDecl=%d)%s", g_cgNCand, examined, actors,
+              g_cgChainOK, g_cgNVulnDecl, g_cgNHandlerDecl,
+              firstTime ? "" : " (refresh)");
+        if (firstTime || g_cgNCand <= 24) {
+            char cb[160];
+            for (int k = 0; k < g_cgNCand && k < 40; k++) {
+                CgCand *c = &g_cgCand[k];
+                float d = -1.0f;
+                if (pl) { float dx = c->loc[0]-pl[0], dy = c->loc[1]-pl[1], dz = c->loc[2]-pl[2];
+                          d = sqrtf(dx*dx + dy*dy + dz*dz); }
+                const char *kn = c->kind == CGC_VULN ? "vulnerableTo" :
+                                 c->kind == CGC_VULNBYTE ? "vulnerable-byte" :
+                                 c->kind == CGC_TRIG ? "spelltrigger" :
+                                 c->kind == CGC_FN ? "handler-only" : "name";
+                logf_("      %s  [%s %s] spell=%s%s%s dist=%.0f handlers=%d/%d touch=%d",
+                      c->name, kn, c->info ? c->info->vulnName : "",
+                      c->spellCls ? objName(c->spellCls, cb, sizeof(cb)) : "-",
+                      (c->info && c->spellCls && c->spellCls == c->info->handlerSpell) ? " via " : "",
+                      (c->info && c->spellCls && c->spellCls == c->info->handlerSpell) ? c->info->handlerSpellFrom : "",
+                      d, cgOwnSpecHandlers(c->info), c->info ? c->info->nGen : 0,
+                      c->info && c->info->fnTouch ? 1 : 0);
+            }
+        }
+        if (g_cgNCand == 0)
+            logf_("  [castgame-scan] NOTHING castable found: %s", g_cgChainOK
+                  ? (g_cgNVulnDecl ? "no actor here has a live vulnerable class - "
+                                     "cast near a statue/pad and check again"
+                                   : "this build has no vulnerable* property; send this log")
+                  : "class-chain calibration failed; send this log");
+    }
+}
+
+static CgCand *cgFindCand(void *obj)
+{
+    if (!obj) return NULL;
+    for (int k = 0; k < g_cgNCand; k++) if (g_cgCand[k].obj == obj) return &g_cgCand[k];
+    return NULL;
+}
+
+static BOOL cgCandAlive(CgCand *c)
+{
+    if (!c || !c->obj || !g_objArray || c->slot < 0 || c->slot >= g_objArray->Num) return FALSE;
+    if (g_objArray->Data[c->slot] != c->obj || IsBadReadPtr(c->obj, F.Location + 12)) return FALSE;
+    // Same slot, same class pointer = same object (slots are reused only
+    // after GC, which also invalidates the class pointer we cached).
+    if (c->info && cgClassOf(c->obj) != c->info->cls) return FALSE;
+    return !cgDeleted(c->obj);
+}
+
+// The target's aim point: Location + CentreOffset (the game's own targeting
+// centre), else a little above the actor origin.
+static void cgAimPoint(CgCand *c, float out[3])
+{
+    float *l = (float *)((BYTE *)c->obj + F.Location);
+    out[0] = l[0]; out[1] = l[1]; out[2] = l[2];
+    static int sOffCH = -2;
+    if (sOffCH == -2) sOffCH = propOffset("Engine.Actor.CollisionHeight");
+    BOOL haveCentre = FALSE;
+    if (c->info && c->info->centreOff > 0 && !IsBadReadPtr((BYTE *)c->obj + c->info->centreOff, 12)) {
+        float *co = (float *)((BYTE *)c->obj + c->info->centreOff);
+        if (fabsf(co[0]) < 500.0f && fabsf(co[1]) < 500.0f && fabsf(co[2]) < 500.0f) {
+            out[0] += co[0]; out[1] += co[1]; out[2] += co[2]; haveCentre = TRUE;
+        }
+    }
+    if (!haveCentre && sOffCH > 0 && !IsBadReadPtr((BYTE *)c->obj + sOffCH, 4)) {
+        float h = *(float *)((BYTE *)c->obj + sOffCH);
+        if (h > 1.0f && h < 1000.0f) out[2] += h * 0.35f;
+    }
+}
+
+static float cgHitRadius(CgCand *c)
+{
+    static int sOffCR = -2;
+    if (sOffCR == -2) sOffCR = propOffset("Engine.Actor.CollisionRadius");
+    float r = 60.0f;
+    if (sOffCR > 0 && !IsBadReadPtr((BYTE *)c->obj + sOffCR, 4)) {
+        float cr = *(float *)((BYTE *)c->obj + sOffCR);
+        if (cr > 1.0f && cr < 1000.0f) r = cr;
+    }
+    return r;
+}
+
+// Player-1-style target pick: the castable actor under this camera's spell
+// line (3D corridor from the real spell origin, LOS-checked). SizeModifier
+// widens/narrows the acceptance exactly as the cursor's does.
+static CgCand *cgPickTarget(int i, void *pawn, float *outDist, BOOL verbose, float aimOut[3])
+{
+    if (!g_castGameplay || !pawn || F.Location <= 0 || IsBadReadPtr(pawn, F.Location + 12))
+        return NULL;
+    cgScanCandidates(pawn, FALSE);
     int cy = playerCamYaw(i), cp = playerCamPitch(i);
     double ry = cy * (6.283185307179586 / 65536.0);
     double rp = cp * (6.283185307179586 / 65536.0);
     float cpr = (float)cos(rp);
-    float dir[3] = { (float)cos(ry) * cpr, (float)sin(ry) * cpr,
-                     (float)sin(rp) };
+    float dir[3] = { (float)cos(ry) * cpr, (float)sin(ry) * cpr, (float)sin(rp) };
     float *pl = (float *)((BYTE *)pawn + F.Location);
-    float org[3] = { pl[0] + dir[0] * 90.0f,
-                     pl[1] + dir[1] * 90.0f,
-                     pl[2] + dir[2] * 90.0f + 45.0f };
+    float org[3] = { pl[0] + dir[0] * 90.0f, pl[1] + dir[1] * 90.0f, pl[2] + dir[2] * 90.0f + 45.0f };
 
-    static int sOffCR = -2, sOffCH = -2;
-    if (sOffCR == -2) {
-        sOffCR = propOffset("Engine.Actor.CollisionRadius");
-        sOffCH = propOffset("Engine.Actor.CollisionHeight");
-    }
-
-    void *best = NULL; float bestScore = 1.0e30f, bestT = 0.0f, bestPerp = 0.0f;
-    void *nearest = NULL; float nearestD = 1.0e30f; int seen = 0;
-    char buf[300];
-    for (int j = 0; j < n; j++) {
-        void *o = g_objArray->Data[j];
-        if (!o || o == pawn || IsBadReadPtr(o, 0x100)) continue;
-        BOOL isPlayer = FALSE;
-        for (int p = 0; p < 8; p++) if (g_pawn[p] && g_pawn[p] == o) { isPlayer = TRUE; break; }
-        if (isPlayer) continue;
-        objName(o, buf, sizeof(buf));
-        if (isReflection(buf)) continue;
-        if (!looksLikeSpellGameplayTarget(buf)) continue;
-        if (IsBadReadPtr(o, F.Location + 12)) continue;
-        seen++;
-        float *tl0 = (float *)((BYTE *)o + F.Location);
-        float height = 60.0f, radius = 150.0f;
-        if (sOffCH > 0 && !IsBadReadPtr((BYTE *)o + sOffCH, 4)) {
-            float h = *(float *)((BYTE *)o + sOffCH);
-            if (h > 1.0f && h < 1000.0f) height = h;
-        }
-        if (sOffCR > 0 && !IsBadReadPtr((BYTE *)o + sOffCR, 4)) {
-            float r = *(float *)((BYTE *)o + sOffCR);
-            if (r > 1.0f && r < 1000.0f) radius = r + 90.0f;
+    CgCand *best = NULL; float bestScore = 1.0e30f, bestT = 0, bestPerp = 0, bestAim[3] = {0,0,0};
+    CgCand *nearest = NULL; float nearestD = 1.0e30f;
+    for (int k = 0; k < g_cgNCand; k++) {
+        CgCand *c = &g_cgCand[k];
+        if (!cgCandAlive(c)) continue;
+        float tl[3]; cgAimPoint(c, tl);
+        float radius = cgHitRadius(c) + 90.0f;
+        if (c->info && c->info->sizeOff > 0 && !IsBadReadPtr((BYTE *)c->obj + c->info->sizeOff, 4)) {
+            float sm = *(float *)((BYTE *)c->obj + c->info->sizeOff);
+            if (sm >= 0.3f && sm <= 4.0f) radius *= sm;
         }
         if (radius < 140.0f) radius = 140.0f;
-        float tl[3] = { tl0[0], tl0[1], tl0[2] + height * 0.35f };
         float vx = tl[0] - org[0], vy = tl[1] - org[1], vz = tl[2] - org[2];
         float dist = sqrtf(vx * vx + vy * vy + vz * vz);
-        if (dist < nearestD) { nearestD = dist; nearest = o; }
+        if (dist < nearestD) { nearestD = dist; nearest = c; }
         float t = vx * dir[0] + vy * dir[1] + vz * dir[2];
         if (t < 40.0f || t > 3200.0f) continue;
-        float perp2 = dist * dist - t * t;
-        if (perp2 < 0.0f) perp2 = 0.0f;
+        float perp2 = dist * dist - t * t; if (perp2 < 0.0f) perp2 = 0.0f;
         float perp = sqrtf(perp2);
         if (perp > radius) continue;
-        if (!fastTraceClear(pawn, org, tl)) continue;
+        // LOS to the aim point, or to a point pulled back in front of the
+        // object (a solid mover's own surface must not veto itself).
+        if (!fastTraceClear(pawn, org, tl)) {
+            float back = cgHitRadius(c) + 10.0f;
+            float q[3] = { tl[0] - dir[0] * back, tl[1] - dir[1] * back, tl[2] - dir[2] * back };
+            if (!fastTraceClear(pawn, org, q)) continue;
+        }
         float score = t + perp * 3.0f;
-        if (score < bestScore) { bestScore = score; best = o; bestT = t; bestPerp = perp; }
+        if (score < bestScore) { bestScore = score; best = c; bestT = t; bestPerp = perp;
+                                 memcpy(bestAim, tl, 12); }
     }
     if (outDist) *outDist = bestT;
-    if (best) {
-        logf_("    [castgame] p%d target -> %s ray=%.0f perp=%.0f",
-              i, objName(best, buf, sizeof(buf)), bestT, bestPerp);
-    } else if (verbose) {
-        if (nearest)
-            logf_("    [castgame] p%d no ray target (%d cast objects; nearest %s at %.0f)",
-                  i, seen, objName(nearest, buf, sizeof(buf)), nearestD);
+    if (best && aimOut) memcpy(aimOut, bestAim, 12);
+    if (verbose) {
+        char cb[160];
+        if (best)
+            logf_("    [castgame] p%d target -> %s ray=%.0f perp=%.0f spell=%s", i,
+                  best->name, bestT, bestPerp,
+                  best->spellCls ? objName(best->spellCls, cb, sizeof(cb)) : "(none on object)");
+        else if (nearest)
+            logf_("    [castgame] p%d no target on the spell line (%d castable; nearest %s at %.0f)",
+                  i, g_cgNCand, nearest->name, nearestD);
         else
-            logf_("    [castgame] p%d no SpellTrigger/cast objects in level", i);
+            logf_("    [castgame] p%d no castable actors in this level (see [castgame-scan])", i);
     }
     return best;
 }
 
-static void fillSpellEventParms(void *fn, BYTE *parms, int cb,
-                                void *target, void *caster,
-                                void *spellClass, void *spellActor)
+// Parameter layout of a script function, from its child *Property objects
+// (offset = UProperty::Offset). Cached per function; logged once so the
+// hardware log shows the signature we filled.
+static CgFnLayout *cgFnLayout(void *fn)
 {
-    memset(parms, 0, cb);
-    if (!fn || !g_objArray || g_propOffsetField < 0) return;
-    char fpath[260];
-    if (!functionPath(fn, fpath, sizeof(fpath))) return;
+    if (!fn) return NULL;
+    for (int k = 0; k < g_cgNLay; k++) if (g_cgLay[k].fn == fn) return &g_cgLay[k];
+    if (g_cgNLay >= 24 || !g_objArray || g_propOffsetField < 0) return NULL;
+    CgFnLayout *L = &g_cgLay[g_cgNLay++];
+    memset(L, 0, sizeof(*L));
+    L->fn = fn;
+    char fpath[200];
+    if (!functionPath(fn, fpath, sizeof(fpath))) return L;
     size_t plen = strlen(fpath);
     int n = g_objArray->Num;
-    if (n <= 0 || n > 400000) return;
+    if (n <= 0 || n > 400000) return L;
     char buf[300];
-    for (int j = 0; j < n; j++) {
+    for (int j = 0; j < n && L->n < 12; j++) {
         void *p = g_objArray->Data[j];
         if (!p || IsBadReadPtr(p, g_propOffsetField + 4)) continue;
         objName(p, buf, sizeof(buf));
-        const char *sp = strchr(buf, ' ');
+        char *sp = strchr(buf, ' ');
         if (!sp) continue;
         const char *path = sp + 1;
         if (strncmp(path, fpath, plen) || path[plen] != '.') continue;
         if (strchr(path + plen + 1, '.')) continue;
+        *sp = 0;
+        int kind = 0, size = 4;
+        if      (!strcmp(buf, "ClassProperty"))  kind = 1;
+        else if (!strcmp(buf, "ObjectProperty")) kind = 2;
+        else if (!strcmp(buf, "StructProperty")) { kind = 3; size = 12; }
+        else if (!strcmp(buf, "FloatProperty"))  kind = 4;
+        else if (!strcmp(buf, "BoolProperty"))   kind = 5;
+        else if (!strcmp(buf, "ByteProperty"))   { kind = 6; size = 1; }
+        else if (!strcmp(buf, "IntProperty") || !strcmp(buf, "NameProperty")) kind = 7;
+        else continue;
         int off = (int)*(DWORD *)((BYTE *)p + g_propOffsetField);
-        if (off < 0 || off + 16 > cb) continue;
-        const char *name = path + plen + 1;
-        if (ciHas(buf, "ClassProperty")) {
-            if (ciHas(name, "spell")) *(void **)(parms + off) = spellClass;
-        } else if (ciHas(buf, "ObjectProperty") || ciHas(buf, "ActorProperty") ||
-                   ciHas(buf, "PawnProperty")) {
-            void *v = NULL;
-            if (ciHas(name, "target")) v = target;
-            else if (ciHas(name, "spell") || ciHas(name, "projectile")) v = spellActor;
-            else if (ciHas(name, "instigator") || ciHas(name, "caster") ||
-                     ciHas(name, "source") || ciHas(name, "owner") ||
-                     ciHas(name, "other") || ciHas(name, "pawn")) v = caster;
-            if (v) *(void **)(parms + off) = v;
-        } else if (ciHas(buf, "StructProperty") &&
-                   (ciHas(name, "location") || ciHas(name, "offset") || ciHas(name, "hit"))) {
-            // Zero vector is acceptable for offsets; for hit locations use the
-            // target actor's center when readable.
-            if (target && F.Location > 0 && !IsBadReadPtr((BYTE *)target + F.Location, 12))
-                memcpy(parms + off, (BYTE *)target + F.Location, 12);
-        } else if (ciHas(buf, "BoolProperty")) {
-            DWORD m = 1;
-            for (int d = 4; d <= 0x38; d += 4) {
-                DWORD mm = *(DWORD *)((BYTE *)p + g_propOffsetField + d);
-                if (mm && (mm & (mm - 1)) == 0) { m = mm; break; }
+        if (off < 0 || off + size > 240) continue;
+        L->p[L->n].off = off; L->p[L->n].kind = kind;
+        strncpy(L->p[L->n].name, path + plen + 1, 31);
+        L->n++;
+        if (off + size > L->total) L->total = off + size;
+    }
+    char line[400]; int c = _snprintf(line, sizeof(line) - 1, "  [castgame-fn] %s:", fpath);
+    for (int k = 0; k < L->n && c < (int)sizeof(line) - 40; k++)
+        c += _snprintf(line + c, sizeof(line) - 1 - c, " +0x%02X %s", L->p[k].off, L->p[k].name);
+    line[sizeof(line) - 1] = 0;
+    logf_("%s%s", line, L->n ? "" : " (no params)");
+    return L;
+}
+
+// Call a spell-related script function with parameters filled by NAME/TYPE:
+//   Class     -> the spell class
+//   Object    -> spell/projectile -> spell actor; instigator/caster/owner/
+//                pawn/source -> caster; anything else -> "the other actor"
+//                (the target when self is the spell, the spell when self is
+//                the target) - matches ProcessTouch(Other, HitLocation),
+//                HandleSpellX(spell, vHitLocation), Touch(Other),
+//                Trigger(Other, EventInstigator)
+//   Struct    -> hit location (offset/normal params stay zero)
+//   Float     -> charge = 1.0
+static void cgCall(int i, void *self, void *fn, BOOL selfIsSpell, void *spell,
+                   void *target, void *caster, void *spellCls, const float hit[3],
+                   const char *why)
+{
+    if (!self || !fn || !g_ProcessEvent) return;
+    BYTE parms[256]; memset(parms, 0, sizeof(parms));
+    CgFnLayout *L = cgFnLayout(fn);
+    void *other = selfIsSpell ? target : spell;
+    if (L) {
+        for (int k = 0; k < L->n; k++) {
+            int off = L->p[k].off; const char *nm = L->p[k].name;
+            if (!_stricmp(nm, "ReturnValue")) continue;
+            switch (L->p[k].kind) {
+            case 1: *(void **)(parms + off) = spellCls; break;
+            case 2:
+                if (ciHas(nm, "spell") || ciHas(nm, "projectile") || ciHas(nm, "missile"))
+                    *(void **)(parms + off) = spell;
+                else if (ciHas(nm, "instigator") || ciHas(nm, "caster") || ciHas(nm, "owner") ||
+                         ciHas(nm, "pawn") || ciHas(nm, "source"))
+                    *(void **)(parms + off) = caster;
+                else
+                    *(void **)(parms + off) = other;
+                break;
+            case 3:
+                if (ciHas(nm, "loc") || ciHas(nm, "hit") || ciHas(nm, "pos"))
+                    memcpy(parms + off, hit, 12);
+                break;
+            case 4: if (ciHas(nm, "charge")) *(float *)(parms + off) = 1.0f; break;
+            default: break;
             }
-            *(DWORD *)(parms + (off & ~3)) |= m;
+        }
+    } else {
+        // No reflection for this function: conventional (Actor, Vector).
+        *(void **)(parms + 0) = other;
+        memcpy(parms + 4, hit, 12);
+    }
+    char sb[120], fb[160], ob[120];
+    logf_("    [castgame] p%d %s: %s . %s (other=%s)", i, why,
+          objName(self, sb, sizeof(sb)), objName(fn, fb, sizeof(fb)),
+          other ? objName(other, ob, sizeof(ob)) : "None");
+    g_ProcessEvent(self, NULL, fn, parms, NULL);
+}
+
+// The handler name a spell class maps to: LapiforsSpell -> HandleSpellLapifors.
+static void *cgSpecificHandler(CgClass *ti, void *spellCls, char *nameOut, int cch)
+{
+    if (nameOut && cch > 0) nameOut[0] = 0;
+    if (!ti || !spellCls || !ti->nSpec) return NULL;
+    char cb[160]; objName(spellCls, cb, sizeof(cb));
+    const char *sp = strchr(cb, ' ');
+    char tok[64]; strncpy(tok, cgLastComp(sp ? sp + 1 : cb), 63); tok[63] = 0;
+    size_t L = strlen(tok);
+    if (L > 5 && !_stricmp(tok + L - 5, "Spell")) tok[L - 5] = 0;       // LapiforsSpell
+    else if (L > 5 && !_strnicmp(tok, "spell", 5)) memmove(tok, tok + 5, L - 4); // spellLapifors
+    if (!tok[0]) return NULL;
+    for (int s = 0; s < ti->nSpec; s++) {
+        if (!_stricmp(ti->specName[s] + 11, tok)) {
+            if (nameOut) { strncpy(nameOut, ti->specName[s], cch - 1); nameOut[cch - 1] = 0; }
+            return ti->fnSpec[s];
+        }
+    }
+    return NULL;
+}
+
+static BOOL cgEngineDecl(const char *decl)
+{
+    return !decl || !decl[0] || !_strnicmp(decl, "Engine.", 7) || !_strnicmp(decl, "Core.", 5);
+}
+
+// Name-only fallback (class chain unavailable): "Function Pkg.<ClassToken>.<m>"
+// for the actor's visible class token, else a known engine base.
+static void *cgMethodByToken(void *actor, const char *method, const char *basePath,
+                             const char *tokenFrag)
+{
+    char tok[96];
+    void *fragHit = NULL;
+    if (actor && objectClassToken(actor, tok, sizeof(tok)) && g_objArray) {
+        int n = g_objArray->Num;
+        char buf[300];
+        for (int j = 0; j < n && n <= 400000; j++) {
+            void *o = g_objArray->Data[j];
+            if (!o) continue;
+            objName(o, buf, sizeof(buf));
+            if (strncmp(buf, "Function ", 9)) continue;
+            const char *path = buf + 9;
+            const char *last = strrchr(path, '.');
+            if (!last || _stricmp(last + 1, method)) continue;
+            const char *prev = last;
+            while (prev > path && prev[-1] != '.') prev--;
+            if ((int)strlen(tok) == (int)(last - prev) && !_strnicmp(prev, tok, last - prev))
+                return o;
+            if (tokenFrag && !fragHit && strncmp(path, "Engine.", 7)) {
+                char ct[96]; int cl = (int)(last - prev);
+                if (cl > 0 && cl < 95) { memcpy(ct, prev, cl); ct[cl] = 0;
+                    if (ciHas(ct, tokenFrag)) fragHit = o; }
+            }
+        }
+    }
+    if (fragHit) return fragHit;
+    return basePath ? findObjectByPath(basePath) : NULL;
+}
+
+// Deliver the spell to the target the way the game does when the projectile
+// arrives (or via the wand's autohit): the spell's own ProcessTouch dispatches
+// to the object's handler inside game code. Trigger-family targets get the
+// Touch(spell) the engine would have sent. Direct handler calls are only the
+// fallback when the spell exposes no ProcessTouch (or never spawned).
+static void cgDeliverHit(CgPending *p, BOOL spellAlive)
+{
+    int i = p->player;
+    void *spell = spellAlive ? p->spell : NULL;
+    if (spell && !IsBadReadPtr((BYTE *)spell + F.Location, 12)) {
+        // HitLocation = the projectile's position at impact, as the engine
+        // would report it (hit effects spawn there, not inside the object).
+        float *sl = (float *)((BYTE *)spell + F.Location);
+        float dx = sl[0] - p->aim[0], dy = sl[1] - p->aim[1], dz = sl[2] - p->aim[2];
+        if (dx * dx + dy * dy + dz * dz < 600.0f * 600.0f) memcpy(p->aim, sl, 12);
+    }
+    CgClass *ti = p->tinfo;
+    CgClass *si = spell ? cgClassInfo(cgClassOf(spell)) : NULL;
+    BOOL did = FALSE, gameDispatch = FALSE;
+    char hn[48];
+    BOOL trigLike = ti ? (ti->isTrigger || ti->nameTrigger) : ciHas(p->targetName, "Trigger");
+
+    // 1. Trigger family: the engine's Touch(spell) is what a flying spell
+    //    would have produced (IsRelevant checks the spell type inside).
+    if (trigLike && spell) {
+        void *fn = (ti && ti->fnTouch) ? ti->fnTouch
+                 : cgMethodByToken(p->target, "Touch", "Engine.Trigger.Touch", "SpellTrigger");
+        if (fn) {
+            cgCall(i, p->target, fn, FALSE, spell, p->target, p->caster, p->spellCls,
+                   p->aim, "trigger touch");
+            did = TRUE; gameDispatch = TRUE;
+        }
+    }
+    // 2. The spell's own ProcessTouch(target, hitLoc) - the wand's autohit.
+    //    Only when the game overrides it (Engine.Projectile's is empty).
+    if (spell) {
+        void *fn = NULL;
+        if (si && si->fnPTouch && !cgEngineDecl(si->pTouchDecl)) fn = si->fnPTouch;
+        else if (!si) fn = cgMethodByToken(spell, "ProcessTouch", NULL, "Spell");
+        if (fn) {
+            cgCall(i, spell, fn, TRUE, spell, p->target, p->caster, p->spellCls,
+                   p->aim, "spell ProcessTouch");
+            did = TRUE; gameDispatch = TRUE;
+        }
+    }
+    // 3. No game-side dispatch available: call the object's handler the way
+    //    ProcessTouch would have (HandleSpell<Name>(spell, hitLoc), else the
+    //    generic OnSpellHit/HandleSpell).
+    if (!gameDispatch && ti) {
+        void *fn = cgSpecificHandler(ti, p->spellCls, hn, sizeof(hn));
+        if (fn) {
+            cgCall(i, p->target, fn, FALSE, spell, p->target, p->caster, p->spellCls,
+                   p->aim, "target handler");
+            did = TRUE;
+        } else if (ti->nGen) {
+            cgCall(i, p->target, ti->fnGen[0], FALSE, spell, p->target, p->caster,
+                   p->spellCls, p->aim, "target generic handler");
+            did = TRUE;
+        }
+        // 4. Spell Touch (Engine.Projectile.Touch -> ProcessTouch inside the
+        //    game) when nothing else exists.
+        if (!did && si && si->fnTouch && spell) {
+            cgCall(i, spell, si->fnTouch, TRUE, spell, p->target, p->caster,
+                   p->spellCls, p->aim, "spell Touch");
+            did = TRUE;
+        }
+    }
+    if (!did)
+        logf_("    [castgame] p%d %s: NO activation path (spell=%s ptouch=%s touch=%d "
+              "handlers=%d/%d) - send this log", i, p->targetName,
+              spell ? "alive" : "none", si && si->fnPTouch ? si->pTouchDecl : "none",
+              si && si->fnTouch ? 1 : 0, ti ? ti->nSpec : 0, ti ? ti->nGen : 0);
+}
+
+static void cgArmHit(int i, void *caster, void *spawned, CgCand *c, void *spellCls)
+{
+    CgPending *p = &g_cgPend[i];
+    if (p->active)
+        logf_("    [castgame] p%d previous pending hit on %s dropped (new cast)", i, p->targetName);
+    memset(p, 0, sizeof(*p));
+    p->spellSlot = -1;
+    if (!c || !cgCandAlive(c)) {
+        logf_("    [castgame] p%d target gone before the fire completed - no pending hit", i);
+        return;
+    }
+    p->active = TRUE; p->player = i; p->caster = caster; p->spellCls = spellCls;
+    p->target = c->obj; p->targetSlot = c->slot; p->tinfo = c->info;
+    strncpy(p->targetName, c->name, sizeof(p->targetName) - 1);
+    cgAimPoint(c, p->aim);
+    p->hitR = cgHitRadius(c) + 40.0f;
+    if (p->hitR < 80.0f) p->hitR = 80.0f;
+    p->fireAt = GetTickCount();
+    float d = 0.0f, speed = 1000.0f;
+    if (spawned && !IsBadReadPtr(spawned, F.Location + 12)) {
+        p->spell = spawned;
+        p->spellClsPtr = cgClassOf(spawned);
+        objName(spawned, p->spellName, sizeof(p->spellName));
+        if (g_objArray) {
+            int n = g_objArray->Num;
+            for (int j = 0; j < n && n <= 400000; j++)
+                if (g_objArray->Data[j] == spawned) { p->spellSlot = j; break; }
+        }
+        float *sl = (float *)((BYTE *)spawned + F.Location);
+        float dx = p->aim[0] - sl[0], dy = p->aim[1] - sl[1], dz = p->aim[2] - sl[2];
+        d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (g_offProjSpeed > 0 && !IsBadReadPtr((BYTE *)spawned + g_offProjSpeed, 4)) {
+            float s = *(float *)((BYTE *)spawned + g_offProjSpeed);
+            if (s > 100.0f && s < 20000.0f) speed = s;
+        }
+    }
+    p->d0 = d;
+    DWORD flight = (DWORD)(d / speed * 1000.0f) + 700;
+    if (flight < 900) flight = 900;
+    if (flight > 3500) flight = 3500;
+    p->deadline = p->fireAt + flight;
+    if (p->spell && p->spellSlot < 0) {
+        // Not in the object table under that pointer: cannot watch it fly,
+        // so deliver right now (autohit) while the pointer is known-good.
+        logf_("    [castgame] p%d spell actor not indexed - immediate hit on %s", i, p->targetName);
+        cgDeliverHit(p, TRUE);
+        p->active = FALSE;
+        return;
+    }
+    if (!p->spell) {
+        // Nothing to fly: the game could not spawn the projectile, so run the
+        // handler directly (with spell=None, as the optional params allow).
+        logf_("    [castgame] p%d no spell actor - direct handler on %s", i, p->targetName);
+        cgDeliverHit(p, FALSE);
+        p->active = FALSE;
+        return;
+    }
+    logf_("    [castgame] p%d pending hit on %s: dist=%.0f speed=%.0f window=%lums hitR=%.0f",
+          i, p->targetName, d, speed, (unsigned long)flight, p->hitR);
+}
+
+static BOOL cgSpellAlive(CgPending *p)
+{
+    if (!p->spell || !g_objArray || p->spellSlot < 0 || p->spellSlot >= g_objArray->Num) return FALSE;
+    if (g_objArray->Data[p->spellSlot] != p->spell) return FALSE;
+    if (IsBadReadPtr(p->spell, F.Location + 12)) return FALSE;
+    if (p->spellClsPtr && cgClassOf(p->spell) != p->spellClsPtr) return FALSE;
+    return !cgDeleted(p->spell);
+}
+
+// Per frame: watch each pending projectile; deliver when it reaches the
+// target or the flight window closes with it still alive. A projectile that
+// died on its own hit something naturally - the game already handled it.
+static void cgTick(void)
+{
+    if (!g_castGameplay) return;
+    DWORD now = GetTickCount();
+    for (int i = 1; i < 8; i++) {
+        CgPending *p = &g_cgPend[i];
+        if (!p->active) continue;
+        BOOL alive = cgSpellAlive(p);
+        DWORD age = now - p->fireAt;
+        if (!alive) {
+            logf_("    [castgame] p%d spell %s ended on its own at +%lums (natural touch "
+                  "or expiry) - target %s", i, p->spellName, (unsigned long)age, p->targetName);
+            p->active = FALSE;
+            continue;
+        }
+        float *sl = (float *)((BYTE *)p->spell + F.Location);
+        float dx = p->aim[0] - sl[0], dy = p->aim[1] - sl[1], dz = p->aim[2] - sl[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        BOOL targetOk = (g_objArray && p->targetSlot >= 0 && p->targetSlot < g_objArray->Num &&
+                         g_objArray->Data[p->targetSlot] == p->target &&
+                         !IsBadReadPtr(p->target, F.Location + 12) &&
+                         (!p->tinfo || cgClassOf(p->target) == p->tinfo->cls));
+        if (!targetOk) {
+            logf_("    [castgame] p%d target %s vanished - pending hit dropped", i, p->targetName);
+            p->active = FALSE;
+            continue;
+        }
+        if (age < 50) continue;          // natural collision gets first go
+        if (d <= p->hitR || now >= p->deadline) {
+            logf_("    [castgame] p%d spell reached %s: dist=%.0f (start %.0f) at +%lums%s",
+                  i, p->targetName, d, p->d0, (unsigned long)age,
+                  d <= p->hitR ? "" : " [flight window closed - forcing the hit]");
+            if (g_castAutoHit) cgDeliverHit(p, TRUE);
+            else logf_("    [castgame] p%d CastAutoHit=0 - leaving it to the game's collision", i);
+            p->active = FALSE;
         }
     }
 }
 
-static void activateCastGameplayTarget(int i, void *caster, void *target,
-                                       void *spellClass, void *spellActor)
+// The spell class the target asks for (the vulnerableToClass value), or the
+// caster's own current spell when the object does not say.
+static void *cgSpellClassFor(CgCand *c, void *fallback)
 {
-    if (!g_castGameplay || !target || !caster || !g_ProcessEvent) return;
-    char tb[160]; objName(target, tb, sizeof(tb));
-    if (!looksLikeSpellGameplayTarget(tb)) return;
+    if (c && c->spellCls && cgIsKnownClass(c->spellCls) && !cgGenericSpellClass(c->spellCls))
+        return c->spellCls;
+    return fallback;
+}
 
-    const char *methods[] = { "HandleSpell", "OnHandleSpell", "SpellHit", "Trigger", NULL };
-    BOOL did = FALSE;
-    for (int m = 0; methods[m]; m++) {
-        void *fn = findActorMethod(target, methods[m]);
-        if (!fn) {
-            // Some maps use base-class script functions while the instance
-            // class name is subclassed/numbered. Try the known broad bases.
-            if (!_stricmp(methods[m], "Trigger"))
-                fn = findObjectByPath("Engine.Actor.Trigger");
-        }
-        if (!fn) continue;
-        BYTE p[256]; fillSpellEventParms(fn, p, sizeof(p), target, caster, spellClass, spellActor);
-        // Conventional Trigger(Actor Other, Pawn EventInstigator) fallback if
-        // reflection did not expose children for this stripped package.
-        if (!_stricmp(methods[m], "Trigger") && !*(void **)p) {
-            *(void **)(p + 0x00) = caster;
-            *(void **)(p + 0x04) = caster;
-        }
-        char fb[180]; objName(fn, fb, sizeof(fb));
-        logf_("    [castgame] p%d activating %s via %s", i, tb, fb);
-        g_ProcessEvent(target, NULL, fn, p, NULL);
-        did = TRUE;
-        // Trigger is the final generic fallback. If a spell-specific handler
-        // exists, do not also fire Trigger unless explicitly no handler exists.
-        if (_stricmp(methods[m], "Trigger")) break;
+// What the index knows about one live actor - used to describe the object
+// PLAYER 1's own cursor selected, so the log proves whether our candidate
+// rules would have found the same thing.
+static void cgDescribeActor(void *o, const char *tag)
+{
+    char ob[160], cb[160];
+    if (!o || IsBadReadPtr(o, 0x100)) { logf_("  [castgame] %s: <bad actor>", tag); return; }
+    objName(o, ob, sizeof(ob));
+    cgBuildIndex();
+    CgClass *ci = g_cgChainOK ? cgClassInfo(cgClassOf(o)) : NULL;
+    if (!ci) { logf_("  [castgame] %s: %s (no class info)", tag, ob); return; }
+    void *v = NULL; int vb = -1;
+    if (ci->vulnOff > 0 && !IsBadReadPtr((BYTE *)o + ci->vulnOff, 4)) {
+        void *x = *(void **)((BYTE *)o + ci->vulnOff);
+        if (cgIsKnownClass(x)) v = x;
     }
-    if (!did) logf_("    [castgame] p%d target %s has no known activation function", i, tb);
+    if (ci->vulnByteOff > 0 && !IsBadReadPtr((BYTE *)o + ci->vulnByteOff, 1))
+        vb = *((BYTE *)o + ci->vulnByteOff);
+    BOOL inList = FALSE;
+    for (int k = 0; k < g_cgNCand; k++) if (g_cgCand[k].obj == o) { inList = TRUE; break; }
+    logf_("  [castgame] %s: %s class=%s %s=%s vulnByte=%d handlers=%d/%d touch=%d "
+          "trigger=%d pawn=%d in-candidates=%d", tag, ob, ci->path,
+          ci->vulnName[0] ? ci->vulnName : "vulnerableTo", v ? objName(v, cb, sizeof(cb)) : "None",
+          vb, ci->nSpec, ci->nGen, ci->fnTouch ? 1 : 0, ci->isTrigger || ci->nameTrigger,
+          ci->isPawn, inList);
+    for (int s = 0; s < ci->nSpec; s++) logf_("      handler: %s", ci->specName[s]);
+    for (int g = 0; g < ci->nGen; g++)  logf_("      handler: %s", ci->genName[g]);
+}
+
+// Watch PLAYER 1's real cast: when the game's own cursor writes his
+// spellTarget / currentSpell, log what it chose and open a telemetry window
+// so the [pelog] lines carry the genuine activation sequence. Cheap: two
+// pointer reads per frame.
+static void pelogAuto(void);
+static void *findOrigCursor(void);
+static void cgWatchP1(void)
+{
+    static void *sLastTarget = NULL, *sLastSpell = NULL, *sLastPawn = NULL;
+    static DWORD sLastWindowAt = 0, sLastLogAt = 0;
+    static DWORD sResolveAt = 0;
+    void *p1 = g_pawn[0];
+    if (!p1) {
+        DWORD nowR = GetTickCount();
+        if (nowR - sResolveAt < 3000) return;
+        sResolveAt = nowR;
+        p1 = findActorByClass("harry");
+        if (p1) g_pawn[0] = p1;
+    }
+    if (!p1 || IsBadReadPtr(p1, 0x200)) return;
+    if (p1 != sLastPawn) { sLastPawn = p1; sLastTarget = NULL; sLastSpell = NULL; }
+    if (!g_cgReady && g_castGameplay && F.ok) cgBuildIndex();   // one pass per level
+    if (g_offSpellTarget > 0 && !IsBadReadPtr((BYTE *)p1 + g_offSpellTarget, 4)) {
+        void *t = *(void **)((BYTE *)p1 + g_offSpellTarget);
+        DWORD now = GetTickCount();
+        if (t != sLastTarget && now - sLastLogAt >= 300) {
+            sLastLogAt = now;
+            sLastTarget = t;
+            if (t && !IsBadReadPtr(t, 0x100)) {
+                char tb[160];
+                logf_("[castgame] PLAYER 1 spellTarget -> %s", objName(t, tb, sizeof(tb)));
+                if (g_castGameplay) {
+                    cgScanCandidates(p1, FALSE);
+                    cgDescribeActor(t, "player-1 target");
+                }
+                if (g_cgP1Windows < 3 && now - sLastWindowAt > 12000 && !g_pelogOn) {
+                    sLastWindowAt = now; g_cgP1Windows++;
+                    pelogAuto();
+                    logf_("[pelog] window %d/3 opened for player 1's cast (activation path capture)",
+                          g_cgP1Windows);
+                }
+            } else {
+                logf_("[castgame] PLAYER 1 spellTarget -> None");
+            }
+        }
+    }
+    if (g_offCurrentSpell > 0 && !IsBadReadPtr((BYTE *)p1 + g_offCurrentSpell, 4)) {
+        void *s = *(void **)((BYTE *)p1 + g_offCurrentSpell);
+        if (s != sLastSpell) {
+            sLastSpell = s;
+            char sb[160];
+            logf_("[castgame] PLAYER 1 currentSpell -> %s",
+                  s && !IsBadReadPtr(s, 0x30) ? objName(s, sb, sizeof(sb)) : "None");
+        }
+    }
+    // The game's own cursor: SelectCursor.aCurrentTarget / aPossibleTarget
+    // (KWGame names). Whatever it locks is by definition a castable object.
+    static int sOffCur = -2, sOffPos = -2;
+    static void *sLastCur = NULL, *sLastPos = NULL;
+    if (sOffCur == -2) {
+        sOffCur = propOffset("KWGame.SelectCursor.aCurrentTarget");
+        if (sOffCur < 0) sOffCur = propOffset("hgame.SpellCursor.aCurrentTarget");
+        sOffPos = propOffset("KWGame.SelectCursor.aPossibleTarget");
+        if (sOffPos < 0) sOffPos = propOffset("hgame.SpellCursor.aPossibleTarget");
+        logf_("[castgame] cursor target props: aCurrentTarget=+0x%X aPossibleTarget=+0x%X",
+              sOffCur, sOffPos);
+    }
+    // Player 1's REAL cursor: his controller's Cursor property (KWGame.
+    // KWHeroController.Cursor), else the level's SpellCursor actor.
+    static int sOffCtrlCursor = -2;
+    if (sOffCtrlCursor == -2) sOffCtrlCursor = propOffset("KWGame.KWHeroController.Cursor");
+    void *cur = NULL;
+    if (sOffCtrlCursor > 0 && F.PawnController > 0 && !IsBadReadPtr((BYTE *)p1 + F.PawnController, 4)) {
+        void *ctrl = *(void **)((BYTE *)p1 + F.PawnController);
+        if (ctrl && !IsBadReadPtr((BYTE *)ctrl + sOffCtrlCursor, 4))
+            cur = *(void **)((BYTE *)ctrl + sOffCtrlCursor);
+    }
+    if (!cur) cur = findOrigCursor();
+    if (cur && !IsBadReadPtr(cur, 0x200) && cgClassOf(cur)) {
+        static void *sSaidCur = NULL;
+        if (cur != sSaidCur) {
+            sSaidCur = cur;
+            char cb[160];
+            logf_("[castgame] PLAYER 1 cursor actor: %s", objName(cur, cb, sizeof(cb)));
+        }
+        if (sOffCur > 0 && !IsBadReadPtr((BYTE *)cur + sOffCur, 4)) {
+            void *t = *(void **)((BYTE *)cur + sOffCur);
+            if (t != sLastCur) {
+                sLastCur = t;
+                if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t)) {
+                    char tb[160];
+                    logf_("[castgame] PLAYER 1 cursor aCurrentTarget -> %s", objName(t, tb, sizeof(tb)));
+                    if (g_castGameplay) { cgScanCandidates(p1, FALSE); cgDescribeActor(t, "cursor target"); }
+                    // A lock-on precedes the fire: open the capture now so
+                    // the window holds the whole activation sequence.
+                    DWORD nowC = GetTickCount();
+                    if (g_cgP1Windows < 3 && nowC - sLastWindowAt > 12000 && !g_pelogOn) {
+                        sLastWindowAt = nowC; g_cgP1Windows++;
+                        pelogAuto();
+                        logf_("[pelog] window %d/3 opened at player 1's cursor lock-on", g_cgP1Windows);
+                    }
+                } else if (!t) logf_("[castgame] PLAYER 1 cursor aCurrentTarget -> None");
+            }
+        }
+        if (sOffPos > 0 && !IsBadReadPtr((BYTE *)cur + sOffPos, 4)) {
+            void *t = *(void **)((BYTE *)cur + sOffPos);
+            if (t != sLastPos) {
+                sLastPos = t;
+                if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t)) {
+                    char tb[160];
+                    logf_("[castgame] PLAYER 1 cursor aPossibleTarget -> %s", objName(t, tb, sizeof(tb)));
+                    if (g_castGameplay) { cgScanCandidates(p1, FALSE); cgDescribeActor(t, "cursor possible target"); }
+                }
+            }
+        }
+    }
 }
 
 // Pick something worth casting at. A companion's natural targets in this game
@@ -2547,7 +3638,6 @@ static void rotYaw(float *v, double yawRad)
 // fired on ANY player pawn is logged (consecutive dupes collapsed). Cast
 // with P1 (natural) and P2 (ours) inside the window; the log then holds
 // both exit sequences for a diff. Patch is removed when the window ends.
-static BOOL  g_pelogOn    = FALSE;
 static DWORD g_pelogEnd   = 0;
 static DWORD g_pelogT0    = 0;      // v36: timestamp base (cast fire)
 static int   g_pelogCount = 0;
@@ -2582,8 +3672,10 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
                 sPinged = TRUE;
                 logf_("[pelog] capture active - events flowing");
             }
+            BOOL isPawnEv = FALSE;
             for (int p = 0; p < 8; p++) {
                 if (!g_pawn[p] || g_pawn[p] != self) continue;
+                isPawnEv = TRUE;
                 char nb[120];
                 objName(func, nb, sizeof(nb));
                 // v36: timestamps since the window base (cast fire for
@@ -2598,6 +3690,52 @@ static void __fastcall pelogDetour(void *self, void *edx, void *func,
                       (unsigned long)(now2 - g_pelogT0), nb);
                 g_pelogCount++;
                 break;
+            }
+            // v51: the ACTIVATION path is not on the pawn - it runs on the
+            // spell actor (ProcessTouch/HitWall/Explode) and on the object
+            // it hits (HandleSpell*/OnSpellHit/Touch/Trigger/OnBounce). Log
+            // those for ANY actor (P1's real cast included), so a hardware
+            // log shows exactly which functions the game itself calls when
+            // Harry hits a statue or a pad. Capped per window.
+            if (!isPawnEv && g_cgPelogExtra < 160 && self && !IsBadReadPtr(self, 0x30)) {
+                char fnb[64];
+                const char *fnName = objShortName(func, fnb, sizeof(fnb));
+                BOOL hit = !_strnicmp(fnName, "HandleSpell", 11) ||
+                           !_stricmp(fnName, "OnHandleSpell") ||
+                           ciHas(fnName, "SpellHit") || ciHas(fnName, "HitBySpell") ||
+                           !_stricmp(fnName, "ProcessTouch") || !_stricmp(fnName, "Touch") ||
+                           !_stricmp(fnName, "HitWall") || !_stricmp(fnName, "Explode") ||
+                           !_stricmp(fnName, "Trigger") || !_stricmp(fnName, "UnTrigger") ||
+                           ciHas(fnName, "Bounce") || !_stricmp(fnName, "OnSpellShutdown") ||
+                           ciHas(fnName, "SpellCast") || ciHas(fnName, "CastSpell") ||
+                           ciHas(fnName, "SpawnSpell") || ciHas(fnName, "ChooseSpell") ||
+                           !_stricmp(fnName, "LockOn") || !_stricmp(fnName, "Activate");
+                char nb[120];
+                if (hit) objName(func, nb, sizeof(nb));
+                if (hit && !strstr(nb, "Emitter") && !strstr(nb, "Particle")) {
+                    char sb[120]; objName(self, sb, sizeof(sb));
+                    if (!isReflection(sb)) {
+                        char pb[80] = "";
+                        // First Object parm of Touch/ProcessTouch/Trigger/
+                        // HandleSpell*/OnSpellHit/OnBounce is the other actor
+                        // - show it, but only when the pointer provably is an
+                        // object (its Class is in the known-class set).
+                        if (parms && !IsBadReadPtr(parms, 4) && g_cgNKCls > 0 &&
+                            (!_stricmp(fnName, "Touch") || !_stricmp(fnName, "ProcessTouch") ||
+                             !_stricmp(fnName, "Trigger") || !_strnicmp(fnName, "HandleSpell", 11) ||
+                             !_stricmp(fnName, "OnSpellHit") || !_stricmp(fnName, "OnBounce"))) {
+                            void *o = *(void **)parms;
+                            if (o && !IsBadReadPtr(o, 0x30) && cgClassOf(o)) {
+                                char ob[72]; objName(o, ob, sizeof(ob));
+                                _snprintf(pb, sizeof(pb) - 1, " other=%s", ob);
+                                pb[sizeof(pb) - 1] = 0;
+                            }
+                        }
+                        logf_("[pelog] @+%lums %s :: %s%s",
+                              (unsigned long)(GetTickCount() - g_pelogT0), sb, nb, pb);
+                        g_pelogCount++; g_cgPelogExtra++;
+                    }
+                }
             }
         }
     }
@@ -2850,6 +3988,7 @@ static void pelogStart(void)
     g_pelogEnd   = GetTickCount() + 8000;
     g_pelogT0    = GetTickCount();
     g_pelogCount = 0;
+    g_cgPelogExtra = 0;
     logf_("[pelog] === START (8s): NOW cast with P1 (mouse, natural), "
           "then with P2 (Y) ===");
 }
@@ -2937,6 +4076,7 @@ static void updateAimFX(int i, void *pawn, BOOL held,
     if (i < 1 || i >= 8) return;
     if (!held) {
         g_aimSup[i] = FALSE;              // v24: reset with the glow
+        g_cgLockName[i][0] = 0;           // v51: castable lock ends with the hold
         // v22: return the borrowed original cursor first (no-op if unused)
         if (g_glowStyle == 0) origCursorDrive(i, g_pawn[i], FALSE, NULL);
         if (g_aimFX[i]) {
@@ -2979,11 +4119,40 @@ static void updateAimFX(int i, void *pawn, BOOL held,
     BOOL snapped = FALSE;
     BOOL locked  = FALSE;
 
+    // v51: the castable object under the spell line owns the glow, as
+    // player 1's cursor locks onto the statue/pad it will fire at. Same
+    // picker as the fire, so what the glow marks is what gets the spell.
+    if (g_castGameplay) {
+        static DWORD sCgAt[8] = { 0 };
+        static void *sCgObj[8] = { 0 };
+        DWORD now = GetTickCount();
+        if (now - sCgAt[i] > 150) {
+            sCgAt[i] = now;
+            CgCand *c = cgPickTarget(i, pawn, NULL, FALSE, NULL);
+            sCgObj[i] = c ? c->obj : NULL;
+        }
+        CgCand *c = cgFindCand(sCgObj[i]);
+        if (c && cgCandAlive(c)) {
+            float tp[3]; cgAimPoint(c, tp);
+            if (strcmp(c->name, g_cgLockName[i])) {
+                strncpy(g_cgLockName[i], c->name, sizeof(g_cgLockName[i]) - 1);
+                logf_("  [aimfx] p%d castable lock -> %s", i, c->name);
+            }
+            aim[0] = tp[0]; aim[1] = tp[1]; aim[2] = tp[2] + 20.0f;
+            snapped = TRUE; locked = TRUE;
+            aimD = sqrtf((aim[0]-org[0])*(aim[0]-org[0]) + (aim[1]-org[1])*(aim[1]-org[1]) +
+                         (aim[2]-org[2])*(aim[2]-org[2]));
+        } else if (g_cgLockName[i][0]) {
+            logf_("  [aimfx] p%d castable lock released (was %s)", i, g_cgLockName[i]);
+            g_cgLockName[i][0] = 0;
+        }
+    }
+
     // AimedCast: fireCast homes the spell at the best cone target, so the
     // glow must sit on THAT actor or the two disagree again (v17 hardware
     // report: spell veered at Ron/harry while the glow marked the wall).
     // Same search, same rules - throttled, target latched between scans.
-    if (g_aimedCast) {
+    if (g_aimedCast && !snapped) {
         static DWORD sScanAt = 0;
         static void *sLock[8] = { 0 };
         DWORD now = GetTickCount();
@@ -3315,6 +4484,24 @@ static void beginCast(int i, void *pawn)
 {
     char b[160];
     void *cls = spellClassFor(pawn);
+    // v51: like the wand's ChooseSpell(target.vulnerableTo...), the spell is
+    // picked FROM the object under the spell line, so a statue gets its
+    // Lapifors/Depulso and a pad its Spongify instead of the default spell.
+    g_cgBeginCls[i] = NULL;
+    if (g_castGameplay) {
+        static void *sBase[8] = { 0 };     // the pawn's own spell before any override
+        static void *sBasePawn[8] = { 0 };
+        if (sBasePawn[i] != pawn) { sBasePawn[i] = pawn; sBase[i] = NULL; }
+        if (!sBase[i]) sBase[i] = cls; else cls = sBase[i];
+        CgCand *c = cgPickTarget(i, pawn, NULL, FALSE, NULL);
+        void *tc = cgSpellClassFor(c, NULL);
+        if (tc) {
+            char tb[160];
+            logf_("  [cast-begin] p%d spell chosen from target %s: %s", i,
+                  c->name, objName(tc, tb, sizeof(tb)));
+            cls = tc; g_cgBeginCls[i] = tc;
+        }
+    }
     logf_("  [cast-begin] p%d pawn=%s spellClass=%s", i, g_pawnName[i],
           cls ? objName(cls, b, sizeof(b)) : "<NONE>");
     if (!cls) { logf_("    !! no spell class available - cast skipped"); return; }
@@ -3349,20 +4536,43 @@ static void fireCast(int i, void *pawn)
 {
     char b[160];
     void *cls = spellClassFor(pawn);
-    logf_("  [cast-fire] p%d pawn=%s spellClass=%s", i, g_pawnName[i],
-          cls ? objName(cls, b, sizeof(b)) : "<NONE>");
-    if (!cls) return;
-
     void *target = NULL;
     void *gameTarget = NULL;
     void *spawned = NULL;
+    CgCand *gameCand = NULL;
 
-    // v50: even in straight-shot mode, acquire the SpellTrigger/cast object
-    // under the camera ray and feed it into the game's cast pipeline. This is
-    // the gameplay part player 1 gets from his real cursor/controller path.
-    float gd = 0.0f;
-    gameTarget = findCastGameplayTarget(i, pawn, &gd, TRUE);
-    if (gameTarget) target = gameTarget;
+    // v51: the castable object under the camera spell line (vulnerableTo
+    // class / spell handler / SpellTrigger family), chosen exactly as the
+    // game's cursor chooses it. It supplies the spell class, becomes the
+    // projectile's TargetActor, and gets the game's own touch when the spell
+    // arrives (cgArmHit below). Straight-shot mode only applies when nothing
+    // castable is on the line.
+    if (g_castGameplay) {
+        float gd = 0.0f;
+        gameCand = cgPickTarget(i, pawn, &gd, TRUE, NULL);
+        if (gameCand) {
+            gameTarget = gameCand->obj;
+            target = gameTarget;
+            void *tc = cgSpellClassFor(gameCand, NULL);
+            if (tc) cls = tc;
+            else if (g_cgBeginCls[i]) cls = g_cgBeginCls[i];
+        } else if (g_cgBeginCls[i]) {
+            cls = g_cgBeginCls[i];    // keep what the aim phase started with
+        }
+        if (cls && g_offCurrentSpell > 0 && !IsBadWritePtr((BYTE *)pawn + g_offCurrentSpell, 4) &&
+            *(void **)((BYTE *)pawn + g_offCurrentSpell) != cls) {
+            *(void **)((BYTE *)pawn + g_offCurrentSpell) = cls;
+            if (g_fnChoose) {
+                BYTE p[64]; memset(p, 0, sizeof(p));
+                *(void **)(p + 0x00) = cls;
+                *(DWORD *)(p + 0x04) = 1;
+                callFnP(pawn, g_fnChoose, p, 12, "ChooseSpell(targetCls,force)");
+            }
+        }
+    }
+    logf_("  [cast-fire] p%d pawn=%s spellClass=%s", i, g_pawnName[i],
+          cls ? objName(cls, b, sizeof(b)) : "<NONE>");
+    if (!cls) return;
 
     if (!target && g_aimedCast) {
         float d = 0.0f;
@@ -3373,6 +4583,16 @@ static void fireCast(int i, void *pawn)
     }
     if (g_offSpellTarget > 0) *(void **)((BYTE *)pawn + g_offSpellTarget) = target;
 
+    // v51: aTargetOffset = the cursor's "hit point minus actor origin" - the
+    // object's own targeting centre (CentreOffset), so homing aims at the
+    // statue's body, not its base.
+    float tgtOff[3] = { 0.0f, 0.0f, 0.0f };
+    if (gameCand && cgCandAlive(gameCand)) {
+        float ap[3]; cgAimPoint(gameCand, ap);
+        float *tl = (float *)((BYTE *)gameCand->obj + F.Location);
+        tgtOff[0] = ap[0] - tl[0]; tgtOff[1] = ap[1] - tl[1]; tgtOff[2] = ap[2] - tl[2];
+    }
+
     if (g_fnPlayCast) {
         BYTE p[64]; memset(p, 0, sizeof(p));
         *(void **)(p + 0x00) = target;
@@ -3382,8 +4602,9 @@ static void fireCast(int i, void *pawn)
     {   // castSpell(target, offset, class) - the gameplay fire
         BYTE p[64]; memset(p, 0, sizeof(p));
         *(void **)(p + 0x00) = target;
+        memcpy(p + 0x04, tgtOff, 12);
         *(void **)(p + 0x10) = cls;
-        callFnP(pawn, g_fnCast, p, 20, "castSpell(tgt,0,cls)");
+        callFnP(pawn, g_fnCast, p, 20, "castSpell(tgt,off,cls)");
     }
     if (g_fnCharFire) {
         BYTE p[64]; memset(p, 0, sizeof(p));
@@ -3507,21 +4728,55 @@ static void fireCast(int i, void *pawn)
                     logf_("    spell aimed along camera yaw=%d pitch=%d "
                           "speed=%.0f (was %.0f u/s)", cy, cpt, speed, sp);
                 } else if (sp < 20.0f) {
-                    int yaw = playerViewYaw(i);
-                    double r = yaw * (6.283185307179586 / 65536.0);
-                    sv[0] = (float)cos(r) * 1200.0f;
-                    sv[1] = (float)sin(r) * 1200.0f;
-                    sv[2] =  40.0f;
+                    // v51: a stationary spell with a gameplay target flies
+                    // straight AT the target's aim point (3D), so even a
+                    // non-homing spell class reaches the statue/pad. The
+                    // game's own homing (TargetActor) still steers it.
+                    float speed = 1200.0f;
+                    if (g_offProjSpeed > 0 &&
+                        !IsBadReadPtr((BYTE *)spawned + g_offProjSpeed, 4)) {
+                        float s = *(float *)((BYTE *)spawned + g_offProjSpeed);
+                        if (s > 100.0f && s < 20000.0f) speed = s;
+                    }
+                    float tp[3]; BOOL haveTP = FALSE;
+                    if (gameCand && cgCandAlive(gameCand)) { cgAimPoint(gameCand, tp); haveTP = TRUE; }
+                    float *sl2 = (float *)((BYTE *)spawned + F.Location);
+                    float ddx = 0, ddy = 0, ddz = 0, dl = 0;
+                    if (haveTP) {
+                        ddx = tp[0] - sl2[0]; ddy = tp[1] - sl2[1]; ddz = tp[2] - sl2[2];
+                        dl = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz);
+                    }
+                    if (haveTP && dl > 1.0f) {
+                        sv[0] = ddx / dl * speed; sv[1] = ddy / dl * speed; sv[2] = ddz / dl * speed;
+                        if (F.Rotation > 0 && !IsBadWritePtr((BYTE *)spawned + F.Rotation, 12)) {
+                            int *sr = (int *)((BYTE *)spawned + F.Rotation);
+                            sr[0] = (int)(atan2(ddz, sqrtf(ddx * ddx + ddy * ddy)) * (65536.0 / 6.283185307179586));
+                            sr[1] = (int)(atan2(ddy, ddx) * (65536.0 / 6.283185307179586));
+                            sr[2] = 0;
+                        }
+                        logf_("    spell aimed at target point (%.0f %.0f %.0f) dist=%.0f speed=%.0f",
+                              tp[0], tp[1], tp[2], dl, speed);
+                    } else {
+                        int yaw = playerViewYaw(i);
+                        double r = yaw * (6.283185307179586 / 65536.0);
+                        sv[0] = (float)cos(r) * 1200.0f;
+                        sv[1] = (float)sin(r) * 1200.0f;
+                        sv[2] =  40.0f;
+                        logf_("    spell given projectile velocity (was stationary)");
+                    }
                     if (F.Physics > 0) *((BYTE *)spawned + F.Physics) = 6; // PHYS_Projectile
-                    logf_("    spell given projectile velocity (was stationary)");
                 } else {
                     logf_("    spell already moving at %.0f units/s", sp);
                 }
             }
         }
     }
-    if (gameTarget)
-        activateCastGameplayTarget(i, pawn, gameTarget, cls, spawned);
+    if (gameTarget) {
+        // v51: the game's spell actor keeps TargetActor (homing) and now also
+        // gets the wand's autohit delivery when it arrives - the projectile's
+        // own ProcessTouch(target, hitLoc), i.e. the object's real handler.
+        cgArmHit(i, pawn, spawned, gameCand, cls);
+    }
     if (g_fnFinalize) callFn(pawn, g_fnFinalize, "finalizeSpell");
 }
 
@@ -4028,6 +5283,8 @@ static void invalidateLevelCaches(const char *reason)
     }
     g_fnResolved = FALSE;      // UFunctions live in packages too
     g_defaultSpell = NULL;
+    cgResetLevel();            // v51: class index / candidates / pending hits
+    g_origCursor = NULL; g_origCursorChecked = FALSE;   // v51: it dies with the level
     resetViewYaw();
     F.ok = FALSE;              // re-resolve field offsets as well
 }
@@ -5258,6 +6515,8 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
 
     hookGameWindow();
     finishPendingCasts();
+    cgTick();                  // v51: deliver pending spell hits
+    cgWatchP1();               // v51: log player 1's real target/spell choice
 
     {   // K (diagnostic, 2-player configs only - K is P3's back key at N=3):
         // A/B the aim glow's actor DrawScale live - 4.0, 0.3, back to
@@ -5737,6 +6996,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         g_freeLook   = GetPrivateProfileIntA("camera",  "FreeCamera", 0, ini) != 0;
         g_aimedCast  = GetPrivateProfileIntA("actions", "AimedCast", 0, ini) != 0;
         g_castGameplay = GetPrivateProfileIntA("actions", "CastGameplay", 1, ini) != 0;
+        g_castAutoHit  = GetPrivateProfileIntA("actions", "CastAutoHit", 1, ini) != 0;
         {   // v40: gap between the state's natural AnimEnd and our exit.
             // 90 (default) = the v39 timing that removed the pose snap. If
             // a cast leaves a weird stance on hardware, raise it (250/400)

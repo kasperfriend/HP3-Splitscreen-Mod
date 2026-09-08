@@ -236,6 +236,116 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
           a safety net. The target search is narrow (SpellTrigger or cast+
           Trigger names only) so missed casts do not fire arbitrary overlap/
           cutscene triggers. Logs are [castgame] target/activating.
+        - HARDWARE VERDICT: statues and jump pads still did nothing. Three
+          reasons, all structural: (1) statues/pads are not named
+          "SpellTrigger", so they never became targets; (2) the spell fired
+          was the caster's default (Rictusempra) - a Lapifors statue or a
+          Spongify pad ignores it; (3) the "safety net" was Trigger(caster,
+          caster) - spell objects react to a SPELL TOUCH, not to Trigger.
+    * v51 (implemented; NOT YET VERIFIED IN HP3) - THE ORIGINAL CAST PATH:
+        - No HP3 script source exists anywhere public. The path was
+          reconstructed from two same-family sources: the HP2 (Chamber of
+          Secrets) script decompile (github metallicafan212/HP2UScriptDecompile,
+          same hgame lineage: baseSpell/spellTrigger/HPawn.OnSpellHit/
+          HandleSpell<Name>/baseWand.CastSpell/SpellCursor) and the Shrek 2
+          KWGame export (github Master-64/Shrek2-LevelEditor, the exact
+          KnowWonder framework HP3 is built on: KWHeroController.Cursor
+          (SelectCursor), KWPawn, KWJumpPad/BouncePad, and the engine-level
+          Actor property block var(Reaction) Class<Projectile>
+          vulnerableToClass + var(Targeting) SizeModifier/CentreOffset/
+          GestureDistance/bMustClickToTarget present on EVERY actor).
+        - How player 1 activates a statue/pad (reconstructed):
+            1. SelectCursor/SpellCursor traces the camera line and accepts
+               only actors whose vulnerable-to value is set (HP2:
+               eVulnerableToSpell != SPELL_None; KW: vulnerableToClass !=
+               None). aCurrentTarget/aPossibleTarget hold the pick.
+            2. LockOn -> wand.ChooseSpell(target.vulnerableTo): THE SPELL IS
+               CHOSEN FROM THE TARGET. castSpell(aTarget, aTargetOffset,
+               spellClass) gets the target and the hit-point offset.
+            3. baseSpell extends Projectile, TargetActor set -> per-tick
+               homing (UpdateRotationWithSeeking). No TargetActor = no homing.
+            4. Collision: spell.ProcessTouch(Other, HitLocation) ->
+               HPawn(Other).HandleSpell<Name>(self, HitLocation) /
+               OnSpellHit(self, HitLocation); spellTrigger via Trigger.Touch
+               (IsRelevant: baseSpell(Other).SpellType == eVulnerableToSpell,
+               so a generic Trigger() call never activates it). SpongifyPad.
+               HandleSpellSpongify lives INSIDE a state (stateDisabled).
+            5. Autohit: baseWand fires LastCastedSpell.ProcessTouch(aTarget,
+               aTarget.Location) directly for close targets. That is the
+               call we replicate: the game's own dispatch, from our timing.
+        - v51 mechanics (dllmain.cpp, "CAST GAMEPLAY, PLAYER-1 FAITHFUL"):
+            * cgBuildIndex: one object-table pass indexes every
+              ClassProperty/ByteProperty named *vulnerable*, SizeModifier,
+              CentreOffset, and every Function named HandleSpell*/
+              OnHandleSpell/OnSpellHit/SpellHit/HitBySpell*/ProcessTouch/
+              Touch/Trigger (class level, plus state-level spell handlers).
+              It also calibrates two previously unknown offsets the same
+              way UProperty::Offset was calibrated: UObject::Class (the
+              dword that equals Core.StructProperty in Engine.Actor.Location,
+              Core.Function in Engine.Actor.Trigger, ...) and
+              UStruct::SuperField (the dword that equals Engine.Actor in
+              Engine.Pawn, Engine.Controller in Engine.PlayerController,
+              ...). The chain is VERIFIED on a known pawn (must reach
+              Engine.Pawn and Engine.Actor) before anything trusts it;
+              otherwise the v50 name-only rules remain as fallback.
+              Pointers are only dereferenced as objects when they are in
+              the known-class set (binary search over every "Class ..."
+              object) - the crash guard for property values.
+            * cgScanCandidates: actors (chain reaches Engine.Actor, not a
+              projectile, not the trio, not cursors/emitters) whose
+              vulnerable class value is a live class, or whose vulnerable
+              byte is non-zero, or SpellTrigger-family, or that override a
+              specific HandleSpell<Name> below the shared bases (HPPawn/
+              HPCharacter/KWPawn declare stubs for all of them - those do
+              not count). Spell class per object: the vulnerable class
+              value, else a "*spell*" ClassProperty on it, else derived
+              from the handler name (HandleSpellLapifors -> hgame.
+              LapiforsSpell / spellLapifors). baseSpell/Projectile values
+              mean "any spell" and are not cast.
+            * cgPickTarget: 3D corridor from the real spawn point along the
+              camera line, CollisionRadius+90 (x SizeModifier), LOS by
+              FastTrace to the aim point (Location+CentreOffset) or a point
+              pulled back in front of the object. Same picker drives the
+              aim glow (locks onto the object) and the fire.
+            * beginCast/fireCast: spell = target's class (ChooseSpell/
+              StartCasting/castSpell/SpawnSpell all receive it; the pawn's
+              own spell is remembered per pawn and restored for untargeted
+              casts); aTargetOffset = CentreOffset; the spawned projectile
+              keeps TargetActor and, if the game left it stationary, is
+              given velocity toward the aim point.
+            * cgArmHit/cgTick/cgDeliverHit: after the fire a pending hit
+              watches the projectile (slot + class-pointer liveness, no
+              name compares per frame); when it gets within
+              CollisionRadius+40 of the aim point or the flight window
+              (dist/Speed + 0.7 s, 0.9-3.5 s) closes with it still alive,
+              the delivery runs: trigger-family target -> target.Touch(
+              spell); spell class overrides ProcessTouch -> spell.
+              ProcessTouch(target, spellLocation); else target.
+              HandleSpell<Name>(spell, hitLoc) / generic handler / spell.
+              Touch(target). Params are filled by NAME+TYPE from the
+              function's child properties (ClassProperty -> spell class,
+              Object named *spell* -> spell actor, *instigator/caster/
+              owner/pawn/source* -> caster, other Object -> the other
+              actor, Struct *loc/hit/pos* -> hit location, Float *charge*
+              -> 1.0) and each layout is logged once as [castgame-fn]. A
+              projectile that died on its own hit something naturally (the
+              engine already dispatched) and is left alone.
+            * Telemetry for the proof: the ProcessEvent detour now also
+              logs NON-pawn events whose name is a spell/touch/trigger/
+              bounce function (self + function + first Object parm), and
+              cgWatchP1 opens up to three such windows per level when
+              player 1's spellTarget changes, logging his target/current
+              spell and the cursor's aCurrentTarget/aPossibleTarget with a
+              [castgame] description of that object (class, vulnerable
+              value, handlers, whether OUR rules list it). A hardware log
+              with one P1 cast and one P2 cast on the same statue is the
+              acceptance test.
+        - Build note: no MinGW in the sandbox; the DLL was cross-built
+          with zig (clang) -target x86-windows-gnu from the same single
+          TU (exports Direct3DCreate8 via the .def, imports winmm/user32/
+          kernel32 + UCRT api-ms-win-crt-*). The Actions workflow still
+          builds with MinGW; both are 32-bit PE and the code has no
+          compiler-specific parts (no SEH, no inline asm).
     * v49 (implemented; policy tested, NOT YET VERIFIED IN HP3):
         - Preserve the working v48 exit call set, timing and one anim
           re-pick. Remove castHoldFloor/castDipGuard entirely.
