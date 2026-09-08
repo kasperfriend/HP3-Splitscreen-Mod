@@ -57,7 +57,7 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v52 ...
+          === hp3mod build v53 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
       d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave

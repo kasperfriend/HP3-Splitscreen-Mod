@@ -469,4 +469,25 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   offset would let the re-pick fire only when the pose is actually
   wrong.
 - upkg2.py v129 export table.
+12. V52/V53 NATIVE AIM ICON NOTES (2026-09-08)
+----------------------------------------------
+- v52 hardware (Save0, split ON): P2 seek particles native and correct, but
+  the locked SpellGesture never spawned - every real target logged
+  "no readable default.SpellIcon", so the legacy Sparkle_1/3/7 additive
+  marker drew over the native effect for the whole hold. After a successful
+  cast (hover state changed) it glowed like P1; a fresh hold reverted.
+- Root cause: the icon read assumed hgame.baseSpell.SpellIcon is a plain
+  "Texture" at a fixed offset. Sibling-engine evidence (HP2 UScript
+  decompile, metallicafan212/HP2UScriptDecompile): spell subclasses may
+  shadow the base declaration, and the gesture glyphs are wet/shader
+  materials (SpellCursor.GetGestureTexture feeds WetTexture
+  'SpellShapes.SpellFX.<Spell>Wet1' to the same GestureSprite.ChangeGesture
+  that our lock path calls). A strict "Texture " check rejects exactly the
+  values the game passes.
+- v53 fix (src/native_aim.h): resolve <spellClass path>.SpellIcon on the
+  class's own chain via findObjectByPath + calibrated UProperty::Offset
+  (cached, cleared with the bindings), accept any material-family object,
+  pass it to ChangeGesture untouched, and on failure log the exact gate
+  (class, +0xX slot, None/unreadable/wrong-family value) instead of a bare
+  miss. Anchor fallback remains hgame.baseSpell.SpellIcon.
 ===========================================================================
