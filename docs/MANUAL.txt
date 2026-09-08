@@ -30,11 +30,11 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v50 ...
+          === hp3mod build v51 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
-      d3d8.dll. Upgrading from v49 can keep your custom hp3mod.ini; leave
-      [actions] NoDip=1 and CastGameplay=1 (the defaults).
+      d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave
+      [actions] NoDip=1, CastGameplay=1 and CastAutoHit=1 (the defaults).
 
   >>> IF THE SPLIT FLASHES ON AND DISAPPEARS <<<
       Open hp3mod.ini and set:      StartOn=1
@@ -89,14 +89,18 @@ USING IT
                                  auto-target the spell
                                  flies along the camera (yaw AND pitch,
                                  v14 aims the spell actor itself so the
-                                 direction sticks); v50 also traces that
-                                 same spell line for SpellTrigger/cast
-                                 objects and feeds the found target through
-                                 the game's cast pipeline, so doors, buttons
-                                 and lesson objects activate like player 1's
-                                 casts instead of only playing animation.
-                                 With AimedCast=1, non-object targets in the
-                                 cone are still auto-aimed like before.
+                                 direction sticks). v51: castable OBJECTS on
+                                 that spell line (statues, jump pads, doors,
+                                 lesson objects) are recognised the way the
+                                 game's own cursor recognises them, the glow
+                                 locks onto the one you will hit, the spell
+                                 that object needs is cast at it (a Lapifors
+                                 statue gets Lapifors, a pad gets Spongify),
+                                 and on arrival the game's own spell-touch
+                                 runs the object's handler - so it activates
+                                 exactly like player 1's cast. With
+                                 AimedCast=1, non-object targets in the cone
+                                 are still auto-aimed like before.
                                  The casting pose is cleared again ~1.2 s
                                  after the spell leaves the wand - v17
                                  exits the casting script STATE (the real
@@ -555,6 +559,36 @@ USING IT
                                  SpawnSpell, and invokes that target's own
                                  spell/trigger handler as a safety net. Look
                                  for [castgame] target and activating lines.
+                                 v51: v50 never fired on statues/jump pads -
+                                 it only knew actors NAMED SpellTrigger, cast
+                                 the default spell with no target, and its
+                                 fallback Trigger() is ignored by spell
+                                 objects. v51 copies the original cast path:
+                                 castable objects are found by their own
+                                 reaction/targeting properties and
+                                 HandleSpell<Name> handlers (class chain
+                                 calibrated at runtime, verified before use),
+                                 the spell class is chosen FROM the object,
+                                 the projectile keeps the object as its
+                                 target and flies at its targeting centre,
+                                 and when it arrives the game's own spell
+                                 ProcessTouch / trigger Touch runs the
+                                 handler (CastAutoHit=1). Read the log:
+                                   [castgame-scan] what is castable in this
+                                                   level and why (property /
+                                                   handler / trigger name)
+                                   [castgame]      target, chosen spell,
+                                                   flight, handler that ran
+                                   [castgame-fn]   recovered handler params
+                                   PLAYER 1 ...    what the game itself
+                                                   picked for player 1's
+                                                   cast, plus a [pelog]
+                                                   window with the real
+                                                   ProcessTouch/HandleSpell/
+                                                   Touch/OnBounce events
+                                 HARDWARE CHECK: cast at a statue and a
+                                 jump pad with player 2, then the SAME
+                                 object with player 1, and send the log.
                                  HARDWARE CHECK STILL REQUIRED:
                                  cast standing still, wait at least
                                  5 seconds, then move. Also try
@@ -613,8 +647,10 @@ WHAT IS VERIFIED
 KNOWN LIMITATIONS (this is a prototype)
   - The HUD is drawn once, for player 1's strip only.
   - The scene is rendered N+1 times per frame, so the cost scales with N.
-  - Player 2 has no aiming cursor; casts auto-target the best candidate in
-    front of the caster, then fire on release like player 1.
+  - Player 2's aiming cursor is the mod's glow (not the game's HUD reticle);
+    it locks onto the castable object on the spell line and the cast fires on
+    release like player 1. Object activation (v51) follows the original cast
+    path but is not yet hardware-confirmed.
   - Player 2 has no menu/inventory access.
   - Save games are single-player and unchanged.
   - Companion AI is released by dropping TrailingChar / LeadChar and
