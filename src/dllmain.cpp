@@ -3280,6 +3280,16 @@ static BOOL g_aiReleased[8] = {0};
 static BOOL g_letAI[8]     = {0};          // debug: M key hands the pawn back
 static void *g_savedCtrl[8] = {0};
 
+// The companion follow state as it was the moment we first took the pawn, so
+// that switching the split back OFF can hand the companion back to the AI in
+// the same trailing configuration the game set up at level load (see aiRestore
+// below). Captured once by captureFollowState(), the first time we ever touch
+// the AI (in releaseAI, before any stop-trail call mutates the fields).
+static BOOL  g_leashOrig[8]   = { FALSE };
+static float g_saveRadius[8]  = { 0 };     // KWAIController.TrailCharFollowRadius
+static void *g_saveLead[8]    = { 0 };     // KWAIController.LeadChar (Harry pawn)
+static BOOL  g_saveUseDist[8] = { TRUE };  // bUseDistFromLeadCharForMovement
+
 // Only companion/AI controllers may be UnPossessed. Calling HPAIController.UnPossess
 // on a KWCutControllerII tears down the cutscene state machine and GPFs
 // (AActor::ProcessState on KWCutControllerII.Scripting).
@@ -3293,10 +3303,40 @@ static BOOL isCompanionCtrl(const char *name)
     return FALSE;
 }
 
+// Record the companion AI's follow configuration THE FIRST time the mod ever
+// touches a controller for player i, so that switching the split back OFF can
+// hand the companion back intact via aiRestore(). This is the state the game
+// set up at level load - follow radius, which lead char it trails, and
+// whether it moves relative to that lead. It must run BEFORE any of the stop
+// writes below change the fields, which is why releaseAI calls it before its
+// script stop-trail functions.
+static void captureFollowState(int i, void *ctrl)
+{
+    if (!ctrl || g_leashOrig[i] || g_offFollowRadius <= 0 ||
+        g_offLeadChar <= 0 || g_offUseDistLead <= 0 ||
+        IsBadReadPtr((BYTE *)ctrl + g_offFollowRadius, 4) ||
+        IsBadReadPtr((BYTE *)ctrl + g_offLeadChar, 4))
+        return;
+    g_saveRadius[i]  = *(float *)((BYTE *)ctrl + g_offFollowRadius);
+    g_saveLead[i]    = *(void **)((BYTE *)ctrl + g_offLeadChar);
+    g_saveUseDist[i] = g_maskUseDistLead
+        ? ((*(DWORD *)((BYTE *)ctrl + (g_offUseDistLead & ~3)) &
+            g_maskUseDistLead) != 0) : TRUE;
+    if (g_saveRadius[i] >= 0.0f && g_saveRadius[i] < 40000.0f) {
+        char b[160];
+        logf_("  [leash] p%d captured follow state: radius=%.0f lead=%s "
+              "useDist=%d", i, g_saveRadius[i],
+              g_saveLead[i] ? objName(g_saveLead[i], b, sizeof(b)) : "<none>",
+              g_saveUseDist[i] ? 1 : 0);
+        g_leashOrig[i] = TRUE;
+    }
+}
+
 // Open the companion follow sphere (TrailCharFollowRadius) and forget the lead.
 // Cheap field writes - safe every frame. The sphere around Harry is this radius.
 static void cutLeash(int i, void *pawn, void *ctrl)
 {
+    captureFollowState(i, ctrl);   // fallback if releaseAI never captured first
     if (ctrl && g_offFollowRadius > 0 &&
         !IsBadWritePtr((BYTE *)ctrl + g_offFollowRadius, 4)) {
         float *r = (float *)((BYTE *)ctrl + g_offFollowRadius);
@@ -3356,6 +3396,10 @@ static void releaseAI(int i, void *pawn, BOOL hard)
 
     BYTE p[64];
     if (!hard) {
+        // Capture the pristine follow state BEFORE the stop functions below
+        // (or anything else) mutate the leash fields, so aiRestore() on the
+        // toggle-off can hand the companion back to the same follow setup.
+        captureFollowState(i, ctrl);
         if (g_fnStopTrail) { memset(p, 0, sizeof(p));
             callFnP(ctrl, g_fnStopTrail, p, 4, "OnStopTrailingLeadChar()"); }
         if (g_fnStopTrailKW) { memset(p, 0, sizeof(p));
@@ -3537,6 +3581,156 @@ static void takeControl(int i, void *pawn)
     suppressAI(i, pawn);                   // every frame, in case it re-binds
 }
 
+// Hand a driven companion pawn back to its companion AI once the split is
+// switched OFF. This reverses everything takeControl/releaseAI/suppressAI and
+// driveePawn did to the pawn and its controller:
+//   * give the controller back animation control (bControlAnimations=1);
+//   * restore the trailing configuration captured in cutLeash at take-over
+//     (LeadChar, TrailCharFollowRadius, bUseDistFromLeadCharForMovement and
+//     the lead's TrailingChar back-pointer) so the AI keeps following Harry
+//     the same way the game set it up;
+//   * if a hard release had UnPossessed the controller, reattach it via
+//     Controller.Possess;
+//   * un-freeze walking physics and restore GroundSpeed/AccelRate that the
+//     idle driver had pinned to 0, so the AI's own Tick owns the pawn again;
+//   * clear the per-view "we own this pawn" state so re-enabling the split
+//     later re-takes control cleanly.
+static void aiRestore(int i, void *pawn)
+{
+    if (!F.ok || !pawn || i < 1 || i >= 8) return;
+    if (!g_detached[i] && !g_aiReleased[i] && !g_savedCtrl[i]) return;
+    if (g_letAI[i]) return;                // debug M already handed it back
+    resolveActions();
+    char b[160];
+    void *ctrl = (F.PawnController > 0 &&
+                  !IsBadReadPtr((BYTE *)pawn + F.PawnController, 4))
+               ? *(void **)((BYTE *)pawn + F.PawnController) : NULL;
+    logf_("  [ai-restore] p%d pawn=%s controller=%s", i,
+          g_pawnName[i][0] ? g_pawnName[i] : "?",
+          ctrl ? objName(ctrl, b, sizeof(b)) : "<none>");
+
+    // A HARD release UnPossessed the controller (Pawn.Controller was cut).
+    // Reattach it with Controller.Possess so the AI owns the pawn again.
+    if (!ctrl && g_savedCtrl[i]) {
+        if (g_offDontPossess > 0)
+            setBoolProp(pawn, g_offDontPossess, g_maskDontPossess, FALSE);
+        void *fn = g_fnPossessAI ? g_fnPossessAI
+                                 : findObjectByPath("Engine.Controller.Possess");
+        if (fn) {
+            BYTE p[64]; memset(p, 0, sizeof(p));
+            *(void **)(p + 0x00) = pawn;
+            callFnP(g_savedCtrl[i], fn, p, 8, "Controller.Possess(pawn)");
+        }
+        g_savedCtrl[i] = NULL;
+        ctrl = (F.PawnController > 0 &&
+                !IsBadReadPtr((BYTE *)pawn + F.PawnController, 4))
+             ? *(void **)((BYTE *)pawn + F.PawnController) : NULL;
+    }
+    if (!ctrl) {
+        logf_("  [ai-restore] p%d no controller to hand the pawn back to", i);
+        g_detached[i] = FALSE; g_aiReleased[i] = FALSE;
+        g_leashOrig[i] = FALSE; g_savedCtrl[i] = NULL;
+        g_savedGS[i] = 0; g_savedAR[i] = 0; g_pinned[i] = FALSE;
+        return;
+    }
+    objName(ctrl, b, sizeof(b));
+    if (!isCompanionCtrl(b)) {
+        logf_("  [ai-restore] p%d controller '%s' is not a companion AI - "
+              "leaving it alone", i, b);
+        g_detached[i] = FALSE; g_aiReleased[i] = FALSE;
+        g_leashOrig[i] = FALSE; g_savedCtrl[i] = NULL;
+        g_savedGS[i] = 0; g_savedAR[i] = 0; g_pinned[i] = FALSE;
+        return;
+    }
+
+    // Give the AI back animation control of the pawn.
+    if (g_offCtrlAnims > 0)
+        setBoolProp(ctrl, g_offCtrlAnims, g_maskCtrlAnims, TRUE);
+
+    // Re-link the follow chain captured at take-over: this companion trails
+    // LeadChar (Harry), inside its original follow radius, moving relative to
+    // the lead. The lead's TrailingChar back-pointer must point at us too.
+    void *lead = g_saveLead[i];
+    if (!lead) lead = g_pawn[0] ? g_pawn[0] : findActorByClass("harry");
+    if (lead) {
+        if (!g_pawn[0]) g_pawn[0] = lead;
+        if (g_offLeadChar > 0 && !IsBadWritePtr((BYTE *)ctrl + g_offLeadChar, 4)) {
+            void **lc = (void **)((BYTE *)ctrl + g_offLeadChar);
+            if (*lc != lead) {
+                *lc = lead;
+                logf_("  [ai-restore] p%d LeadChar -> %s", i,
+                      objName(lead, b, sizeof(b)));
+            }
+        }
+        if (g_offTrailingChar > 0 &&
+            !IsBadWritePtr((BYTE *)lead + g_offTrailingChar, 4)) {
+            void **tc = (void **)((BYTE *)lead + g_offTrailingChar);
+            if (*tc != pawn) {
+                *tc = pawn;
+                logf_("  [ai-restore] p%d re-linked from lead.TrailingChar", i);
+            }
+        }
+    }
+    if (g_offFollowRadius > 0 &&
+        !IsBadWritePtr((BYTE *)ctrl + g_offFollowRadius, 4)) {
+        float *r = (float *)((BYTE *)ctrl + g_offFollowRadius);
+        float want = (g_leashOrig[i] && g_saveRadius[i] >= 0.0f &&
+                      g_saveRadius[i] < 40000.0f)
+                   ? g_saveRadius[i]
+                   : (*r > 40000.0f ? 300.0f : *r);   // generous default
+        if (*r != want) {
+            *r = want;
+            logf_("  [ai-restore] p%d TrailCharFollowRadius %.0f -> %.0f",
+                  i, *r, want);
+        }
+    }
+    if (g_offUseDistLead > 0)
+        setBoolProp(ctrl, g_offUseDistLead, g_maskUseDistLead,
+                    g_leashOrig[i] ? g_saveUseDist[i] : TRUE);
+
+    // Un-freeze the pawn so the AI's Tick can drive it again: restore the
+    // walk stats the idle driver pinned to 0 and make sure physics is Walking.
+    if (F.GroundSpeed > 0 && g_savedGS[i] > 0.0f &&
+        !IsBadWritePtr((BYTE *)pawn + F.GroundSpeed, 4))
+        *(float *)((BYTE *)pawn + F.GroundSpeed) = g_savedGS[i];
+    if (F.AccelRate > 0 && g_savedAR[i] > 0.0f &&
+        !IsBadWritePtr((BYTE *)pawn + F.AccelRate, 4))
+        *(float *)((BYTE *)pawn + F.AccelRate) = g_savedAR[i];
+    if (F.Physics > 0 && !IsBadWritePtr((BYTE *)pawn + F.Physics, 1) &&
+        *((BYTE *)pawn + F.Physics) == 0)
+        *((BYTE *)pawn + F.Physics) = 1;   // PHYS_Walking
+
+    logf_("  [ai-restore] p%d handed to AI: ctrl=%p phys=%d "
+          "(Pawn.Controller now=%p)", i, ctrl,
+          F.Physics > 0 ? *((BYTE *)pawn + F.Physics) : -1,
+          (F.PawnController > 0 && !IsBadReadPtr((BYTE *)pawn + F.PawnController, 4))
+              ? *(void **)((BYTE *)pawn + F.PawnController) : NULL);
+
+    // We no longer own this pawn; a future split re-take starts fresh.
+    g_detached[i]   = FALSE;
+    g_aiReleased[i] = FALSE;
+    g_leashOrig[i]  = FALSE;
+    g_savedCtrl[i]  = NULL;
+    g_savedGS[i]    = 0;
+    g_savedAR[i]    = 0;
+    g_pinned[i]     = FALSE;
+    g_letAI[i]      = FALSE;
+}
+
+// When the split is switched OFF, hand every player-2..N pawn we took control
+// of back to its companion AI. Called on the split-off edge (key or file).
+static void handBackAllPlayers(void)
+{
+    if (!F.ok) return;
+    int N = g_numPlayers; if (N < 1) N = 1; if (N > 8) N = 8;
+    for (int i = 1; i < N && i < 8; i++) {
+        void *pawn = g_pawn[i];
+        if (!pawn) continue;
+        if (!g_detached[i] && !g_aiReleased[i] && !g_savedCtrl[i]) continue;
+        aiRestore(i, pawn);
+    }
+}
+
 // Everything cached that belongs to the current level. Called on a detected
 // level change, and by the "n" debug key so the recovery path can be tested
 // deterministically instead of hoping to catch a door transition.
@@ -3547,6 +3741,8 @@ static void invalidateLevelCaches(const char *reason)
         g_pawn[k] = NULL; g_pawnName[k][0] = 0;
         g_detached[k] = FALSE; g_aiReleased[k] = FALSE; g_letAI[k] = FALSE;
         g_savedCtrl[k] = NULL; g_camDistCur[k] = 0.0f;
+        g_leashOrig[k] = FALSE; g_saveRadius[k] = 0;
+        g_saveLead[k] = NULL; g_saveUseDist[k] = TRUE;
         g_savedGS[k] = 0; g_savedAR[k] = 0; g_pinned[k] = FALSE;
         g_aimFX[k] = NULL; g_aimFXAt[k] = 0;   // dies with the level anyway
         memset(&g_run[k], 0, sizeof(g_run[k]));
@@ -4618,10 +4814,13 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
         DWORD now = GetTickCount();
         if (down && !prevKey && (now - lastToggle) >= 300) {
             lastToggle = now;
+            BOOL wasOn = g_splitOn;
             g_splitOn = !g_splitOn;
             g_liveFrames = 0;
             logf_("toggle key 0x%02X -> split %s", g_toggleKey,
                   g_splitOn ? "ON" : "OFF");
+            if (wasOn && !g_splitOn)
+                handBackAllPlayers();   // split OFF: return P2..N to the AI
         }
         prevKey = down;
     }
@@ -4634,10 +4833,13 @@ static BOOL renderSplitPortals(void *self, void *edx, void *canvas)
         int f = (GetFileAttributesA("split_on") != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
         if (prevFile < 0)        prevFile = f;
         else if (f != prevFile) {
+            BOOL wasOn = g_splitOn;
             g_splitOn = f ? TRUE : FALSE;
             g_liveFrames = 0;
             logf_("split_on file %s -> split %s",
                   f ? "appeared" : "removed", f ? "ON" : "OFF");
+            if (wasOn && !g_splitOn)
+                handBackAllPlayers();   // split OFF: return P2..N to the AI
         }
         prevFile = f;
     }
