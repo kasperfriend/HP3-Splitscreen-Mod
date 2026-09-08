@@ -38,6 +38,9 @@ jobs:
             mingw-w64-i686-gcc
             zip
 
+      - name: Test cast floor handoff policy
+        run: bash tests/run.sh
+
       - name: Build d3d8.dll
         env:
           CXX: g++
