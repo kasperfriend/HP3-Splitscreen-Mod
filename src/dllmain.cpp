@@ -4853,11 +4853,19 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
     // LockOn can run arbitrary stock script, so validate both objects again
     // before reading a field it may have invalidated (e.g. at a level change).
     if (!coopActorAlive(g_coopActive.hero[0].pawn) || !coopTargetAlive(key) ||
+        IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget, 4) ||
         IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell, 4)) {
         g_coopBlocked[holder] = TRUE;
         coopRestore("stock P1 bridge changed the active level/state");
         return FALSE;
     }
+    // LockOn owns P1's target/spell choice. Mark either field as borrowed if
+    // that stock call changed it, even when coopSetFields later finds it
+    // already equal to our desired value; otherwise cancellation would leave
+    // a LockOn-written P1 field behind.
+    void *stockTarget = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget);
+    if (stockTarget != g_coopActive.hero[0].savedTarget)
+        g_coopActive.hero[0].targetWritten = TRUE;
     // LockOn is the game's own spell choice for this target. Prefer it over a
     // generic P2/P3 fallback class when reflection can read a concrete class.
     void *stockSpell = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell);
