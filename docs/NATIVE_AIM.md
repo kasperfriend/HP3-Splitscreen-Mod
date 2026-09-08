@@ -172,7 +172,7 @@ On the same save used for the v51 log:
 
 1. Replace `system/d3d8.dll`. Keep custom controls; add `NativeAim=1` under
    `[actions]` if desired (default on). Keep `CastGameplay=1`, `AimedCast=0`.
-2. Confirm `build v53` and `[nativeaim] bindings OK` in `hp3mod.log`.
+2. Confirm `build v54` (or later) and `[nativeaim] bindings OK` in `hp3mod.log`. (v54 retains the v53 native-aim path and adds the separate cooperative-cast fallback.)
 3. Hold P2 cast away from targets, then over the Spongify pad and Depulso
    triggers. Expect `[nativeaim] p2 SEEK`, then `LOCK` with the correct
    material name (plain or wet/shader texture) and `privateParticles=2`, not

@@ -12,7 +12,8 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 - **Player 2 (and 3) fully controllable**: walk, turn, jump, cast real spells, use/interact
 - **Distinct characters per view** (Harry / Hermione / Ron), each with their own camera, floor and collision
 - Real spellcasting through the game's own script VM (Rictusempra, Depulso, Lumos, ... ) with hold-to-aim, vertical aim, and (v51) player-1-faithful gameplay activation: statues, jump pads, doors and lesson objects react to player 2's spells
-- **Native HP3 aim effects (v52)**: original seeking particles and target-sized hovered spell icons; hardware verification pending.
+- **Native HP3 aim effects (v52/v53)**: original seeking particles and target-sized hovered spell icons; hardware verification pending.
+- **Cooperative sustained-cast fallback (v54)**: after a deliberate over-10-second P2/P3 hold on a class proven by the game's own P1-plus-companions behavior, the real Harry/Hermione/Ron enter the normal shared hold; ordinary spell targets are untouched.
 - Camera that slides against walls instead of clipping, gamepad camera-follow + orbit (v13+)
 - Works on free-roam levels; survives level changes
 
@@ -23,7 +24,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v52`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v54`.
 
 ## Player 2 controls
 
@@ -45,9 +46,17 @@ sudo apt install g++-mingw-w64-i686
 ./build.sh          # -> dist/d3d8.dll
 ```
 
-Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, with the native visual adapter in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
+Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, the cooperative hold lifecycle is in `src/coop_cast.h`, and the native visual adapter is in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
 
-Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aiming geometry, and native-effect lifecycle using an engine double—not HP3's actual VM, collision, animation, or rendering.
+Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aim geometry, continuous cooperative-hold identity/timing, and native-effect lifecycle using an engine double—not HP3's actual VM, collision, animation, or rendering.
+
+### v54 cooperative sustained cast (needs in-game verification)
+
+This is a **general fallback for genuine three-character sustained-cast interactions**, not a Pixie-well shortcut. The class is intentionally not guessed from a name or a generic `SpellTrigger`: while the normal game is running, the mod watches Player 1's real `SpellCursor`. It certifies a class only after the cursor is locked on an object and both real companions independently report that same object as their spell target. The log records this as `[coopcast] CERTIFIED ...`; the proof lasts for the current level.
+
+To use it, first leave split-screen off and perform the game's normal Player-1 cooperative interaction once, until Harry, Hermione and Ron are all holding the same target. Then enable split-screen. A Player 2 or Player 3 player can hold cast continuously on an instance of that certified class for **more than 10 seconds**. The bridge calls the genuine Player-1 `SpellCursor.LockOn` only after reflection confirms its one-target input and the paired `UnLock` has no inputs; it also confirms that P1's live cursor retained the requested target. It then gives the actual trio the target spell/held casting state and lets the target's own script decide the result. It never invokes generic `Trigger`, synthetic `Touch`, repeated projectile impacts, or a guessed completion field.
+
+The temporary P1/companion state is canceled and restored when the holder releases, changes target, another real player begins a different cast, the target disappears, the map changes, or F10 turns split-screen off. `CoopCastFallback=0` disables it; `CoopCastHoldMs` is clamped to a minimum/default of `10000`. Keep `CastGameplay=1`. Because this deliberately reaches the previously avoided P1 controller route, test it first on a save you can reload and send `hp3mod.log` if the game does not emit `[coopcast] CERTIFIED` or behaves differently from the stock P1 interaction.
 
 ### v52 native aiming glow (needs hardware verification)
 
@@ -119,13 +128,14 @@ README.md            this file
 FINDINGS.txt         the reverse-engineering findings (engine internals, offsets,
                      the cast pipeline, animation/physics quirks, dead ends)
 build.sh             build script (32-bit MinGW)
-src/dllmain.cpp      mod / engine integration (v51)
+src/dllmain.cpp      mod / engine integration (v54)
 src/cast_ground.h    testable post-cast floor-handoff policy
 src/aim_policy.h     testable camera/radius/ownership helpers
+src/coop_cast.h      testable continuous cooperative-hold identity/timing policy
 src/native_aim.h     original HP3 effect adapter (included by dllmain.cpp)
 src/d3d8.def         Direct3DCreate8 export alias
 src/hp3mod.ini       default configuration
-bin/d3d8.dll         prebuilt v52 (zig/clang cross-build of src/dllmain.cpp; the GitHub Actions workflow produces the MinGW build)
+bin/d3d8.dll         prebuilt v54 (32-bit zig/clang cross-build of src/dllmain.cpp; the GitHub Actions workflow produces the MinGW build)
 bin/hp3mod.ini       shipped configuration
 docs/MANUAL.txt      full in-game manual (all ini options, controls, troubleshooting)
 docs/NATIVE_AIM.md  package findings, limitations, hardware acceptance checklist
@@ -148,6 +158,8 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v51** cast gameplay rebuilt on the original cast path: castable objects found by their reaction/targeting properties and spell handlers (statues, jump pads, doors), spell class chosen from the target, projectile keeps its target, and the game's own spell `ProcessTouch` / trigger `Touch` runs the object's handler on arrival. Aim glow locks onto the castable object; player 1's casts are logged for comparison.
 
 - **v52** original HP3 seeking particles and spell-specific SpellGesture hover aura for P2+, with reflected icon/radius/readiness calls, 770-unit camera-relative range, current-map actor lookup, per-player effect ownership, and regression tests. Native VM/visual hardware confirmation pending.
+- **v53** resolves hovered SpellGesture icons on each chosen spell's class chain and accepts the game's wet/shader glyph materials instead of rejecting them as plain textures.
+- **v54** behavior-certifies genuine P1-led three-character cast classes live, then gives a P2/P3 player who continuously holds such a target for more than 10 seconds a scoped P1-cursor/trio-held-cast bridge. It restores all temporary state on every cancellation boundary and does not use generic trigger/touch/completion shortcuts. In-game verification pending.
 
 ## Disclaimer
 
