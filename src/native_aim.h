@@ -2,6 +2,12 @@
 // HP3 v129 package evidence and deviations: docs/NATIVE_AIM.md.
 // This is a visual adapter, NOT a second SpellCursor/controller: calling the
 // full cursor lockOn would drive P1-only controller logic and gameplay events.
+// v53: the gesture icon is resolved the way the class system defines it -
+// <spellClass>.default.SpellIcon with the property located on the spell's own
+// class chain, and any renderable material accepted (HP's gesture glyphs are
+// WetTexture/Shader, which the old strict "Texture " name check rejected, so
+// the locked gesture never spawned and the legacy sparkle marker drew over
+// the native effect on hardware).
 struct NativeAimBinding {
     BOOL tried, ok;
     void *gestureClass, *cursorClass, *cursorDefault;
@@ -143,14 +149,110 @@ static BOOL naParticles(void *fx, void *cls, int required) {
     }
     return TRUE;
 }
+// ---------------------------------------------------------------------------
+// Gesture icon resolution (v53).
+//
+// The stock cursor hands SpellGesture.ChangeGesture the value of
+// <spellClass>.default.SpellIcon. v52 hardcoded where that property lives
+// (hgame.baseSpell, ObjectProperty) and what it holds ("Texture "). On the
+// retail packages the hardware log then showed "no readable default.SpellIcon"
+// for every Depulso/Spongify target: the locked SpellGesture never spawned and
+// the legacy Sparkle_1/3/7 sprite drew over the native seek effect instead.
+// Resolve it structurally instead of by assumption:
+//   1. find the "SpellIcon" property on the spell class's OWN chain (a
+//      subclass may shadow the base declaration, which moves the offset);
+//   2. accept any material-family object the slot holds - HP gesture glyphs
+//      are WetTexture in the sibling KW games, and ChangeGesture is called
+//      with exactly this object by the stock scripts;
+//   3. if it still cannot be read, log precisely what sits at the slot so a
+//      hardware log is conclusive (None / wrong class / unreadable) instead
+//      of falling back silently.
+// ---------------------------------------------------------------------------
+struct NaIconCache { void *cls; int off; BOOL done; };
+static NaIconCache g_naIcon[16] = {};
+
+static BOOL naMaterialToken(const char *name) {
+    // Renderable material classes the gesture sprite's Texture may legally
+    // hold. Anything else (Class/Sound/Actor/Emitter names) is refused.
+    static const char *const kMat[] = {
+        "Texture ", "WetTexture ", "ScriptedTexture ", "Cubemap ",
+        "Shader ", "Modifier ", "FinalBlend ", "Combiner ",
+        "Material ", "RenderedMaterial ", "BitmapMaterial ",
+        "ShadowBitmapTexture ", NULL };
+    for (int k = 0; kMat[k]; k++)
+        if (!strncmp(name, kMat[k], strlen(kMat[k]))) return TRUE;
+    return FALSE;
+}
+static int naIconLookup(const char *clsPath) {
+    size_t n = strlen(clsPath);
+    if (n < 4 || n > 200) return -1;
+    char path[224];
+    snprintf(path, sizeof(path), "%s.SpellIcon", clsPath);
+    void *p = findObjectByPath(path);
+    if (!p) return -1;
+    char nb[240];
+    if (strncmp(objName(p, nb, sizeof(nb)), "ObjectProperty ", 15)) return -1;
+    if (g_propOffsetField < 0 || IsBadReadPtr((BYTE *)p + g_propOffsetField, 4)) return -1;
+    int off = (int)*(DWORD *)((BYTE *)p + g_propOffsetField);
+    return (off > 0 && off <= 0x4000) ? off : -1;
+}
+static int naIconOffset(void *spell) {
+    if (!spell) return g_naB.icon;
+    for (int k = 0; k < 16; k++)
+        if (g_naIcon[k].done && g_naIcon[k].cls == spell) return g_naIcon[k].off;
+    int slot = -1;
+    for (int k = 0; k < 16 && slot < 0; k++) if (!g_naIcon[k].cls) slot = k;
+    if (slot < 0) slot = (int)(((size_t)spell >> 4) % 16);
+    int off = -1;
+    void *c = spell;
+    int depth = 0;
+    while (c && cgIsKnownClass(c) && depth++ < 32) {   // most-derived first
+        char cn[240];
+        if (!objName(c, cn, sizeof(cn))[0]) break;
+        const char *sp = strchr(cn, ' ');
+        if (!sp || !sp[1]) break;
+        off = naIconLookup(sp + 1);
+        if (off > 0) break;
+        c = cgSuper(c);
+    }
+    if (off <= 0) off = g_naB.icon;   // research anchor: hgame.baseSpell.SpellIcon
+    g_naIcon[slot].cls = spell; g_naIcon[slot].off = off; g_naIcon[slot].done = TRUE;
+    return off;
+}
+static void naIconDiag(void *spell, char *out, int cap) {
+    // e.g. "hgame.DepulsoSpell SpellIcon(+0x42C)=None"
+    out[0] = 0;
+    if (!spell) { snprintf(out, cap, "spell class unresolved"); return; }
+    char sn[160];
+    objName(spell, sn, sizeof(sn));
+    const char *cls = strchr(sn, ' ');
+    cls = cls ? cls + 1 : sn;
+    if (!g_naB.getDefault) { snprintf(out, cap, "%s (no GetDefaultObject binding)", cls); return; }
+    void *def = g_naB.getDefault(spell, NULL);
+    if (!def) { snprintf(out, cap, "%s (no default object)", cls); return; }
+    int off = naIconOffset(spell);
+    if (off <= 0 || IsBadReadPtr((BYTE *)def + off, 4)) {
+        snprintf(out, cap, "%s (no SpellIcon property on its class chain)", cls);
+        return;
+    }
+    void *v = *(void **)((BYTE *)def + off);
+    if (!v) { snprintf(out, cap, "%s SpellIcon(+0x%X)=None", cls, off); return; }
+    if (IsBadReadPtr(v, 0x2C)) { snprintf(out, cap, "%s SpellIcon(+0x%X)=unreadable %p", cls, off, v); return; }
+    char vb[200];
+    snprintf(out, cap, "%s SpellIcon(+0x%X)=%s", cls, off, objName(v, vb, sizeof(vb)));
+}
 static void *naSpellIcon(void *spell) {
-    if (!cgIsKnownClass(spell)) return NULL;
-    void *def=g_naB.getDefault(spell,NULL);
-    if (!def || IsBadReadPtr((BYTE *)def+g_naB.icon,4)) return NULL;
-    void *icon=*(void **)((BYTE *)def+g_naB.icon);
+    if (!cgIsKnownClass(spell) || !g_naB.getDefault) return NULL;
+    void *def = g_naB.getDefault(spell, NULL);
+    if (!def) return NULL;
+    int off = naIconOffset(spell);
+    if (off <= 0 || IsBadReadPtr((BYTE *)def + off, 4)) return NULL;
+    void *icon = *(void **)((BYTE *)def + off);
     char name[200];
-    // baseSpell.SpellIcon is Texture, not arbitrary projectile FX/material.
-    if (!icon || IsBadReadPtr(icon,0x2C) || strncmp(objName(icon,name,sizeof(name)),"Texture ",8)) return NULL;
+    // Whatever ChangeGesture would be handed by the stock cursor: a
+    // renderable material, not an arbitrary actor/class/FX reference.
+    if (!icon || IsBadReadPtr(icon, 0x2C) || !naMaterialToken(objName(icon, name, sizeof(name))))
+        return NULL;
     return icon;
 }
 static void naVisible(int i, BOOL visible) {
@@ -166,6 +268,7 @@ static void nativeAimPaneVisible(int pane) {
 static void nativeAimResetBindings(void) {
     memset(&g_naB,0,sizeof(g_naB));
     memset(g_naFailed,0,sizeof(g_naFailed));
+    memset(g_naIcon,0,sizeof(g_naIcon)); // spell-class pointers may be recycled
 }
 static BOOL naFallback(int i) {
     if(g_nativeAimOwned[i]) destroyAimFX(i);
@@ -183,11 +286,14 @@ static BOOL updateNativeAim(int i, void *pawn, BOOL held, const float cam[3], co
     CgCand *c=cgPickTarget(i,pawn,NULL,FALSE,NULL);
     void *spell=c ? cgSpellClassFor(c,NULL) : NULL;
     void *icon=spell ? naSpellIcon(spell) : NULL;
-    // No fabricated spell/color mapping: a missing icon is diagnosed and the
-    // legacy marker remains available instead of showing the wrong symbol.
+    // No fabricated spell/color mapping: a missing icon is diagnosed (exact
+    // class, slot offset and value) and the legacy marker remains available
+    // instead of showing the wrong symbol.
     if (c && !icon) {
         if (!g_na[i].retryAt || GetTickCount()-g_na[i].retryAt>3000) {
-            logf_("[nativeaim] p%d target %s has no readable default.SpellIcon; legacy marker",i+1,c->name);
+            char diag[240];
+            naIconDiag(spell,diag,sizeof(diag));
+            logf_("[nativeaim] p%d target %s has no readable default.SpellIcon (%s); legacy marker",i+1,c->name,diag);
             g_na[i].retryAt=GetTickCount();
         }
         return naFallback(i);

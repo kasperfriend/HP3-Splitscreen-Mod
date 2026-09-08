@@ -133,8 +133,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v52"
-#define MOD_STAMP "build v52 - 2026-09-08 - NATIVE HP3 AIM: original seeking particles + target-sized SpellGesture using the chosen spell default.SpellIcon; original 770-unit range, per-player effects, active-level lookup. [nativeaim] reports bindings, particles, icon and lock transitions. Gameplay hit/exit path retained from v51."
+#define MOD_BUILD  "v53"
+#define MOD_STAMP "build v53 - 2026-09-08 - NATIVE HP3 AIM: locked SpellGesture now actually spawns on hardware - spell default.SpellIcon resolved on the spell's own class chain and wet/shader gesture textures accepted (v52's strict Texture check rejected HP3's glyphs, so the legacy sparkle marker drew over the native effect); unresolved icons are diagnosed with class, slot and value. Seeking particles, 770-unit range, per-player effects, cast gameplay retained from v52/v51."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;

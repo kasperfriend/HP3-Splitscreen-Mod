@@ -25,8 +25,9 @@ struct Fake {
 };
 static std::vector<std::unique_ptr<Fake>> heap;
 static void *slots[128]={};static TArrayLite objects={slots,0,128},*g_objArray=&objects;
-static int cursorClass,gestureClass,spellClass,spell2Class,iconToken,icon2Token;
+static int cursorClass,gestureClass,spellClass,spell2Class,iconToken,icon2Token,wetToken;
 static int changeFn,readyFn,targetFn,canFn,chooseFn;
+static void *sIconProp=nullptr;
 static void *g_clsAimFX=&cursorClass,*g_fnChoose=&chooseFn,*g_fnCanCast=&canFn;
 static void *g_core=nullptr,*g_engine=nullptr;
 static int g_propOffsetField=4,g_opByteConst=0;
@@ -54,13 +55,19 @@ static Fake *make(const char *name,void *cls=nullptr) {
 }
 static BOOL IsBadReadPtr(const void *p,size_t) {return p==nullptr;}
 static char *objName(void *p,char *out,size_t n) {
-    const char *name=p==&iconToken?"Texture HP_FX.SpellIcon1":p==&icon2Token?"Texture HP_FX.SpellIcon2":fake(p)?fake(p)->name.c_str():"Class hgame.Mock";
+    const char *name=p==&iconToken?"Texture HP_FX.SpellIcon1"
+                  :p==&icon2Token?"Texture HP_FX.SpellIcon2"
+                  :p==&wetToken?"WetTexture SpellShapes.SpellFX.SpongifyWet1"
+                  :fake(p)?fake(p)->name.c_str():"Class hgame.Mock";
     std::snprintf(out,n,"%s",name);return out;
 }
 static void *cgClassOf(void *p) {return fake(p)?fake(p)->cls:nullptr;}
 static BOOL cgIsKnownClass(void *p) {return p==&cursorClass||p==&gestureClass||p==&spellClass||p==&spell2Class;}
+static void *cgSuper(void *) {return nullptr;}   // chain walk ends after the spell class
 static BOOL actorInCurrentLevel(void *p) {return fake(p)&&fake(p)->level;}
-static void *findObjectByPath(const char *) {return nullptr;}
+static void *findObjectByPath(const char *path) {
+    return sIconProp&&!std::strcmp(path,"hgame.Mock.SpellIcon")?sIconProp:nullptr;
+}
 static int propOffset(const char *) {return -1;}
 static DWORD nativeBoolBitMask(const char *) {return 0;}
 static void *GetProcAddress(void *,const char *) {return nullptr;}
@@ -166,5 +173,35 @@ int main() {
     updateNativeAim(1,pawn,FALSE,cam,rot);placeOK=true;spawnOK=false;
     assert(!updateNativeAim(1,pawn,TRUE,cam,rot));assert(g_naFailed[1]);
     nativeAimResetBindings();assert(!g_naFailed[1]&&!g_naB.tried);
+    // ---- v53: the gesture icon resolves on the spell's own class chain ----
+    // A SpellIcon declared on the spell class shadows the base anchor offset,
+    // wet textures are legal glyphs, and a non-material value is refused
+    // (with a diagnostic) instead of being handed to ChangeGesture.
+    spawnOK=true;placeOK=true;privateParts=true;canCast=true;candidate=nullptr;
+    Fake *iconProp=make("ObjectProperty hgame.Mock.SpellIcon");
+    g_propOffsetField=0;        // the fake object's data block is its head
+    *(int *)(iconProp->data)=88;                         // UProperty::Offset value
+    *(void **)(spellDefault->data+80)=nullptr;           // base anchor slot: empty
+    *(void **)(spell2Default->data+80)=nullptr;
+    *(void **)(spellDefault->data+88)=&iconToken;        // declared on the class chain
+    *(void **)(spell2Default->data+88)=&wetToken;
+    sIconProp=iconProp;
+    setup();                                             // re-arms bindings (anchor 80)
+    updateNativeAim(1,pawn,FALSE,cam,rot);
+    c.spell=&spellClass;c.radius=60;candidate=&c;
+    int ch=changes;
+    assert(updateNativeAim(1,pawn,TRUE,cam,rot));        // chain offset won over the anchor
+    assert(changes==ch+1&&lastIcon==uint32_t(uintptr_t(&iconToken)));
+    c.spell=&spell2Class;
+    assert(updateNativeAim(1,pawn,TRUE,cam,rot));        // wet-texture glyph accepted
+    assert(changes==ch+2&&lastIcon==uint32_t(uintptr_t(&wetToken)));
+    *(void **)(spell2Default->data+88)=&gestureClass;    // a class is not a material
+    assert(!updateNativeAim(1,pawn,TRUE,cam,rot));
+    assert(g_naFailed[1]&&!g_aimFX[1]);                  // refused + latched, nothing drawn
+    *(void **)(spell2Default->data+88)=&wetToken;
+    updateNativeAim(1,pawn,FALSE,cam,rot);               // release clears the latch
+    assert(updateNativeAim(1,pawn,TRUE,cam,rot));
+    assert(changes==ch+3&&lastIcon==uint32_t(uintptr_t(&wetToken)));
+    sIconProp=nullptr;
     puts("native aim adapter: seeking, lock, icon/radius/readiness, pane isolation, cleanup and fallback passed");
 }

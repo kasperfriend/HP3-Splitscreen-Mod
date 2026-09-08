@@ -1,4 +1,4 @@
-# v52: original HP3 seeking and hovered-spell effects
+# v53: original HP3 seeking and hovered-spell effects
 
 ## Status and scope
 
@@ -9,8 +9,15 @@ particle instancing, visibility, or visual parity on the user's machine.
 
 The v51 hardware log confirmed working P2 spell selection, homing, and object
 activation, but showed an additive sprite cycling Sparkle_1/3/7 rather than the
-original hovered-spell effect. v52 replaces that visual path. It retains the
+original hovered-spell effect. v52 replaced that visual path. It retains the
 v51 projectile/ProcessTouch/Touch and cast-exit/floor-recovery implementation.
+
+The v52 hardware log then showed the native seek particles working but the
+locked SpellGesture never spawning: every Depulso/Spongify target logged "no
+readable default.SpellIcon", so the legacy Sparkle_1/3/7 marker drew over the
+native effect for the whole hold (glowing like P1 only after a successful cast
+changed hover state). v53 fixes the icon read itself - see "v53 icon
+resolution" below.
 
 `[actions] NativeAim=1` is the default, even in an existing INI without the key.
 `NativeAim=0` restores the legacy visual/range policy for comparison. It does
@@ -165,10 +172,13 @@ On the same save used for the v51 log:
 
 1. Replace `system/d3d8.dll`. Keep custom controls; add `NativeAim=1` under
    `[actions]` if desired (default on). Keep `CastGameplay=1`, `AimedCast=0`.
-2. Confirm `build v52` and `[nativeaim] bindings OK` in `hp3mod.log`.
+2. Confirm `build v53` and `[nativeaim] bindings OK` in `hp3mod.log`.
 3. Hold P2 cast away from targets, then over the Spongify pad and Depulso
-   triggers. Expect `[nativeaim] p2 SEEK`, then `LOCK` with the correct Texture
-   name and `privateParticles=2`, not just a cycling generic sparkle.
+   triggers. Expect `[nativeaim] p2 SEEK`, then `LOCK` with the correct
+   material name (plain or wet/shader texture) and `privateParticles=2`, not
+   just a cycling generic sparkle. If a target still falls back, the log now
+   says exactly what sits in `default.SpellIcon` (class, slot offset, value) -
+   include that line in the report.
 4. Compare the native seeking glow and hovered-spell aura side by side with P1.
    Approach/leave the range boundary; change targets during a single hold.
 5. Aim simultaneously as P1/P2 (and P3 if available). P1 must remain unchanged;
@@ -180,7 +190,7 @@ On the same save used for the v51 log:
 7. Toggle F10 off/on while holding; cycle characters; load/travel to another
    level. No orphaned glow, crash, or HP_preamble target should remain.
 8. If native particles are absent, use `NativeAim=0` for an A/B comparison and
-   send the v52 log plus a screenshot of both panes. Tap D while P1 holds aim to
+   send the v53 log plus a screenshot of both panes. Tap D while P1 holds aim to
    include the corrected live emitter/gesture diagnostic.
 
 `[nativeaim] p2` means the second human player. Historical `[castgame] p1`
