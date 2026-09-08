@@ -42,6 +42,7 @@ static float g_camDist = 125.0f, g_camHeight = 50.0f;
 static int   g_camPitch = -1400;
 static BOOL  g_camCollide = TRUE;
 static BOOL  g_aimedCast  = FALSE;
+static BOOL  g_castGameplay = TRUE;   // v50: make P2+ casts activate spell/gameplay targets, not only animate
 static int   g_glowSize   = 36;       // v24: -40% (was 60) by user request -
 static BOOL  g_aimSup[8];             // v24 body-clearance: glow hidden this frame
                                       // the sparkle's original (hardware:
@@ -129,8 +130,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v49"
-#define MOD_STAMP   "build v49 - 2026-09-08 - CAST FLOOR HANDOFF: keep the v48 pose exit and one re-pick per cast. Replace the saved-Z / raw-Physics dip loop with native SetPhysics(Walking) + FindBase, then allow walking physics to validate floor contact before idle may freeze it. One attempt per exit, no height reset, no fall pinning and no default landing-animation swallow. Missing support, real jumps and ledges release to the engine. Look for [castground] reacquire / verified / released; NoDip=0 selects the legacy animation-only fallback."
+#define MOD_BUILD  "v50"
+#define MOD_STAMP   "build v50 - 2026-09-08 - CAST GAMEPLAY: keep the v49 floor/pose recovery, but make player 2+ spells hit gameplay targets like player 1. Each release now traces along the camera spell line for SpellTrigger/cast objects, passes that target through castSpell/playCast/SpawnSpell, and directly invokes the target spell/trigger script as a safety net so doors, buttons and lesson objects activate instead of only playing the cast animation. [castgame] lines show target acquisition and activation."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1417,6 +1418,267 @@ static void callFnP(void *obj, void *fn, void *parms, int size, const char *tag)
     for (int i = 0; i < size && i < 24 && c < 100; i++)
         c += sprintf(h + c, "%02X ", ((BYTE *)parms)[i]);
     logf_("    -> %s  parms[%s]", tag, h);
+}
+
+// Case-insensitive substring helper kept local to the action layer (a later
+// input helper has its own nameHas()).
+static BOOL ciHas(const char *s, const char *frag)
+{
+    if (!s || !frag) return FALSE;
+    size_t n = strlen(s), f = strlen(frag);
+    if (!f || f > n) return FALSE;
+    for (size_t i = 0; i + f <= n; i++) {
+        size_t k = 0;
+        for (; k < f; k++) {
+            char a = s[i + k], b = frag[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+        }
+        if (k == f) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL objectClassToken(void *obj, char *out, int cch)
+{
+    if (!out || cch <= 0) return FALSE;
+    out[0] = 0;
+    char full[256];
+    objName(obj, full, sizeof(full));
+    const char *sp = strchr(full, ' ');
+    if (!sp || sp == full) return FALSE;
+    int n = (int)(sp - full);
+    if (n >= cch) n = cch - 1;
+    memcpy(out, full, n); out[n] = 0;
+    return TRUE;
+}
+
+static BOOL functionPath(void *fn, char *out, int cch)
+{
+    if (!fn || !out || cch <= 0) return FALSE;
+    char full[300];
+    objName(fn, full, sizeof(full));
+    const char *sp = strchr(full, ' ');
+    if (!sp || strncmp(full, "Function", 8)) return FALSE;
+    strncpy(out, sp + 1, cch - 1); out[cch - 1] = 0;
+    return TRUE;
+}
+
+// Find a script method declared directly on an actor's runtime class. This is
+// safer than calling Engine.Actor.Trigger for everything: ProcessEvent executes
+// the UFunction object we hand it, so for script overrides we want the class's
+// own Function object when it exists.
+static void *findActorMethod(void *actor, const char *method)
+{
+    if (!actor || !method || !g_objArray) return NULL;
+    char cls[96];
+    if (!objectClassToken(actor, cls, sizeof(cls))) return NULL;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return NULL;
+    char buf[300];
+    for (int i = 0; i < n; i++) {
+        void *o = g_objArray->Data[i];
+        if (!o) continue;
+        objName(o, buf, sizeof(buf));
+        if (strncmp(buf, "Function ", 9)) continue;
+        const char *path = buf + 9;
+        const char *last = strrchr(path, '.');
+        if (!last || _stricmp(last + 1, method)) continue;
+        const char *prev = last;
+        while (prev > path && prev[-1] != '.') prev--;
+        int clen = (int)(last - prev);
+        if ((int)strlen(cls) == clen && _strnicmp(prev, cls, clen) == 0)
+            return o;
+        // Many level actors are subclasses whose visible class token carries
+        // a map/game-specific prefix, while the useful handler lives on the
+        // shared SpellTrigger class. Accept that base handler only for the
+        // spell-trigger family.
+        if (ciHas(cls, "SpellTrigger") && clen == 12 &&
+            _strnicmp(prev, "SpellTrigger", clen) == 0)
+            return o;
+    }
+    return NULL;
+}
+
+static BOOL looksLikeSpellGameplayTarget(const char *fullName)
+{
+    // The map actors player 1 opens/lights/pushes with spells are normally
+    // SpellTrigger-family actors. Keep this intentionally narrow: arbitrary
+    // Trigger actors are use/overlap/cutscene machinery and should not be
+    // fired by a missed spell.
+    return ciHas(fullName, "SpellTrigger") ||
+           (ciHas(fullName, "Cast") && ciHas(fullName, "Trigger"));
+}
+
+// Player-1-style gameplay targeting for P2+: a spell release should select
+// the castable object sitting under this camera's spell line, even when
+// AimedCast=0 (straight projectiles). The old cone targeter was optional and
+// yaw-only; it helped homing spells but did not reliably activate doors or
+// lesson objects. This is a tight 3D ray corridor from the actual spell origin.
+static void *findCastGameplayTarget(int i, void *pawn, float *outDist, BOOL verbose)
+{
+    if (!g_castGameplay || !g_objArray || !pawn || F.Location <= 0) return NULL;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return NULL;
+    if (IsBadReadPtr(pawn, F.Location + 12)) return NULL;
+
+    int cy = playerCamYaw(i), cp = playerCamPitch(i);
+    double ry = cy * (6.283185307179586 / 65536.0);
+    double rp = cp * (6.283185307179586 / 65536.0);
+    float cpr = (float)cos(rp);
+    float dir[3] = { (float)cos(ry) * cpr, (float)sin(ry) * cpr,
+                     (float)sin(rp) };
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    float org[3] = { pl[0] + dir[0] * 90.0f,
+                     pl[1] + dir[1] * 90.0f,
+                     pl[2] + dir[2] * 90.0f + 45.0f };
+
+    static int sOffCR = -2, sOffCH = -2;
+    if (sOffCR == -2) {
+        sOffCR = propOffset("Engine.Actor.CollisionRadius");
+        sOffCH = propOffset("Engine.Actor.CollisionHeight");
+    }
+
+    void *best = NULL; float bestScore = 1.0e30f, bestT = 0.0f, bestPerp = 0.0f;
+    void *nearest = NULL; float nearestD = 1.0e30f; int seen = 0;
+    char buf[300];
+    for (int j = 0; j < n; j++) {
+        void *o = g_objArray->Data[j];
+        if (!o || o == pawn || IsBadReadPtr(o, 0x100)) continue;
+        BOOL isPlayer = FALSE;
+        for (int p = 0; p < 8; p++) if (g_pawn[p] && g_pawn[p] == o) { isPlayer = TRUE; break; }
+        if (isPlayer) continue;
+        objName(o, buf, sizeof(buf));
+        if (isReflection(buf)) continue;
+        if (!looksLikeSpellGameplayTarget(buf)) continue;
+        if (IsBadReadPtr(o, F.Location + 12)) continue;
+        seen++;
+        float *tl0 = (float *)((BYTE *)o + F.Location);
+        float height = 60.0f, radius = 150.0f;
+        if (sOffCH > 0 && !IsBadReadPtr((BYTE *)o + sOffCH, 4)) {
+            float h = *(float *)((BYTE *)o + sOffCH);
+            if (h > 1.0f && h < 1000.0f) height = h;
+        }
+        if (sOffCR > 0 && !IsBadReadPtr((BYTE *)o + sOffCR, 4)) {
+            float r = *(float *)((BYTE *)o + sOffCR);
+            if (r > 1.0f && r < 1000.0f) radius = r + 90.0f;
+        }
+        if (radius < 140.0f) radius = 140.0f;
+        float tl[3] = { tl0[0], tl0[1], tl0[2] + height * 0.35f };
+        float vx = tl[0] - org[0], vy = tl[1] - org[1], vz = tl[2] - org[2];
+        float dist = sqrtf(vx * vx + vy * vy + vz * vz);
+        if (dist < nearestD) { nearestD = dist; nearest = o; }
+        float t = vx * dir[0] + vy * dir[1] + vz * dir[2];
+        if (t < 40.0f || t > 3200.0f) continue;
+        float perp2 = dist * dist - t * t;
+        if (perp2 < 0.0f) perp2 = 0.0f;
+        float perp = sqrtf(perp2);
+        if (perp > radius) continue;
+        if (!fastTraceClear(pawn, org, tl)) continue;
+        float score = t + perp * 3.0f;
+        if (score < bestScore) { bestScore = score; best = o; bestT = t; bestPerp = perp; }
+    }
+    if (outDist) *outDist = bestT;
+    if (best) {
+        logf_("    [castgame] p%d target -> %s ray=%.0f perp=%.0f",
+              i, objName(best, buf, sizeof(buf)), bestT, bestPerp);
+    } else if (verbose) {
+        if (nearest)
+            logf_("    [castgame] p%d no ray target (%d cast objects; nearest %s at %.0f)",
+                  i, seen, objName(nearest, buf, sizeof(buf)), nearestD);
+        else
+            logf_("    [castgame] p%d no SpellTrigger/cast objects in level", i);
+    }
+    return best;
+}
+
+static void fillSpellEventParms(void *fn, BYTE *parms, int cb,
+                                void *target, void *caster,
+                                void *spellClass, void *spellActor)
+{
+    memset(parms, 0, cb);
+    if (!fn || !g_objArray || g_propOffsetField < 0) return;
+    char fpath[260];
+    if (!functionPath(fn, fpath, sizeof(fpath))) return;
+    size_t plen = strlen(fpath);
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000) return;
+    char buf[300];
+    for (int j = 0; j < n; j++) {
+        void *p = g_objArray->Data[j];
+        if (!p || IsBadReadPtr(p, g_propOffsetField + 4)) continue;
+        objName(p, buf, sizeof(buf));
+        const char *sp = strchr(buf, ' ');
+        if (!sp) continue;
+        const char *path = sp + 1;
+        if (strncmp(path, fpath, plen) || path[plen] != '.') continue;
+        if (strchr(path + plen + 1, '.')) continue;
+        int off = (int)*(DWORD *)((BYTE *)p + g_propOffsetField);
+        if (off < 0 || off + 16 > cb) continue;
+        const char *name = path + plen + 1;
+        if (ciHas(buf, "ClassProperty")) {
+            if (ciHas(name, "spell")) *(void **)(parms + off) = spellClass;
+        } else if (ciHas(buf, "ObjectProperty") || ciHas(buf, "ActorProperty") ||
+                   ciHas(buf, "PawnProperty")) {
+            void *v = NULL;
+            if (ciHas(name, "target")) v = target;
+            else if (ciHas(name, "spell") || ciHas(name, "projectile")) v = spellActor;
+            else if (ciHas(name, "instigator") || ciHas(name, "caster") ||
+                     ciHas(name, "source") || ciHas(name, "owner") ||
+                     ciHas(name, "other") || ciHas(name, "pawn")) v = caster;
+            if (v) *(void **)(parms + off) = v;
+        } else if (ciHas(buf, "StructProperty") &&
+                   (ciHas(name, "location") || ciHas(name, "offset") || ciHas(name, "hit"))) {
+            // Zero vector is acceptable for offsets; for hit locations use the
+            // target actor's center when readable.
+            if (target && F.Location > 0 && !IsBadReadPtr((BYTE *)target + F.Location, 12))
+                memcpy(parms + off, (BYTE *)target + F.Location, 12);
+        } else if (ciHas(buf, "BoolProperty")) {
+            DWORD m = 1;
+            for (int d = 4; d <= 0x38; d += 4) {
+                DWORD mm = *(DWORD *)((BYTE *)p + g_propOffsetField + d);
+                if (mm && (mm & (mm - 1)) == 0) { m = mm; break; }
+            }
+            *(DWORD *)(parms + (off & ~3)) |= m;
+        }
+    }
+}
+
+static void activateCastGameplayTarget(int i, void *caster, void *target,
+                                       void *spellClass, void *spellActor)
+{
+    if (!g_castGameplay || !target || !caster || !g_ProcessEvent) return;
+    char tb[160]; objName(target, tb, sizeof(tb));
+    if (!looksLikeSpellGameplayTarget(tb)) return;
+
+    const char *methods[] = { "HandleSpell", "OnHandleSpell", "SpellHit", "Trigger", NULL };
+    BOOL did = FALSE;
+    for (int m = 0; methods[m]; m++) {
+        void *fn = findActorMethod(target, methods[m]);
+        if (!fn) {
+            // Some maps use base-class script functions while the instance
+            // class name is subclassed/numbered. Try the known broad bases.
+            if (!_stricmp(methods[m], "Trigger"))
+                fn = findObjectByPath("Engine.Actor.Trigger");
+        }
+        if (!fn) continue;
+        BYTE p[256]; fillSpellEventParms(fn, p, sizeof(p), target, caster, spellClass, spellActor);
+        // Conventional Trigger(Actor Other, Pawn EventInstigator) fallback if
+        // reflection did not expose children for this stripped package.
+        if (!_stricmp(methods[m], "Trigger") && !*(void **)p) {
+            *(void **)(p + 0x00) = caster;
+            *(void **)(p + 0x04) = caster;
+        }
+        char fb[180]; objName(fn, fb, sizeof(fb));
+        logf_("    [castgame] p%d activating %s via %s", i, tb, fb);
+        g_ProcessEvent(target, NULL, fn, p, NULL);
+        did = TRUE;
+        // Trigger is the final generic fallback. If a spell-specific handler
+        // exists, do not also fire Trigger unless explicitly no handler exists.
+        if (_stricmp(methods[m], "Trigger")) break;
+    }
+    if (!did) logf_("    [castgame] p%d target %s has no known activation function", i, tb);
 }
 
 // Pick something worth casting at. A companion's natural targets in this game
@@ -3092,14 +3354,24 @@ static void fireCast(int i, void *pawn)
     if (!cls) return;
 
     void *target = NULL;
-    if (g_aimedCast) {
+    void *gameTarget = NULL;
+    void *spawned = NULL;
+
+    // v50: even in straight-shot mode, acquire the SpellTrigger/cast object
+    // under the camera ray and feed it into the game's cast pipeline. This is
+    // the gameplay part player 1 gets from his real cursor/controller path.
+    float gd = 0.0f;
+    gameTarget = findCastGameplayTarget(i, pawn, &gd, TRUE);
+    if (gameTarget) target = gameTarget;
+
+    if (!target && g_aimedCast) {
         float d = 0.0f;
         target = findAimTarget(pawn, &d, TRUE);
         if (target) logf_("    aim -> %s at %.0f units",
                           objName(target, b, sizeof(b)), d);
         else        logf_("    aim -> no target in cone, firing straight ahead");
-        if (g_offSpellTarget > 0) *(void **)((BYTE *)pawn + g_offSpellTarget) = target;
     }
+    if (g_offSpellTarget > 0) *(void **)((BYTE *)pawn + g_offSpellTarget) = target;
 
     if (g_fnPlayCast) {
         BYTE p[64]; memset(p, 0, sizeof(p));
@@ -3122,7 +3394,7 @@ static void fireCast(int i, void *pawn)
         *(void **)(p + 0x00) = cls;
         *(void **)(p + 0x04) = target;
         callFnP(pawn, g_fnSpawnSpell, p, 12, "SpawnSpell(cls,target)");
-        void *spawned = *(void **)(p + 0x08);
+        spawned = *(void **)(p + 0x08);
         castRunStart(i, pawn);           // v48: one recovery run for this cast
         if (i > 0) pelogAuto();          // v36: timeline around every cast
         g_castActor[i]    = spawned;
@@ -3248,6 +3520,8 @@ static void fireCast(int i, void *pawn)
             }
         }
     }
+    if (gameTarget)
+        activateCastGameplayTarget(i, pawn, gameTarget, cls, spawned);
     if (g_fnFinalize) callFn(pawn, g_fnFinalize, "finalizeSpell");
 }
 
@@ -5462,6 +5736,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         g_camCollide = GetPrivateProfileIntA("camera",  "Collision", 1, ini) != 0;
         g_freeLook   = GetPrivateProfileIntA("camera",  "FreeCamera", 0, ini) != 0;
         g_aimedCast  = GetPrivateProfileIntA("actions", "AimedCast", 0, ini) != 0;
+        g_castGameplay = GetPrivateProfileIntA("actions", "CastGameplay", 1, ini) != 0;
         {   // v40: gap between the state's natural AnimEnd and our exit.
             // 90 (default) = the v39 timing that removed the pose snap. If
             // a cast leaves a weird stance on hardware, raise it (250/400)
@@ -5546,8 +5821,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
               g_toggleKey, g_splitOn, g_fileToggle);
         initKeyDefaults();
         loadKeyMap(ini);
-        logf_("hp3mod.ini: camera dist=%.0f height=%.0f pitch=%d collision=%d aimedcast=%d",
-              g_camDist, g_camHeight, g_camPitch, g_camCollide, g_aimedCast);
+        logf_("hp3mod.ini: camera dist=%.0f height=%.0f pitch=%d collision=%d aimedcast=%d castgameplay=%d",
+              g_camDist, g_camHeight, g_camPitch, g_camCollide, g_aimedCast,
+              g_castGameplay);
 
         char sys[MAX_PATH];
         GetSystemDirectoryA(sys, MAX_PATH); strcat(sys, "\\d3d8.dll");

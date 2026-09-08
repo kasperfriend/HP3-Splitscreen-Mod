@@ -30,11 +30,11 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v49 ...
+          === hp3mod build v50 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
-      d3d8.dll. Upgrading from v48 can keep your custom hp3mod.ini; leave
-      [actions] NoDip=1 to enable the new floor handoff.
+      d3d8.dll. Upgrading from v49 can keep your custom hp3mod.ini; leave
+      [actions] NoDip=1 and CastGameplay=1 (the defaults).
 
   >>> IF THE SPLIT FLASHES ON AND DISAPPEARS <<<
       Open hp3mod.ini and set:      StartOn=1
@@ -89,8 +89,14 @@ USING IT
                                  auto-target the spell
                                  flies along the camera (yaw AND pitch,
                                  v14 aims the spell actor itself so the
-                                 direction sticks); with a target in the
-                                 cone it auto-aims like the original game.
+                                 direction sticks); v50 also traces that
+                                 same spell line for SpellTrigger/cast
+                                 objects and feeds the found target through
+                                 the game's cast pipeline, so doors, buttons
+                                 and lesson objects activate like player 1's
+                                 casts instead of only playing animation.
+                                 With AimedCast=1, non-object targets in the
+                                 cone are still auto-aimed like before.
                                  The casting pose is cleared again ~1.2 s
                                  after the spell leaves the wand - v17
                                  exits the casting script STATE (the real
@@ -541,12 +547,20 @@ USING IT
                                  [castground] logs "reacquire",
                                  "verified" or "released", with the
                                  Base/Floor and Z before/after.
+                                 v50: CastGameplay=1 (default) adds the
+                                 missing gameplay half of P2+ casting. On
+                                 release, the mod ray-selects the castable
+                                 SpellTrigger under the camera/reticle, passes
+                                 it as spellTarget to playCast/castSpell/
+                                 SpawnSpell, and invokes that target's own
+                                 spell/trigger handler as a safety net. Look
+                                 for [castgame] target and activating lines.
                                  HARDWARE CHECK STILL REQUIRED:
                                  cast standing still, wait at least
                                  5 seconds, then move. Also try
                                  moving casts, rapid re-casts, jumps,
                                  stairs and ledges. If it still hops,
-                                 send the v49 log. Earlier version
+                                 send the v49/v50 log. Earlier version
                                  notes above are historical; the
                                  latest hardware log disproved the
                                  old claims that height pins or

@@ -224,6 +224,18 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
           Rotation and DesiredRotation are re-written to the view yaw
           at that same instant, so the animation the engine picks is
           the one facing the camera.
+    * v50 (implemented; NOT YET VERIFIED IN HP3):
+        - The previous cast path could still look like "animation only" on
+          map objects because default AimedCast=0 fired a straight projectile
+          with spellTarget=None. Player 1's real controller/cursor supplies a
+          gameplay target for SpellTrigger/cast objects. P2+ now does the same
+          at release: trace the camera spell line in 3D, pick the castable
+          SpellTrigger under the reticle, write HPCharacter.spellTarget, pass
+          that target into playCast/castSpell/SpawnSpell, and invoke the
+          target's own HandleSpell/OnHandleSpell/SpellHit/Trigger function as
+          a safety net. The target search is narrow (SpellTrigger or cast+
+          Trigger names only) so missed casts do not fire arbitrary overlap/
+          cutscene triggers. Logs are [castgame] target/activating.
     * v49 (implemented; policy tested, NOT YET VERIFIED IN HP3):
         - Preserve the working v48 exit call set, timing and one anim
           re-pick. Remove castHoldFloor/castDipGuard entirely.
