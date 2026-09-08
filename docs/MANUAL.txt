@@ -515,6 +515,68 @@ USING IT
                                  idle-restart stutter again (the
                                  v44 baseline) - cast playback
                                  correctness outranks it.
+                                 v48: all three post-cast quirks
+                                 are fixed together, because they
+                                 were one bug wearing three hats.
+                                 STUCK POSE: the cleanup kept its
+                                 per-cast bookkeeping in statics
+                                 that were only cleared when a
+                                 cast's 4-second watch expired, so
+                                 casting again within 4s silently
+                                 inherited "cleanup already done"
+                                 and got NO exit at all - the pose
+                                 just sat there until some later
+                                 retry happened to fire. Now every
+                                 cast gets its own run (created
+                                 the moment the spell leaves,
+                                 dropped the moment a newer cast
+                                 takes over), so a re-cast can
+                                 never cancel the previous exit.
+                                 HOP: the exit re-enables physics
+                                 and she free-falls the fraction
+                                 of a unit the cast pose held her
+                                 above the floor (~2.5 units in
+                                 ~130ms - your log shows it as
+                                 874.75 -> 872.3 -> 874.5). v38
+                                 only swallowed the landing
+                                 ANIMATION, so the dip stayed on
+                                 screen - and the swallow also
+                                 removed the engine's own landing
+                                 animation, which is exactly why a
+                                 hop that slipped through "fixed"
+                                 everything. Now the dip is
+                                 cancelled at the source: for a
+                                 short window after the exit, any
+                                 falling frame that is only the
+                                 exit dip is put straight back on
+                                 the height she was standing at
+                                 and re-glued to the floor. No
+                                 fall, no landing, no hop.
+                                 WRONG POSE / YAW: the animation
+                                 re-pick that settles both was
+                                 gated behind six conditions and
+                                 expired on almost every cast (one
+                                 re-pick in ten casts in your
+                                 v47 log). It now runs once per
+                                 cast, 450ms after a verified
+                                 exit, the first moment she stands
+                                 still - and it stays armed for
+                                 the rest of the run, so walking
+                                 away and stopping a few seconds
+                                 later still gets it. The actor's
+                                 facing is re-written at the same
+                                 instant, so the animation the
+                                 engine picks is the one facing
+                                 your camera.
+                                 NEW LOG LINES: every cast now
+                                 prints a [cast] run#N trail -
+                                 "fired", "exit chain", "state
+                                 LEFT", "anim re-pick", "done
+                                 (...)" - and [nodip] for every
+                                 cancelled dip. If a cast ever
+                                 leaves her hovering, set
+                                 NoDip=0 in hp3mod.ini to get the
+                                 old fall back and send the log.
                                  DIAGNOSTIC (helps the next build): hold
                                  PLAYER 1's own aim (mouse) so the
                                  game's real marker is on screen, then

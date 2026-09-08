@@ -22,7 +22,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v47`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v48`.
 
 ## Player 2 controls
 
@@ -53,7 +53,7 @@ A preconfigured workflow (`.github/workflows/build-release.yml`) builds the same
 1. Open the **Actions** tab in the repository.
 2. Select **Build release** in the left sidebar.
 3. Click **Run workflow**.
-4. Optionally enter a release **tag** and **title**, then run the job. Leave the tag blank to auto-generate a unique one (for example `v47-20260906-1234567890`).
+4. Optionally enter a release **tag** and **title**, then run the job. Leave the tag blank to auto-generate a unique one (for example `v48-20260908-1234567890`).
 
 The workflow compiles the DLL natively on a Windows runner using MSYS2's 32-bit MinGW-w64 toolchain (`mingw-w64-i686-gcc`), attaches both the `.zip` and the individual `d3d8.dll` / `hp3mod.ini`, and also uploads them as run artifacts.
 
@@ -64,10 +64,10 @@ README.md            this file
 FINDINGS.txt         the reverse-engineering findings (engine internals, offsets,
                      the cast pipeline, animation/physics quirks, dead ends)
 build.sh             build script (32-bit MinGW)
-src/dllmain.cpp      the entire mod (v47)
+src/dllmain.cpp      the entire mod (v48)
 src/d3d8.def         Direct3DCreate8 export alias
 src/hp3mod.ini       default configuration
-bin/d3d8.dll         prebuilt v47
+bin/d3d8.dll         prebuilt v48
 bin/hp3mod.ini       shipped configuration
 docs/MANUAL.txt      full in-game manual (all ini options, controls, troubleshooting)
 ```
@@ -81,6 +81,7 @@ docs/MANUAL.txt      full in-game manual (all ini options, controls, troubleshoo
 - **v44** settle radius 350 + standing yaw lock (hardware-confirmed)
 - **v45** first hardening attempt — regressed on hardware, pulled
 - **v47** the post-cast animation re-sync rebuilt event-driven: it arms once at the cast state's own exit event and executes only when nothing new (player or mod) has started acting on the pawn — a re-sync can no longer interrupt a cast no matter how fast you chain them
+- **v48** clean cast exit: one recovery run per cast (a re-cast can no longer inherit the previous cast's bookkeeping and lose its exit — the stuck pose), the exit's micro-fall cancelled at the source instead of only hiding its animation (the hop), and the animation re-pick that settles pose and facing now runs on every cast instead of one in ten
 
 ## Disclaimer
 
