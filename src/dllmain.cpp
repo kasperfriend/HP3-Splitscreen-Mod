@@ -47,6 +47,12 @@
 // file BEFORE the LUMOS REPLICATION & SECRET WALL PASSABILITY section below.
 static hp3lumos::State g_lumosState;
 
+// v66.1 forward decl: the Lumos caches live further down in the LUMOS
+// REPLICATION section, but invalidateLevelCaches (defined before it) must
+// drop them on level travel so cached wall/trigger/light pointers never
+// outlive the level that owned them.
+static void lumosInvalidate(void);
+
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
 static int g_numPlayers = 2;
@@ -149,8 +155,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v66"
-#define MOD_STAMP "build v66 - 2026-09-09 - SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66.1"
+#define MOD_STAMP "build v66.1 - 2026-09-09 - SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -7316,6 +7322,7 @@ static void invalidateLevelCaches(const char *reason)
     g_fnResolved = FALSE;      // UFunctions live in packages too
     g_defaultSpell = NULL;
     g_lumosState.deactivate();
+    lumosInvalidate();         // v66.1: drop cached lumos walls/triggers/lights
     cgResetLevel();            // v51: class index / candidates / pending hits
     g_origCursor = NULL;   // v51: it dies with the level
     resetViewYaw();
@@ -8051,6 +8058,41 @@ static void driveePawn(int i, void *pawn)
 
     float *pl = (F.Location > 0) ? (float *)((BYTE *)pawn + F.Location) : NULL;
 
+    // v66.1: a driven companion can be left stranded in PHYS_Falling with no
+    // real falling motion (the Hogwarts door transition parks the pawn in the
+    // air while the engine's gravity never runs: Z stays flat, vz stays 0).
+    // Once vertical motion has been flat for a grace window, hand the engine
+    // PHYS_Walking back through the native so it re-acquires its Base/Floor.
+    // A genuine jump or ledge fall always moves Z or has g_jumpStanding /
+    // g_jumpPh set, so it can never trip this.
+    {
+        static DWORD sStrandAt[8] = {0};
+        static float sStrandZ[8]  = {0.0f};
+        BYTE phRc = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
+        float vzRc = (F.Velocity > 0 && !IsBadReadPtr(pawn, F.Velocity + 12))
+                   ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
+        BOOL stranded = (phRc == 2) && (g_jumpPh[i] == 0) &&
+                        !g_jumpStanding[i] &&
+                        (vzRc > -60.0f && vzRc < 60.0f) && (pl != NULL);
+        if (stranded) {
+            if (!sStrandAt[i]) {
+                sStrandAt[i] = now; sStrandZ[i] = pl[2];
+            } else if (fabsf(pl[2] - sStrandZ[i]) > 8.0f) {
+                // actually moving vertically (a real fall): not stranded
+                sStrandAt[i] = now; sStrandZ[i] = pl[2];
+            } else if (now - sStrandAt[i] >= 600) {
+                sStrandAt[i] = 0;
+                if (nativeSetPhysics(pawn, 1)) {
+                    if (g_FindBase) g_FindBase(pawn, NULL);
+                    logf_("  [physrecover] p%d stranded Falling->Walking "
+                          "(vz=%.0f Z=%.0f)", i, vzRc, pl[2]);
+                }
+            }
+        } else {
+            sStrandAt[i] = 0;
+        }
+    }
+
     if (mag < 0.15f) {
         vel[0] = vel[1] = 0.0f;
         if (acc) acc[0] = acc[1] = acc[2] = 0.0f;
@@ -8473,6 +8515,117 @@ static void setLumosActorCollision(void *actor, BOOL collide)
     }
 }
 
+// ---------------------------------------------------------------------------
+// v66.1 PERF FIX: the v66 Lumos replication did a full GObjObjects scan with
+// GetFullName on EVERY object, EVERY rendered frame (multiple scans per
+// frame, split on or off - including the menu). GetFullName walks the Outer
+// chain and formats a string, so ~9k objects * several scans per frame
+// collapsed the frame rate to single digits. The trigger/wall actors and the
+// per-player wand/light pointers are now cached and reused; the heavy scans
+// run once per level (re-armed only when a cached pointer stops being live),
+// and the wand-light fallback scan is throttled to once per second.
+// ---------------------------------------------------------------------------
+#define LUMOS_MAX_ACTORS 1024
+
+static void *g_lumosTriggers[LUMOS_MAX_ACTORS];  // LumosSparkles/LumosTrigger actors
+static int   g_lumosTriggersN = 0;
+static void *g_lumosWalls[LUMOS_MAX_ACTORS];     // GenericColObj / KWBlockingVolume
+static int   g_lumosWallsN = 0;
+static BOOL  g_lumosScanDone = FALSE;
+
+static void *g_lumosWand[8]  = {0};   // cached HPCharacter.Wand per player
+static void *g_lumosLight[8] = {0};   // cached LumosLight per player
+static BOOL  g_lumosTrigFired[LUMOS_MAX_ACTORS]; // edge-trigger guard per trigger
+
+static void lumosInvalidate(void)
+{
+    g_lumosTriggersN = 0;
+    g_lumosWallsN = 0;
+    g_lumosScanDone = FALSE;
+    memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));
+    for (int p = 0; p < 8; p++) {
+        g_lumosWand[p] = NULL;
+        g_lumosLight[p] = NULL;
+    }
+}
+
+// One full table scan, once per level. Only the class/name match is needed;
+// each result is cached for the rest of the level's life.
+static void lumosScanActors(void)
+{
+    g_lumosTriggersN = 0;
+    g_lumosWallsN = 0;
+    if (!g_objArray || !g_objArray->Data) { g_lumosScanDone = FALSE; return; }
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) {
+        g_lumosScanDone = FALSE; return;
+    }
+    char name[160];
+    for (int k = 0; k < n; k++) {
+        void *obj = g_objArray->Data[k];
+        if (!obj || IsBadReadPtr(obj, 0x100)) continue;
+        objName(obj, name, sizeof(name));
+        BOOL isLumosTrigger = strstr(name, "LumosSparklesTrigger") ||
+                              strstr(name, "LumosTrigger") ||
+                              strstr(name, "LumosSparkles");
+        BOOL isSecretWall   = strstr(name, "GenericColObj") ||
+                              strstr(name, "KWBlockingVolume");
+        if (isLumosTrigger && g_lumosTriggersN < LUMOS_MAX_ACTORS)
+            g_lumosTriggers[g_lumosTriggersN++] = obj;
+        if (isSecretWall && g_lumosWallsN < LUMOS_MAX_ACTORS)
+            g_lumosWalls[g_lumosWallsN++] = obj;
+    }
+    g_lumosScanDone = TRUE;
+}
+
+// Cached, liveness-validated wand lookup. The wand is stable for a level; the
+// expensive object-table fallback inside getPawnWand therefore runs at most
+// once per player per level instead of every frame.
+static void *lumosWandOf(int p, void *pawn)
+{
+    if (p < 0 || p >= 8 || !pawn) return NULL;
+    static DWORD sWandAt[8] = {0};
+    DWORD now = GetTickCount();
+    if (g_lumosWand[p] && !cgLiveObject(g_lumosWand[p])) g_lumosWand[p] = NULL;
+    if (g_lumosWand[p]) return g_lumosWand[p];
+    // Cheap direct HPCharacter.Wand offset read: keep it per-frame so a wand
+    // that appears (e.g. on Lumos cast) is picked up immediately.
+    if (g_offWand > 0 && !IsBadReadPtr((BYTE *)pawn + g_offWand, 4)) {
+        void *w = *(void **)((BYTE *)pawn + g_offWand);
+        if (w && !IsBadReadPtr(w, 0x100)) { g_lumosWand[p] = w; return w; }
+    }
+    // Full-table fallback (a pawn whose wand has no direct pointer, e.g. a
+    // cutscene): run it at most once per second so it can never tank the
+    // frame rate the way v66 did.
+    if (now - sWandAt[p] >= 1000) {
+        sWandAt[p] = now;
+        g_lumosWand[p] = getPawnWand(pawn);
+    }
+    return g_lumosWand[p];
+}
+
+// Cached LumosLight lookup. The direct TheLumosLight property read is cheap
+// and stays per-frame; only the full-table fallback (used when the offset
+// could not be resolved by name) is throttled to once per second.
+static void *lumosLightOf(int p, void *pawn)
+{
+    if (p < 0 || p >= 8 || !pawn) return NULL;
+    void *wand = lumosWandOf(p, pawn);
+    if (!wand) { g_lumosLight[p] = NULL; return NULL; }
+    if (g_offTheLumosLight > 0) {
+        if (IsBadReadPtr((BYTE *)wand + g_offTheLumosLight, 4)) return NULL;
+        void *l = *(void **)((BYTE *)wand + g_offTheLumosLight);
+        if (l && !IsBadReadPtr(l, 0x100)) return l;
+    }
+    static DWORD sLightAt[8] = {0};
+    DWORD now = GetTickCount();
+    if (g_lumosLight[p] && !cgLiveObject(g_lumosLight[p])) g_lumosLight[p] = NULL;
+    if (g_lumosLight[p] && now - sLightAt[p] < 1000) return g_lumosLight[p];
+    sLightAt[p] = now;
+    g_lumosLight[p] = getWandLumosLight(wand, pawn);   // full-table fallback
+    return g_lumosLight[p];
+}
+
 static void lumosTick(void)
 {
     resolveLumosFields();
@@ -8482,12 +8635,23 @@ static void lumosTick(void)
     if (numP < 1) numP = 1;
     if (numP > 8) numP = 8;
 
-    // Scan for any active LumosLight
+    // Rebuild the trigger/wall cache once per level. If a level change raced
+    // past invalidateLevelCaches (v57 showed that is possible for a frame or
+    // two), the representative liveness probe below re-arms the scan instead
+    // of handing GetFullName a freed pointer.
+    if (!g_lumosScanDone)
+        lumosScanActors();
+    else if (g_lumosTriggersN > 0 && !cgLiveObject(g_lumosTriggers[0])) {
+        lumosInvalidate(); lumosScanActors();
+    } else if (g_lumosWallsN > 0 && !cgLiveObject(g_lumosWalls[0])) {
+        lumosInvalidate(); lumosScanActors();
+    }
+
+    // Scan for any active LumosLight (wand/light pointers are cached now).
     for (int p = 0; p < numP; p++) {
         void *pawn = getPawn(p);
         if (!pawn) continue;
-        void *wand = getPawnWand(pawn);
-        void *light = getWandLumosLight(wand, pawn);
+        void *light = lumosLightOf(p, pawn);
         if (light && !isLumosActorHidden(light)) {
             BYTE lt = (g_offLightType > 0 && !IsBadReadPtr((BYTE *)light + g_offLightType, 1))
                     ? *(BYTE *)((BYTE *)light + g_offLightType) : 1;
@@ -8509,8 +8673,7 @@ static void lumosTick(void)
         for (int p = 0; p < numP; p++) {
             void *pawn = getPawn(p);
             if (!pawn) continue;
-            void *wand = getPawnWand(pawn);
-            void *light = getWandLumosLight(wand, pawn);
+            void *light = lumosLightOf(p, pawn);
             if (light) {
                 setLumosActorHidden(light, FALSE);
                 if (g_offLightType > 0 && !IsBadWritePtr((BYTE *)light + g_offLightType, 1))
@@ -8527,8 +8690,7 @@ static void lumosTick(void)
         for (int p = 1; p < numP; p++) {
             void *pawn = getPawn(p);
             if (!pawn) continue;
-            void *wand = getPawnWand(pawn);
-            void *light = getWandLumosLight(wand, pawn);
+            void *light = lumosLightOf(p, pawn);
             if (light && !isLumosActorHidden(light)) {
                 setLumosActorHidden(light, TRUE);
                 if (g_offLightBrightness > 0 && !IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1))
@@ -8537,8 +8699,6 @@ static void lumosTick(void)
         }
     }
 
-    if (!g_objArray || !g_objArray->Data) return;
-    int n = g_objArray->Num;
     float playerPos[8][3];
     int validPlayers = 0;
     for (int p = 0; p < numP; p++) {
@@ -8550,38 +8710,42 @@ static void lumosTick(void)
     }
     if (validPlayers == 0) return;
 
-    for (int k = 0; k < n && n <= 400000; k++) {
-        void *obj = g_objArray->Data[k];
-        if (!obj || IsBadReadPtr(obj, 0x100)) continue;
-        char name[128]; objName(obj, name, sizeof(name));
-        BOOL isLumosTrigger = strstr(name, "LumosSparklesTrigger") || strstr(name, "LumosTrigger") || strstr(name, "LumosSparkles");
-        BOOL isSecretWall   = strstr(name, "GenericColObj") || strstr(name, "KWBlockingVolume");
+    // Triggers / secret walls come from the per-level cache. Each cached
+    // pointer is liveness-checked before any dereference (v57: a level change
+    // can free these objects while the cache still points at them), and the
+    // trigger fire is edge-triggered so a held Lumos never spams Trigger()
+    // every frame.
+    for (int k = 0; k < g_lumosTriggersN; k++) {
+        void *obj = g_lumosTriggers[k];
+        if (!cgLiveObject(obj) || F.Location <= 0 ||
+            IsBadReadPtr((BYTE *)obj + F.Location, 12)) continue;
+        float *tloc = (float *)((BYTE *)obj + F.Location);
+        float rad = (g_offColRadius > 0 && !IsBadReadPtr((BYTE *)obj + g_offColRadius, 4))
+                  ? *(float *)((BYTE *)obj + g_offColRadius) : hp3lumos::DefaultTriggerRadius;
+        float hgt = (g_offColHeight > 0 && !IsBadReadPtr((BYTE *)obj + g_offColHeight, 4))
+                  ? *(float *)((BYTE *)obj + g_offColHeight) : hp3lumos::DefaultTriggerHeight;
+        if (rad < 200.0f) rad = hp3lumos::DefaultTriggerRadius;
+        if (hgt < 80.0f)  hgt = hp3lumos::DefaultTriggerHeight;
 
-        if (isLumosTrigger && F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
-            float *tloc = (float *)((BYTE *)obj + F.Location);
-            float rad = (g_offColRadius > 0 && !IsBadReadPtr((BYTE *)obj + g_offColRadius, 4))
-                      ? *(float *)((BYTE *)obj + g_offColRadius) : hp3lumos::DefaultTriggerRadius;
-            float hgt = (g_offColHeight > 0 && !IsBadReadPtr((BYTE *)obj + g_offColHeight, 4))
-                      ? *(float *)((BYTE *)obj + g_offColHeight) : hp3lumos::DefaultTriggerHeight;
-            if (rad < 200.0f) rad = hp3lumos::DefaultTriggerRadius;
-            if (hgt < 80.0f)  hgt = hp3lumos::DefaultTriggerHeight;
-
-            BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, tloc, rad, hgt);
-            if (lumosActive && nearPlayer) {
-                if (g_fnTrigger) {
-                    callFn(obj, g_fnTrigger, "LumosTrigger.Trigger");
-                }
-            }
+        BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, tloc, rad, hgt);
+        if (lumosActive && nearPlayer && !g_lumosTrigFired[k]) {
+            g_lumosTrigFired[k] = TRUE;
+            if (g_fnTrigger)
+                callFn(obj, g_fnTrigger, "LumosTrigger.Trigger");
         }
+        if (!lumosActive) g_lumosTrigFired[k] = FALSE;
+    }
 
-        if (isSecretWall && F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
-            float *wloc = (float *)((BYTE *)obj + F.Location);
-            BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, wloc, 300.0f, 150.0f);
-            if (lumosActive && nearPlayer) {
-                setLumosActorCollision(obj, FALSE);
-            } else if (!lumosActive) {
-                setLumosActorCollision(obj, TRUE);
-            }
+    for (int k = 0; k < g_lumosWallsN; k++) {
+        void *obj = g_lumosWalls[k];
+        if (!cgLiveObject(obj) || F.Location <= 0 ||
+            IsBadReadPtr((BYTE *)obj + F.Location, 12)) continue;
+        float *wloc = (float *)((BYTE *)obj + F.Location);
+        BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, wloc, 300.0f, 150.0f);
+        if (lumosActive && nearPlayer) {
+            setLumosActorCollision(obj, FALSE);
+        } else if (!lumosActive) {
+            setLumosActorCollision(obj, TRUE);
         }
     }
 }

@@ -1307,3 +1307,77 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
 - VERIFICATION: tests/lumos_sync_test.cpp asserts state activation, expiration,
   tick-wrapping safety, light property checks, cylinder proximity detection,
   and passability rules. All test suites pass via ./tests/run.sh.
+
+24. V66.1 PERF REGRESSION & STUCK COMPANION (2026-09-09)
+--------------------------------------------------------
+- User report after v66 (with the pasted game log as evidence):
+  1. Frame rate collapsed after updating to v66 - even the MENU is laggy.
+     The log's own perf counter reads single digits throughout
+     ("[perf] 2.77 fps", "... 7.00 fps ...") at 3440x1440.
+  2. Hermione as Player 2 gets STUCK after entering Hogwarts
+     ('Save0' -> 'HP3_InsideHub'): the log shows her frozen at
+     loc=(974 1063 Z=137) vz=0 phys=2, "jump ignored (airborne, phys=2)"
+     forever, while her forward/turn/look input is clearly present.
+
+- ROOT CAUSE 1 (FPS): v66's lumosTick (src/dllmain.cpp) ran every rendered
+  frame on BOTH the split-ON and split-OFF paths (the split-OFF path returns
+  after calling it, so it also ran in the menu). Each call performed:
+    * getPawnWand() + getWandLumosLight() for every player; the
+      TheLumosLight property offset could not be resolved by name
+      (log: "TheLumosLight=+0xFFFFFFFF"), so getWandLumosLight fell back to
+      a FULL GObjObjects scan calling GetFullName (objName) on every object,
+      every frame, per player.
+    * A second FULL GObjObjects scan with objName on every object to find
+      LumosSparklesTrigger / LumosTrigger / GenericColObj / KWBlockingVolume
+      by substring - every frame.
+  GetFullName walks the Outer chain and formats a string; ~9k objects in
+  HP3_InsideHub x several scans per frame collapsed the frame rate to single
+  digits. This is a v66 addition (the lumos replication), hence the "even the
+  menu is laggy" symptom (the menu runs the same PostRender path).
+
+  FIX: cache everything the scan used to re-find each frame.
+    * g_lumosTriggers[] / g_lumosWalls[] hold the matched actors; the full
+      table scan runs ONCE PER LEVEL (lumosScanActors), re-armed only when a
+      representative cached pointer stops being live (level-change race) or on
+      explicit invalidation.
+    * lumosInvalidate() clears the caches and is called from
+      invalidateLevelCaches() on every level travel, so cached pointers never
+      outlive their level (v57 crash discipline).
+    * g_lumosWand[]/g_lumosLight[] cache the per-player wand/light; the
+      wand-table fallback is throttled to 1 Hz and the light-table fallback to
+      1 Hz (the direct TheLumosLight offset read stays per-frame when it can
+      be resolved).
+    * Trigger fire is edge-triggered (g_lumosTrigFired[]) so a held Lumos no
+      longer calls Trigger() every frame while near a secret wall.
+  Per-frame cost drops from several full GetFullName scans to a handful of
+  liveness checks + proximity tests over a small cached list.
+
+- ROOT CAUSE 2 (STUCK HERMIONE): after the Hogwarts door transition the driven
+  companion is parked in PHYS_Falling (phys=2) with NO real fall - Location Z
+  stays flat at 137 and Velocity.z stays 0 (the engine's falling gravity never
+  runs on her). driveePawn's movement branch only promoted PHYS_None(0) ->
+  PHYS_Walking(1); a pawn already in PHYS_Falling(2) was left in place, so
+  forward input kept writing XY velocity while the engine kept her airborne
+  and every jump was refused ("grounded jumps only").
+
+  FIX (driveePawn): before the idle/move split, detect a stranded pawn -
+  phys == 2, no jump in flight (g_jumpPh == 0, !g_jumpStanding), |vz| < 60,
+  and a valid Location - and require that Z stay flat (within 8 uu) for a
+  600 ms grace window (a genuine jump or ledge fall moves Z and resets the
+  timer). Then hand the engine PHYS_Walking back through nativeSetPhysics(pawn,
+  1) (which re-initialises Base/Floor bookkeeping that a raw byte write would
+  skip) and g_FindBase() to re-acquire the floor. Logs "[physrecover] pN
+  stranded Falling->Walking".
+
+- VERIFICATION: host policy suites pass (tests/run.sh). The Windows DLL could
+  NOT be rebuilt in this sandbox (no i686 MinGW toolchain; package install
+  blocked), so dist/d3d8.dll and bin/d3d8.dll are NOT refreshed here - build
+  via CI (build-release.yml, workflow_dispatch) and confirm line 2 of
+  hp3mod.log says build v66.1.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v66.1 (else an old DLL is being tested).
+    * Menu + field frame rate is back to normal (no more single-digit [perf]).
+    * After entering Hogwarts as P1 while split is ON, Hermione moves again;
+      the log shows "[physrecover] p1 stranded Falling->Walking" if she ever
+      parks in mid-air.
