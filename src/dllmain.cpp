@@ -142,8 +142,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v65"
-#define MOD_STAMP "build v65 - 2026-09-09 - EXACT STOCK PER-HERO GESTURE PLACEMENT: each companion wet-shader spell now uses the original per-hero goal (target.Location + CentreOffset + Normal(heroLoc - targetLoc) * (1.1*CollisionRadius*SizeModifier + 2 + GestureDistance)), i.e. the point at the stock gesture distance on that hero's OWN line of sight, and faces that hero (target->hero yaw) - not the v64 holder-camera front point nudged by a fixed lateral spacing, which made the two companion icons overlap. The three heroes' lines fan out from the target, so the three icons sit apart on their own heroes' sides and each glides after its own hero with the stock SpellGesture MoveSmooth (goal-loc)*rate*dt (snapped once at lock like LockOn.SetLocation, rate 10 while the target is a possible target, 8 on the cached centre during the 250 ms flicker); a hero unavailable for a frame keeps gliding on its last goal. The holder's native-aim LOCK gesture is unchanged. Purely visual: it still owns only its gesture actors, never touches companion controllers, cast state, target/spell fields, or AI, and the 8-second arm + once-on-release x3 firing are unchanged. v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66"
+#define MOD_STAMP "build v66 - 2026-09-09 - BUG FIX PASS: airborne/Spongify camera yaw input is no longer overwritten by the standing-jump launch snapshot; same-package seamless transitions detect a fresh companion spawned beside Harry, retire the stale controlled pawn, and transfer P2 control before the stale pawn can fall through the destination floor; companion-cast Lumos now invokes the target-side generic handler when baseSpell.ProcessTouch does not forward it, allowing the gargoyle's see-through wall to open. v65 stock per-hero cooperative gesture placement and all earlier cast, camera, floor-handoff, travel-safety and virtual-trio behavior retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -2722,10 +2722,22 @@ static void cgDeliverHit(CgPending *p, BOOL spellAlive)
             did = TRUE; gameDispatch = TRUE;
         }
     }
-    // 3. No game-side dispatch available: call the object's handler the way
-    //    ProcessTouch would have (HandleSpell<Name>(spell, hitLoc), else the
-    //    generic OnSpellHit/HandleSpell).
-    if (!gameDispatch && ti) {
+    // Lumos is exceptional: baseSpell.ProcessTouch can return successfully
+    // without forwarding to a gargoyle's generic OnHandleSpell when the
+    // caster is an AI companion rather than the stock player pawn.  The log
+    // then says ProcessTouch ran, and the light appears, but the gargoyle never
+    // opens its see-through wall.  A generic Lumos target therefore still
+    // needs the target-side callback.  Keep every other spell on the normal
+    // no-double-dispatch path.
+    BOOL lumosNeedsTargetFallback = FALSE;
+    if (gameDispatch && ti && ti->nGen && p->spellCls) {
+        char sc[160]; objName(p->spellCls, sc, sizeof(sc));
+        lumosNeedsTargetFallback = ciHas(sc, ".LumosSpell");
+    }
+
+    // 3. No game-side dispatch available (or the Lumos companion exception):
+    //    call the object's handler the way ProcessTouch would have.
+    if ((!gameDispatch || lumosNeedsTargetFallback) && ti) {
         void *fn = cgSpecificHandler(ti, p->spellCls, hn, sizeof(hn));
         if (fn) {
             cgCall(i, p->target, fn, FALSE, spell, p->target, p->caster, p->spellCls,
@@ -7248,6 +7260,53 @@ static void aiRestore(int i, void *pawn)
     g_letAI[i]      = FALSE;
 }
 
+// Seamless exterior transitions can spawn the destination map's companion
+// before retiring the instance we are driving, while both actors still have
+// the same package name. Package-change invalidation cannot see that case.
+// Prefer the duplicate placed beside Harry; the old controlled pawn otherwise
+// misses the destination floor setup, falls through it, and leaves the newly
+// spawned AI Hermione visible alongside P2.
+static void *rebindSpawnedCompanion(int i, void *current)
+{
+    if (i < 1 || i >= 8 || !current || !g_objArray || !F.ok) return current;
+    void *lead = g_pawn[0] ? g_pawn[0] : findActorByClass("harry");
+    if (!lead || IsBadReadPtr((BYTE *)lead + F.Location, 12) ||
+        IsBadReadPtr((BYTE *)current + F.Location, 12)) return current;
+    float *ll = (float *)((BYTE *)lead + F.Location);
+    float *cl = (float *)((BYTE *)current + F.Location);
+    float cdx=cl[0]-ll[0], cdy=cl[1]-ll[1], cdz=cl[2]-ll[2];
+    float currentD2=cdx*cdx+cdy*cdy+cdz*cdz;
+    void *best=current; float bestD2=currentD2;
+    int n=g_objArray->Num; char name[192]; size_t L=strlen(kCharClass[i]);
+    for (int j=0; j<n && n<=400000; j++) {
+        void *o=g_objArray->Data[j];
+        if (!o || o==current || IsBadReadPtr((BYTE *)o+F.Location,12) ||
+            !actorInCurrentLevel(o) || cgDeleted(o)) continue;
+        objName(o,name,sizeof(name));
+        if (_strnicmp(name,kCharClass[i],L) || name[L]!=' ') continue;
+        float *p=(float *)((BYTE *)o+F.Location);
+        float dx=p[0]-ll[0],dy=p[1]-ll[1],dz=p[2]-ll[2];
+        float d2=dx*dx+dy*dy+dz*dz;
+        if (d2<bestD2) { best=o; bestD2=d2; }
+    }
+    // Require a decisive placement difference. Ordinary scripted separation
+    // must not cause actor churn; this is specifically the stale-across-door
+    // instance versus a fresh companion spawned close to the lead.
+    if (best==current || bestD2>1500.0f*1500.0f ||
+        currentD2<bestD2+600.0f*600.0f) return current;
+    char oldn[128],newn[128]; objName(current,oldn,sizeof(oldn)); objName(best,newn,sizeof(newn));
+    logf_("  [travel-rebind] p%d %s is %.0f from Harry; adopting %s at %.0f",
+          i,oldn,sqrtf(currentD2),newn,sqrtf(bestD2));
+    aiRestore(i,current);
+    if (!destroyActorFX(current))
+        logf_("  [travel-rebind] old companion refused Destroy; destination pawn still adopted");
+    g_pawn[i]=best; strncpy(g_pawnName[i],newn,sizeof(g_pawnName[i])-1);
+    g_pawnName[i][sizeof(g_pawnName[i])-1]=0;
+    g_detached[i]=g_aiReleased[i]=FALSE; g_savedCtrl[i]=NULL;
+    g_savedGS[i]=g_savedAR[i]=0; g_pinned[i]=FALSE;
+    return best;
+}
+
 // When the split is switched OFF, hand every player-2..N pawn we took control
 // of back to its companion AI. Called on the split-off edge (key or file).
 static void handBackAllPlayers(void)
@@ -7919,19 +7978,20 @@ static void driveePawn(int i, void *pawn)
         if (g_lookPitch[i] >  10000) g_lookPitch[i] =  10000;
     }
 
-    // Standing jump: keep actor yaw pinned for the whole airtime, not a timer.
-    // The mesh turn is the jump ANIM (PlayJump) - that call is skipped standing.
-    // v12: also pin DesiredRotation (any FaceRotation pull now converges on
-    // our yaw instead of the AI's) and zero RotationRate so nothing advances
-    // toward a stale desired rotation during the air.
+    // Standing jump: keep the actor upright for the whole airtime, not a
+    // timer.  Do NOT restore g_viewYaw from the launch snapshot here.  That
+    // old v12 assignment discarded every horizontal input sample while the
+    // pawn was airborne; a Spongify bounce can last several seconds, making
+    // P2's camera appear to have only a vertical axis.  The current view yaw
+    // is safe to pin: it preserves the anti-animation-roll guard while letting
+    // the player steer both an ordinary jump and a pad bounce.
     {
         BYTE phNowLock = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 1;
         if (g_jumpStanding[i]) {
-            g_viewYaw[i] = g_jumpYawLock[i];
             rot[0] = 0; rot[2] = 0;
             if (F.DesiredRotation > 0) {
                 int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
-                dr[0] = 0; dr[1] = g_jumpYawLock[i]; dr[2] = 0;
+                dr[0] = 0; dr[1] = g_viewYaw[i]; dr[2] = 0;
             }
             if (F.RotationRate > 0) {
                 int *rr = (int *)((BYTE *)pawn + F.RotationRate);
@@ -8721,6 +8781,12 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
             if (pawn && !IsBadReadPtr(pawn, 0x170)) {
                 resolveFields();
                 resolveActions();
+                void *beforeRebind = pawn;
+                pawn = rebindSpawnedCompanion(i, pawn);
+                if (pawn != beforeRebind) {
+                    g_yawInit[i]=FALSE; g_jumpStanding[i]=FALSE; g_jumpPh[i]=0;
+                    g_jumpLockUntil[i]=g_jumpLaunchAt[i]=0;
+                }
                 takeControl(i, pawn);
                 driveePawn(i, pawn);
                 thirdPersonCam(i, pawn, loc, rot);
