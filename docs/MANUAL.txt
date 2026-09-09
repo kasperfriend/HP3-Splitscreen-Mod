@@ -14,42 +14,47 @@ WHAT IT DOES
   engine's own DrawPortal once per player.
 
 
-V55 COOPERATIVE SUSTAINED CAST (FIXES THE v54 SPLIT-ON DEAD GATE;
-    IN-GAME TESTING PENDING)
+V57 COOPERATIVE SUSTAINED CAST - THE HOVERING TRIPLE CAST FROM ANY CHARACTER
   This is a general fallback for real HP3 objects that require Harry,
   Hermione and Ron to keep casting together. It is NOT a Pixie-well-only
   solution, does not complete a minigame directly, and never calls generic
   Trigger(), synthetic Touch(), repeated spell impacts, or a guessed target
   property.
 
-  PER-LEVEL CLASS CERTIFICATION (live game behavior only):
-    The mod never guesses a class name. It admits a class only from observed
-    game behavior and writes:
-      [coopcast] CERTIFIED P1 cooperative class ...
-    Two observation modes:
-      * split OFF (stock demonstration): perform the normal Player-1
-        interaction on a genuine all-three-character object and keep P1's
-        cursor locked/casting until Hermione and Ron have both joined the
-        same target;
-      * split ON (v55): P1's genuine stock cursor lock on the object is
-        enough. While split is on the companions are AI/mod-driven and their
-        pawn spellTarget cannot show a shared hold, so v54 (which only
-        observed split-OFF) never certified anything and a >10-second P2/P3
-        hold stayed an ordinary single cast.
-    Only an observed class (and subclasses) is eligible for this map. An
-    ordinary SpellTrigger, a short cast, and an unknown class are not
-    eligible. If the line does not appear, the mod intentionally does nothing.
+  HOW THE STOCK GAME HOLDS THE TRIO CAST (established from the HP2-family
+  script source and the v56 hardware ProcessEvent capture):
+    The engine player's held cast plus the SpellCursor lock is what recruits
+    the companions. LockOn(Actor TargetActor) also runs ChooseSpell FROM THE
+    TARGET's own vulnerable spell class, so the hovered spell is always the
+    one the object wants; about 0.7s after the lock in the capture,
+    Hermione's controller put her into the held-cast state on its own. The
+    trigger's own script decides when the converged holds complete it.
 
-  USE AFTER CERTIFICATION:
-    Player 2 or Player 3 (while split is on) aims at an instance of the
-    certified class and holds Cast continuously for more than 10 seconds.
-    Then, only while that hold continues, the mod invokes the real P1
-    SpellCursor.LockOn only when its reflected one-target ABI and paired
-    no-input UnLock are safe, and when P1's cursor retains that target. It
-    then places Harry, Hermione and Ron in the game's existing held-cast
-    state. The object's own script decides what happens; the holder's normal
-    release is the only injected projectile fire. Any of the trio may be the
-    holder; no Player-1-only ceremony is needed mid-session.
+  USE (v57 - any character, any mode):
+    Keep a cast held on the SAME game-verified cast target for more than
+    CoopCastHoldMs (default 10 seconds) - Player 1 with the mouse (the
+    engine cursor lock counts as the hold) or any split-screen player with
+    their cast key. The target must be one the game's own targeting accepts
+    (live vulnerableToClass / spell-handler / SpellTrigger metadata, or the
+    stock cursor lock itself). After the delay the real trio holds the
+    target's own spell: the two non-holders are placed in the game's existing
+    held-cast state through StartCasting(class, 1.0)/PressedFire/playCastAim,
+    heroes the game already recruited itself are left untouched, and the real
+    P1 SpellCursor.LockOn bridges the engine's hover-lock whenever its
+    reflected one-target ABI and paired no-input UnLock are safe (if the
+    cursor's ABI cannot be verified the trio still holds; the log says so).
+    The object's own script decides what happens; the holder's normal release
+    is the only injected projectile fire.
+
+    The v54-v56 per-level behaviour certification is no longer required to
+    hold - it never fired on real hardware (the stock companion join does not
+    set both companions' pawn spellTarget, and a split-ON holder is never the
+    player whose cursor the old test watched). It is still collected when a
+    stock P1 lock demonstrates a class ([coopcast] CERTIFIED ...) and then
+    only helps discover cooperative actors that carry no targeting metadata.
+
+    Target flicker up to 250ms (cursor None frames for P1, aim-pick gaps for
+    P2/P3) does not reset the dwell; a real release does.
 
     Releasing Cast, aiming at another object, another player's normal cast,
     target deletion, map travel, F10/split shutdown, or a missing trio
@@ -58,10 +63,29 @@ V55 COOPERATIVE SUSTAINED CAST (FIXES THE v54 SPLIT-ON DEAD GATE;
     CoopCastHoldMs has a default/minimum of 10000; it cannot be lowered into
     a normal short-cast shortcut.
 
-  This deliberately reaches P1's normal controller/cursor route only after
-  the strict delay and behavior proof. Test first on a reloadable save. If it
-  differs from the stock P1 interaction, send hp3mod.log with the CERTIFIED
-  line and the later [coopcast] lines.
+  WHAT TO LOOK FOR IN hp3mod.log:
+    [coopcast] P2 started continuous >10-second hold on <target>  (dwell starts)
+    [coopcast] P2 held <target> for more than 10 seconds: the trio now
+    holds <spell> on <target> (N borrowed ..., cursor bridge locked/skipped)
+    If the arm is refused the reason is logged on the [coopcast] line
+    (busy hero, reflection incomplete, target replaced...). Test first on a
+    reloadable save and send hp3mod.log if the trio hold behaves differently
+    from the stock P1 interaction.
+
+
+V57 LEVEL-TRAVEL CRASH FIX (ENTERING HOGWARTS)
+  Hard crash on level entry (any character, with or without split):
+    UObject::GetPathName <- UObject::GetPathName <- UObject::GetFullName
+    <- FPlayerSceneNode::Render <- UGameEngine::Draw
+  Cause: the mod caches actors (pawns, cursors, camera, aim FX, borrowed
+  heroes) across frames; a level change frees them while the caches still
+  name them. IsBadReadPtr passes on freed-but-still-mapped UObject memory,
+  and the object-name walk then follows the destroyed Outer chain into
+  memory the new level already reuses. The level-change cache drop also ran
+  only every 45th frame, leaving more than half a second of stale pointers
+  right through the travel. Fix: every cached actor is validated against the
+  engine's own live GObjObjects table before any name/field/destroy use, and
+  the level-change cache drop runs every frame.
 
 
 V52 NATIVE AIMING (HARDWARE TESTING PENDING)
