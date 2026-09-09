@@ -138,7 +138,7 @@ src/coop_cast.h      testable continuous cooperative-hold identity/timing policy
 src/native_aim.h     original HP3 effect adapter (included by dllmain.cpp)
 src/d3d8.def         Direct3DCreate8 export alias
 src/hp3mod.ini       default configuration
-bin/d3d8.dll         prebuilt v54 binary (this PR changes src only; the GitHub Actions workflow rebuilds bin/d3d8.dll into the v55 release)
+bin/d3d8.dll         prebuilt v55 (zig 0.16 x86-windows-gnu cross-build of src/dllmain.cpp + src/d3d8.def; rebuild any time with the toolchain or the Actions workflow)
 bin/hp3mod.ini       shipped configuration
 docs/MANUAL.txt      full in-game manual (all ini options, controls, troubleshooting)
 docs/NATIVE_AIM.md  package findings, limitations, hardware acceptance checklist
