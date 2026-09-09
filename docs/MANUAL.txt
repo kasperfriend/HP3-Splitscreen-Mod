@@ -14,7 +14,7 @@ WHAT IT DOES
   engine's own DrawPortal once per player.
 
 
-V62 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
+V63 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
   This is a fallback for HP3 objects that expect three distinct casters. It
   does not complete a puzzle directly and never fires from a remote hero.
 
@@ -22,8 +22,8 @@ V62 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
     Keep a cast held on the SAME cooperative target (the
     CompanionSpellTrigger class family or a class verified from the stock
     interaction) for more than CoopCastHoldMs. The default and minimum are
-    10000 milliseconds. Player 1's stock cursor lock is the hold signal;
-    split-screen players hold their cast key.
+    8000 milliseconds (8 seconds). Player 1's stock cursor lock is the hold
+    signal; split-screen players hold their cast key.
 
     NOTHING fires when the interval completes. The charge merely arms.
     Release is the fire: all three spells leave from the initiating player in
@@ -42,6 +42,13 @@ V62 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
     casting have GroundSpeed/AccelRate pinned with save/restore. Companions
     walking into range remain free to walk; all pins release on unlock.
 
+    While the charge is armed on P2 or P3, the holder's single floating
+    wet-shader spell is joined by two companion wet-spell gestures near the
+    target - the same "one floating spell becomes three" look as stock P1's
+    held cast plus its AI companions joining. P1 already shows that look
+    through the stock cursor/companion-join path. The companion gestures are
+    purely visual and do not change what fires.
+
     Ordinary targets such as pumpkins and spawners do not arm charged x3; a
     long hold on them remains a plain single cast. Cursor/aim flicker up to
     250ms does not reset a dwell or tear down an armed charge. A different
@@ -50,9 +57,11 @@ V62 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
     charged behavior; CastGameplay=1 is required.
 
   WHAT TO LOOK FOR IN hp3mod.log:
-    [coopcast] P2 started continuous >10-second hold on <target>
-    [coopcast] P2 held <target> for more than 10 seconds: virtual-trio
+    [coopcast] P2 started continuous >8-second hold on <target>
+    [coopcast] P2 held <target> for more than 8 seconds: virtual-trio
       charged x3 <spell> armed on <target>; fires only on release
+    [cooptrio] P2 charge armed: holder spell joined by two companion
+      wet-spell gestures (<wet texture>) - three floating spells
     [coopcast] P2 RELEASED charged cast on <target>: all three shots use the
       HOLDER origin and trajectory
     [coopcast] P2 bonus shot 2/3 at HOLDER origin ... copied from holder shot
@@ -119,7 +128,7 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v62 ...
+          === hp3mod build v63 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
       d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave

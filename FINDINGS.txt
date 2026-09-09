@@ -1035,3 +1035,71 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   apart, then perform a >10-second release once with each player. Every log must
   show both bonuses "at HOLDER origin" with matching location/velocity, and all
   three visible spells must follow the holder's line rather than remote walls.
+
+20. v63 8-second arm + three floating wet spells (2026-09-09)
+
+  User request: triple cast works exactly as intended. Two changes only.
+    (1) Arm the charged x3 after an 8-second continuous hold (was 10).
+    (2) Show the stock cooperative visual - the one floating wet-shader spell
+        that becomes three floating spells when the AI companions join - while
+        a spell is held past the threshold on the correct triple-cast objects.
+  Functional triple-cast firing must not change.
+
+  (1) TIMING. hp3coop::DefaultHoldMs is now 8000; the shipped
+      src/hp3mod.ini and bin/hp3mod.ini say CoopCastHoldMs=8000 and document
+      "minimum/default 8000" (values below 8000 stay clamped). The dllmain
+      clamp already bottoms at hp3coop::DefaultHoldMs, so a sampled ini cannot
+      undercut the new floor. coop_cast_test.cpp now derives every boundary
+      from H = DefaultHoldMs, so the "exactly the interval is still a normal
+      hold; Ready only after it fully elapses" rule is verified at 8000.
+
+  (2) THREE FLOATING SPELLS. v59-v62 keep the holder's own floating gesture
+      (engine cursor for P1, native-aim LOCK for P2/P3) but never borrow
+      companions, so a mod-driven P2/P3 charged hold showed only ONE floating
+      spell. v63 adds a coopTrio overlay: while g_coopActive is armed by a
+      P2/P3 holder, two companion SpellGesture actors are spawned next to the
+      cooperative target and driven with the same reflected ABI as the native
+      aim LOCK gesture (spawnFX + nativeSetPhysics(0) + naPlace + ChangeGesture
+      with the resolved <spell>.default.SpellIcon wet glyph + SetReadyToCast
+      with the target collision radius). The holder's own gesture stays put,
+      so the armed charge reads as three floating spells - exactly the stock
+      1-to-3 look.
+
+      * P1 is deliberately excluded: the stock cursor lock already recruits
+        the AI companions and produces the same 1-to-3 look, so overlaying
+        there would double the companion gestures.
+      * Purely visual. The overlay owns only its two gesture actors and never
+        writes companion controllers, cast state, target/spell fields, or AI;
+        coopRestore's fire path is byte-for-byte untouched.
+      * Lifecycle: armed lazily on the first coopMaintain frame after
+        coopStart; refreshed every frame the charge stays alive; disarmed in
+        coopRestore (release AND cancel), coopClearAll, and defensively in
+        cgResetLevel. Liveness is re-checked through the object table before
+        any write/destroy (level travel can free the actors between frames).
+      * Availability gates: NativeAim on, reflected SpellGesture ABI present,
+        and a resolvable wet icon. If any is missing the overlay is skipped
+        without touching the firing path (the holder's own gesture would be
+        missing too, since it needs the same machinery).
+
+  Preserved unchanged: v62 holder-origin virtual-trio launch, v61
+  distinct-Instigator virtual trio and split-OFF delivery tick, the
+  state-aware companion movement guard, v58 level-travel safety and the
+  cooperative-family gate, and the native wet SpellGesture icon / 770-unit
+  aim. Nothing auto-fires at 8 seconds; x3 fires once on release.
+
+  Host policy suites pass; the 32-bit Windows DLL cross-build succeeds with
+  the v63 banner and Direct3DCreate8/Direct3DCreate8@4 exports; bin/d3d8.dll
+  is refreshed to match. In-game behaviour still needs hardware confirmation.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v63 (else an old DLL is being tested).
+    * Hold a CompanionSpellTrigger as P2/P3 for just over 8 seconds: the
+      holder's one floating wet spell must be joined by two more (three
+      floating spells), and the log shows "[cooptrio] P2 charge armed ...
+      three floating spells". Nothing fires at 8 seconds.
+    * Release: the v62 holder-origin volley fires once (bonuses "at HOLDER
+      origin"); the three floating spells disappear with the release.
+    * 8-second hold on a pumpkin/spawner: NO trio, NO companion gestures,
+      ordinary single cast.
+    * A hold shorter than 8 seconds must not arm and must not show the trio.
+    * Level travel mid-hold: no crash, no orphaned companion gestures.

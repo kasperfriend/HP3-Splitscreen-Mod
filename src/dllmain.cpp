@@ -141,8 +141,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v62"
-#define MOD_STAMP "build v62 - 2026-09-09 - HOLDER-ORIGIN VIRTUAL TRIO: charged x3 keeps the v61 distinct-Instigator virtual trio, but all three spells now leave from the player who completed the 10-second hold. On P2/P3 release, each bonus copies the normal shot's exact Location, Velocity, Rotation, DesiredRotation, projectile speed, max speed, physics and acceleration before the next engine tick. P1's engine-owned shot is not exposed to the mod, so its two bonuses use one identical holder-origin target-directed launch plan. The other heroes are labels only: their Instigators still let CompanionSpellTrigger count three casters, but their distant positions can no longer send bonus spells into walls. This works symmetrically for P1, P2 and P3. Nothing auto-fires at 10 seconds; x3 fires once on release. v61 split-OFF delivery tick and state-aware companion movement guard, v58 level-travel safety, cooperative-family gate, native wet SpellGesture icon, 770-unit aim, and cast gameplay retained."
+#define MOD_BUILD  "v63"
+#define MOD_STAMP "build v63 - 2026-09-09 - 8-SECOND ARM + THREE FLOATING SPELLS: the charged x3 hold now arms after an 8-second continuous hold (was 10) on a cooperative-family target; nothing still fires at the threshold and x3 still fires once on release from the holder, unchanged from v62. When the charge is armed on P2/P3, the holder's single floating wet-shader spell is joined by two companion wet-spell gestures - the same three-floating-spells look as stock P1's held cast plus its AI companions joining (P1 already gets that look from the stock cursor/companions). The companion gestures are visual only: they never touch companion controllers, cast state, target/spell fields, or AI, and they change nothing about what fires. v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1761,6 +1761,9 @@ static BOOL coopClassIsCooperative(void *cls);
 static BOOL isCompanionCtrl(const char *name);
 static void coopObserveP1(void *p1, void *cursorTarget);
 static void coopP1HoldTry(void *p1);
+// v63: the "three floating wet spells" overlay for mod-driven holders.
+static void coopTrioDisarm(const char *why);
+static void coopTrioUpdate(void);
 // v56: cgWatchP1 also drives the coop hold for P1; coopTick itself is
 // defined further down with the rest of the cooperative machinery.
 static void coopTick(int i, void *pawn, BOOL held);
@@ -1793,6 +1796,10 @@ static void cgResetLevel(void)
     g_guardPinning[1] = g_guardPinning[2] = FALSE;
     g_guardSavedGS[1] = g_guardSavedGS[2] = 0.0f;
     g_guardSavedAR[1] = g_guardSavedAR[2] = 0.0f;
+    // v63: the companion wet-spell gestures die with the level too. They are
+    // only a visual overlay; drop any cached actor pointers without touching
+    // the freed objects.
+    coopTrioDisarm("level reset");
 }
 
 static const char *cgLastComp(const char *path)
@@ -3455,8 +3462,9 @@ static void coopObserveP1(void *p1, void *cursorTarget)
     proof->path[sizeof(proof->path) - 1] = 0;
     char targetName[180];
     if (g_splitOn)
-        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's live cursor lock on %s (split-screen ON); a >10-second P2/P3 hold on this class may now enter the shared hold in this level",
-              proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
+        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's live cursor lock on %s (split-screen ON); a >%lu-second P2/P3 hold on this class may now enter the shared hold in this level",
+              proof->path, objName(cursorTarget, targetName, sizeof(targetName)),
+              (unsigned long)g_coopCastHoldMs / 1000u);
     else
         logf_("[coopcast] CERTIFIED P1 cooperative class %s after Harry, Hermione and Ron held %s; P2/P3 fallback may now use this class in this level",
               proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
@@ -4846,9 +4854,10 @@ static BOOL coopClassIsTarget(void *cls)
     return g_cgChainOK && cls && cgIsKnownClass(cls) && coopClassIsCooperative(cls);
 }
 
-// The hold admission is the game's own targeting - a deliberate >10-second
-// hold by ANY single character on a target from the genuine cooperative
-// class family. A CgCand is a real cast target by construction (its class
+// The hold admission is the game's own targeting - a deliberate hold longer
+// than CoopCastHoldMs (default 8 seconds) by ANY single character on a
+// target from the genuine cooperative class family. A CgCand is a real cast
+// target by construction (its class
 // carries live vulnerableToClass metadata, a spell handler, or it is a stock
 // SpellTrigger-family actor), and the v58 family gate keeps ordinary objects
 // from ever entering the shared trio hold.
@@ -5134,6 +5143,196 @@ static CgCand *coopActiveCandidate(void)
     return (c && cgCandAlive(c)) ? c : NULL;
 }
 
+// ===========================================================================
+// v63: cooperative wet-shader "three floating spells" overlay.
+//
+// The stock cooperative hold shows one floating wet-texture SpellGesture per
+// joined hero: P1's own cursor lock turns on the gesture, then the AI
+// companions' controllers join and each contributes its own - one spell that
+// becomes three. v59-v62 keep the HOLDER's ordinary gesture (the engine
+// cursor for P1, the native-aim LOCK gesture for P2/P3) but deliberately no
+// longer borrow companions, so a mod-driven P2/P3 charged hold showed only
+// the holder's one floating spell. This overlay adds the two companion
+// gestures so an armed charge reads as three floating spells, exactly like
+// stock. It is a PURE VISUAL: it owns two extra SpellGesture actors and never
+// touches any companion controller, cast state, target/spell field, or AI,
+// and it changes nothing about what fires on release.
+//
+// P1's holder path is left to the engine: the stock cursor lock already
+// recruits the companions and produces the same 1-to-3 look, so adding the
+// overlay there would double the companion gestures.
+// ===========================================================================
+struct CoopTrioFX {
+    BOOL active;
+    int  holder;
+    void *spell;                 // cooperative spell class (resolves the icon)
+    void *icon;                  // resolved <spell>.default.SpellIcon wet glyph
+    void *fx[2];                 // the two companion SpellGesture actors
+    int   slot[2];               // object-table slot of each gesture (liveness)
+    DWORD spawnedAt[2];
+    BOOL  configured[2];
+    float radius;                // last SetReadyToCast radius applied
+};
+static CoopTrioFX g_coopTrio = {};
+
+static BOOL coopTrioFxAlive(int k)
+{
+    CoopTrioFX &t = g_coopTrio;
+    if (k < 0 || k > 1 || !t.fx[k] || !g_objArray) return FALSE;
+    int slot = t.slot[k];
+    if (slot < 0 || slot >= g_objArray->Num || IsBadReadPtr(g_objArray->Data + slot, 4))
+        return FALSE;
+    void *o = g_objArray->Data[slot];
+    if (o != t.fx[k] || IsBadReadPtr(o, 0x2C)) return FALSE;
+    if (cgClassOf(o) != g_naB.gestureClass) return FALSE;
+    if (!actorInCurrentLevel(o)) return FALSE;
+    if (g_naB.deleted > 0 && g_naB.deletedMask &&
+        !IsBadReadPtr((BYTE *)o + (g_naB.deleted & ~3), 4) &&
+        (*(DWORD *)((BYTE *)o + (g_naB.deleted & ~3)) & g_naB.deletedMask))
+        return FALSE;
+    return TRUE;
+}
+
+static void coopTrioDisarm(const char *why)
+{
+    CoopTrioFX &t = g_coopTrio;
+    if (!t.active) return;
+    int destroyed = 0;
+    for (int k = 0; k < 2; k++) {
+        if (t.fx[k]) {
+            // Level travel can free these between frames; never destroy a
+            // dead actor. coopTrioFxAlive already checks the live object table.
+            if (coopTrioFxAlive(k) && cgLiveObject(t.fx[k]) && destroyActorFX(t.fx[k]))
+                destroyed++;
+        }
+        t.fx[k] = NULL;
+        t.slot[k] = -1;
+        t.spawnedAt[k] = 0;
+        t.configured[k] = FALSE;
+    }
+    if (destroyed)
+        logf_("  [cooptrio] companion wet-spell gestures removed (%s)",
+              why ? why : "disarm");
+    memset(&t, 0, sizeof(t));
+}
+
+static void coopTrioUpdate(void)
+{
+    CoopTrioFX &t = g_coopTrio;
+    // Only a live mod-driven charge (P2/P3 holder) shows the overlay. P1's
+    // stock cursor lock already produces the 1-to-3 look via the engine.
+    if (!g_coopActive.active || g_coopActive.holder <= 0 || !g_coopActive.spell) {
+        coopTrioDisarm(NULL);
+        return;
+    }
+    int holder = g_coopActive.holder;
+    void *pawn = getPawn(holder);
+    if (!coopActorAlive(pawn) || !coopTargetAlive(g_coopActive.target) ||
+        F.Location <= 0 || IsBadReadPtr(pawn, F.Location + 12)) {
+        coopTrioDisarm("holder or target unavailable");
+        return;
+    }
+    // The wet gesture is native-aim machinery; without the reflected ABI
+    // there is nothing stock-consistent to draw.
+    if (!g_nativeAim || !naBind() || !g_naB.gestureClass) {
+        coopTrioDisarm("native aim unavailable");
+        return;
+    }
+    void *spell = g_coopActive.spell;
+    void *icon = naSpellIcon(spell);
+    if (!icon) {
+        // Same icon the holder's own LOCK gesture would need; if it cannot
+        // resolve, the holder gesture also fell back, so skip the companions.
+        coopTrioDisarm("no resolvable wet spell icon");
+        return;
+    }
+
+    if (!t.active || t.holder != holder || t.spell != spell || t.icon != icon) {
+        coopTrioDisarm(NULL);
+        t.active = TRUE;
+        t.holder = holder;
+        t.spell = spell;
+        t.icon = icon;
+        t.radius = -1.0f;
+        char iconName[200];
+        logf_("  [cooptrio] P%d charge armed: holder spell joined by two companion "
+              "wet-spell gestures (%s) - three floating spells",
+              holder + 1, objName(icon, iconName, sizeof(iconName)));
+    }
+
+    CgCand *cand = coopActiveCandidate();
+    if (!cand) { coopTrioDisarm("target candidate gone"); return; }
+    float centre[3];
+    cgAimPoint(cand, centre);
+    float radius = cgHitRadius(cand);
+
+    // Lateral (perpendicular-to-view) spacing from the holder to the target.
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    float hx = centre[0] - pl[0], hy = centre[1] - pl[1];
+    float hl = sqrtf(hx * hx + hy * hy);
+    if (hl < 1.0f) { hx = 1.0f; hy = 0.0f; hl = 1.0f; }
+    float ux = -hy / hl, uy = hx / hl;
+    float spacing = radius * 0.9f + 25.0f;
+    if (spacing < 50.0f) spacing = 50.0f;
+    if (spacing > 120.0f) spacing = 120.0f;
+    // Gesture faces opposite the line of sight (target -> holder), like the
+    // native-aim LOCK gesture faces opposite the camera direction.
+    float yawF = atan2f(-hy, -hx) * (65536.0f / 6.283185307179586f);
+    int facing[3] = { 0, (int)yawF & 65535, 0 };
+    DWORD now = GetTickCount();
+
+    for (int k = 0; k < 2; k++) {
+        float s = (k == 0) ? spacing : -spacing;
+        float at[3] = { centre[0] + ux * s, centre[1] + uy * s, centre[2] + 6.0f };
+        if (t.fx[k] && !coopTrioFxAlive(k)) {
+            t.fx[k] = NULL;
+            t.slot[k] = -1;
+            t.spawnedAt[k] = 0;
+            t.configured[k] = FALSE;
+        }
+        if (!t.fx[k]) {
+            t.fx[k] = spawnFX(pawn, g_naB.gestureClass, pawn, at, facing);
+            if (!t.fx[k]) { coopTrioDisarm("companion gesture spawn failed"); return; }
+            t.slot[k] = -1;
+            for (int slot = 0; slot < g_objArray->Num; slot++)
+                if (g_objArray->Data[slot] == t.fx[k]) { t.slot[k] = slot; break; }
+            t.spawnedAt[k] = now;
+            t.configured[k] = FALSE;
+            if (!coopTrioFxAlive(k) || !nativeSetPhysics(t.fx[k], 0)) {
+                coopTrioDisarm("companion gesture invalid after spawn");
+                return;
+            }
+        }
+        if (!naPlace(t.fx[k], at, facing)) continue;
+        if (!t.configured[k]) {
+            if (!naParticles(t.fx[k], g_naB.gestureClass, 2)) {
+                setBoolProp(t.fx[k], g_naB.hidden, g_naB.hiddenMask, TRUE);
+                // Some engine builds initialize particle copies on first tick.
+                if ((DWORD)(now - t.spawnedAt[k]) < 1000u) continue;
+                logf_("  [cooptrio] companion gesture %d/2 lacks private particles "
+                      "after 1s; overlay skipped", k + 1);
+                coopTrioDisarm("no private particles");
+                return;
+            }
+            BYTE params[64]; memset(params, 0, sizeof(params));
+            memcpy(params + g_naB.textureParam, &t.icon, 4);
+            g_ProcessEvent(t.fx[k], NULL, g_naB.change, params, NULL);
+            memset(params, 0, sizeof(params));
+            *(DWORD *)(params + g_naB.readyParam) = g_naB.readyMask;
+            *(float *)(params + g_naB.radiusParam) = radius;
+            g_ProcessEvent(t.fx[k], NULL, g_naB.ready, params, NULL);
+            setBoolProp(t.fx[k], g_naB.hidden, g_naB.hiddenMask, FALSE);
+            t.configured[k] = TRUE;
+        } else if (radius != t.radius) {
+            BYTE params[64]; memset(params, 0, sizeof(params));
+            *(DWORD *)(params + g_naB.readyParam) = g_naB.readyMask;
+            *(float *)(params + g_naB.radiusParam) = radius;
+            g_ProcessEvent(t.fx[k], NULL, g_naB.ready, params, NULL);
+        }
+    }
+    t.radius = radius;
+}
+
 // Resolve the projectile Instigator field offset once (cached). The v60
 // hardware log showed P2's same-caster x3 completing Touch+ProcessTouch yet
 // still not satisfying CompanionSpellTrigger: the trigger counts distinct
@@ -5391,6 +5590,9 @@ static void coopRestore(const char *why, BOOL fireTrio)
         logf_("[coopcast] P%d ending charged hold on %s: %s",
               g_coopActive.holder + 1, tn, why ? why : "reset");
     }
+    // The three-floating-spells overlay dies with the charge, whether it
+    // fired (release) or was cancelled.
+    coopTrioDisarm(why);
     memset(&g_coopActive, 0, sizeof(g_coopActive));
 }
 
@@ -5490,6 +5692,9 @@ static void coopMaintain(void)
         g_coopBlocked[g_coopActive.holder] = TRUE;
         coopRestore("holder is unavailable", FALSE);
     }
+    // Refresh the "three floating wet spells" overlay every frame the charge
+    // stays armed (P2/P3 holders; a no-op for P1 and for inactive charges).
+    coopTrioUpdate();
 }
 
 static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
@@ -5548,7 +5753,8 @@ static void coopTick(int i, void *pawn, BOOL held)
 
     // Player 1's hold is keyed by the ENGINE's own cursor lock
     // (g_p1CursorLockedTarget), not by a camera-ray pick. coopP1HoldTry owns
-    // the >10s arming; this branch maintains/restores an active P1 charge.
+    // the >CoopCastHoldMs arming; this branch maintains/restores an active
+    // P1 charge.
     if (i == 0) {
         if (!g_coopActive.active || g_coopActive.holder != 0) return;
         // P1's lock state already carries the 250 ms None-frame grace. When
@@ -5621,10 +5827,10 @@ static void coopTick(int i, void *pawn, BOOL held)
     }
 }
 
-// P1's own uninterrupted >10-second cursor lock arms the same single-caster
-// charge as P2/P3. The stock cursor is P1's authoritative "holding cast on
-// this target" signal; P1's normal state supplies the ordinary release. A
-// short cursor flicker (<= kP1CursorGrace) is tolerated.
+// P1's own uninterrupted cursor lock past CoopCastHoldMs arms the same
+// single-caster charge as P2/P3. The stock cursor is P1's authoritative
+// "holding cast on this target" signal; P1's normal state supplies the
+// ordinary release. A short cursor flicker (<= kP1CursorGrace) is tolerated.
 //
 // The locked object's class must belong to the genuine cooperative family
 // (CompanionSpellTrigger-type or session-certified). An ordinary pumpkin or
@@ -5688,8 +5894,10 @@ static void coopP1HoldTry(void *p1)
             if (g_objArray->Data[j] == target) { slot = j; break; }
     }
     if (slot < 0) {
-        logf_("[coopcast] P1 10s hold on %s: target not in GObjObjects - "
-              "skip charged x3 arming", objName(target, cand->name, sizeof(cand->name)));
+        logf_("[coopcast] P1 %lus hold on %s: target not in GObjObjects - "
+              "skip charged x3 arming",
+              (unsigned long)g_coopCastHoldMs / 1000u,
+              objName(target, cand->name, sizeof(cand->name)));
         return;
     }
     hp3coop::Target key = { target, cls, slot };
@@ -6927,8 +7135,8 @@ static void aiRestore(int i, void *pawn)
 static void handBackAllPlayers(void)
 {
     // v54: cancel borrowed P1/companion cast state before their normal AI is
-    // restored; otherwise a split-off during the over-10-second fallback could
-    // leave a companion visually/spiritually holding the old target.
+    // restored; otherwise a split-off during the over-CoopCastHoldMs fallback
+    // could leave a companion visually/spiritually holding the old target.
     coopStopHolderForSplitShutdown();
     coopClearAll("split-screen disabled");
     for (int i=1;i<8;i++) { destroyAimFX(i); g_aimViewValid[i]=FALSE; }

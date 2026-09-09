@@ -9,7 +9,7 @@
 
 namespace hp3coop {
 
-enum { DefaultHoldMs = 10000u };
+enum { DefaultHoldMs = 8000u };
 
 struct Target {
     void *object;
