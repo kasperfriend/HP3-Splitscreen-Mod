@@ -163,8 +163,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v66.3"
-#define MOD_STAMP "build v66.3 - 2026-09-09 - LUMOS-AS-P2 TEXTURE TRIGGER CRASH FIXED. (1) CRASH: casting Lumos (reported as Player 2 on a gargoyle in HP3_InsideHub) GPF'd inside UGameEngine::Draw with the crash history naming the receiver: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger). The per-level Lumos scan admitted ANY object whose full GetFullName string contained the token - the placed trigger actors, but also the UClass entries (Class hgame.LumosTrigger) and the spell's HUD asset Texture hgame.LumosTriggerIcon that the engine loads alongside Lumos. A cached Texture is a live UObject (cgLiveObject passes) and the Location/CollisionRadius reads at actor offsets land in the shared UObject allocator arena (IsBadReadPtr passes), so garbage floats could pass the proximity test and the mod ran pawn Trigger() bytecode with a Texture as 'this'. Scan membership is now decided by the CLASS TOKEN only (hp3lumos class-token helpers in src/lumos_sync.h, regression-tested in tests/lumos_sync_test.cpp with the exact crash names), look-alike rejections are counted and logged per scan, and - defense in depth against a cached pointer being recycled into a different object mid-level - the Trigger() fire site and the secret-wall collision writes re-verify the receiver's class through the calibrated UObject::Class chain (guarded dword reads only, no GetFullName) before running or writing anything; a proven impostor is skipped and logged once. (2) The same class-token rule now guards the GenericColObj/KWBlockingVolume wall cache, which previously also cached the class objects themselves and wrote actor collision bits into them. v66.2 STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES: (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66.4"
+#define MOD_STAMP "build v66.4 - 2026-09-09 - LUMOS-AS-P2 SPARKLES-EMITTER TRIGGER CRASH FIXED. CRASH: with v66.3 running, casting Lumos as Player 2 (same HP3_InsideHub gargoyle) GPF'd inside UGameEngine::Draw, history: UObject::ProcessEvent <- (LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render, and the mod's own pelog shows '-> ProcessEvent LumosTrigger.Trigger' firing straight into the detach. Two defects cooperated: (a) the v66.3 class-token gate still substring-matched WITHIN the class token (strstr 'LumosSparkles'), so the placed secret-wall sparkles actor class 'LumosSparklesEmitter' still entered the trigger cache (21 'triggers' in the hub scan), and the fire-time chain re-verify reused the same substring behind an isActor gate that an Emitter trivially passes; (b) deeper: the fire site called ONE globally resolved function (g_fnTrigger = KWGame.KWPawn.Trigger) on whatever the cache held, so any admitted non-pawn executed pawn bytecode as 'this'. FIX, three layers: (1) name membership is now EXACT class-token equality (src/lumos_sync.h: triggers 'LumosTrigger'/'LumosSparklesTrigger', walls 'GenericColObj'/'KWBlockingVolume', no substring anywhere, regression-tested with the exact crash names in tests/lumos_sync_test.cpp); (2) a differently-named SUBCLASS of one of those classes - the only reason the old substring existed - is admitted exclusively by chain pointer proof: lumosChainProves walks the receiver's calibrated UObject::Class -> UStruct::SuperField chain and pointer-compares it with the family class objects resolved by path (guarded dword reads only, no GetFullName), at scan admission AND inside lumosClassVerified at every fire/write; (3) the Trigger() fire site never replays a function found on a DIFFERENT class again: with the chain verified it fires the most-derived Trigger declaration in the RECEIVER's own chain (CgClass::fnTrigger from the castgame index), falling back to Engine.Actor.Trigger (the event every actor owns), and skips + logs '[lumos] v66.4 BLOCKED Trigger()' when neither can be proven - even a future admission bug can no longer run foreign bytecode on a live object. The receiver-resolved fire also matches what the engine's own touch path dispatches, so stock LumosTrigger behaviour is unchanged. v66.3 LUMOS-AS-P2 TEXTURE TRIGGER CRASH FIXED. (1) CRASH: casting Lumos (reported as Player 2 on a gargoyle in HP3_InsideHub) GPF'd inside UGameEngine::Draw with the crash history naming the receiver: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger). The per-level Lumos scan admitted ANY object whose full GetFullName string contained the token - the placed trigger actors, but also the UClass entries (Class hgame.LumosTrigger) and the spell's HUD asset Texture hgame.LumosTriggerIcon that the engine loads alongside Lumos. A cached Texture is a live UObject (cgLiveObject passes) and the Location/CollisionRadius reads at actor offsets land in the shared UObject allocator arena (IsBadReadPtr passes), so garbage floats could pass the proximity test and the mod ran pawn Trigger() bytecode with a Texture as 'this'. Scan membership is now decided by the CLASS TOKEN only (hp3lumos class-token helpers in src/lumos_sync.h, regression-tested in tests/lumos_sync_test.cpp with the exact crash names), look-alike rejections are counted and logged per scan, and - defense in depth against a cached pointer being recycled into a different object mid-level - the Trigger() fire site and the secret-wall collision writes re-verify the receiver's class through the calibrated UObject::Class chain (guarded dword reads only, no GetFullName) before running or writing anything; a proven impostor is skipped and logged once. (2) The same class-token rule now guards the GenericColObj/KWBlockingVolume wall cache, which previously also cached the class objects themselves and wrote actor collision bits into them. v66.2 STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES: (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1194,6 +1194,10 @@ static void *g_fnJump = NULL, *g_fnFire = NULL, *g_fnFireRel = NULL;
 static void *g_fnCast = NULL, *g_fnChoose = NULL, *g_fnStartCast = NULL;
 static void *g_fnStopCast = NULL, *g_fnCharFire = NULL, *g_fnCanCast = NULL;
 static void *g_fnTrigger = NULL, *g_fnPickup = NULL, *g_fnCanPickup = NULL;
+// v66.4: Engine.Actor.Trigger - the Trigger event EVERY actor's own chain
+// ends in. Universal fallback for the Lumos fire site when the receiver's
+// class chain is proven but declares no more-derived Trigger override.
+static void *g_fnActorTrigger = NULL;
 static void *g_fnUnPossess = NULL, *g_fnUnPossessAI = NULL, *g_fnPossessAI = NULL;
 static void *g_fnStopTrail = NULL, *g_fnIdleWander = NULL, *g_fnRandIdle = NULL;
 static void *g_fnStopTrailKW = NULL, *g_fnDropTrail = NULL;
@@ -1456,6 +1460,10 @@ static void resolveActions(void)
     g_fnCanCast   = findObjectByPath("hgame.HPCharacter.canCast");
     g_fnTrigger   = findObjectByPath("KWGame.KWPawn.Trigger");
     if (!g_fnTrigger) g_fnTrigger = findObjectByPath("Engine.Pawn.Trigger");
+    // v66.4: the base actor Trigger event (safe last resort for non-pawn
+    // receivers - KWPawn.Trigger may NEVER run on a non-pawn; see the
+    // LumosSparklesEmitter GPF fixed at the lumosTick fire site).
+    g_fnActorTrigger = findObjectByPath("Engine.Actor.Trigger");
     g_fnPickup    = findObjectByPath("KWGame.KWPawn.PickupActor");
     g_fnCanPickup = findObjectByPath("KWGame.KWPawn.CanDoPickupActor");
     g_fnUnPossess = findObjectByPath("Engine.Controller.UnPossess");
@@ -8633,6 +8641,13 @@ static void resolveLumosFields(void)
           g_offWand, g_offTheLumosLight, g_offLightType, g_offLightBrightness,
           g_offbCollideActors, (unsigned long)g_maskbCollideActors,
           g_offbHiddenLumos, (unsigned long)g_maskbHiddenLumos);
+    // v66.4: the family class anchor pointers the exact/chain membership
+    // proofs compare against - visible in the log so a hardware dump shows
+    // immediately whether subclass proofs were even possible this session.
+    logf_("[lumos] family classes: LumosTrigger=%p LumosSparklesTrigger=%p "
+          "GenericColObj=%p KWBlockingVolume=%p",
+          g_clsLumosTrigger, g_clsLumosSparklesTrigger,
+          g_clsGenericColObj, g_clsKWBlockingVolume);
 }
 
 static void *getPawnWand(void *pawn)
@@ -8740,6 +8755,12 @@ static int   g_lumosTriggersN = 0;
 static void *g_lumosWalls[LUMOS_MAX_ACTORS];     // GenericColObj / KWBlockingVolume
 static int   g_lumosWallsN = 0;
 static BOOL  g_lumosScanDone = FALSE;
+// v66.4: the first scan of a level can race the castgame class-chain
+// calibration (g_cgChainOK). Name-exact membership never needs the chain,
+// but chain-admission of differently-named SUBCLASSES does - so when the
+// scan ran chainless AND saw look-alike names it could not yet prove or
+// reject, lumosTick re-runs it exactly once as soon as the chain verifies.
+static BOOL  g_lumosRescanOnChain = FALSE;
 
 static void *g_lumosWand[8]  = {0};   // cached HPCharacter.Wand per player
 static void *g_lumosLight[8] = {0};   // cached LumosLight per player
@@ -8755,12 +8776,33 @@ static void lumosInvalidate(void)
     g_lumosTriggersN = 0;
     g_lumosWallsN = 0;
     g_lumosScanDone = FALSE;
+    g_lumosRescanOnChain = FALSE;
     memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));
     memset(g_lumosWallColl, -1, sizeof(g_lumosWallColl));
     for (int p = 0; p < 8; p++) {
         g_lumosWand[p] = NULL;
         g_lumosLight[p] = NULL;
     }
+}
+
+// v66.4 crash fix: subclass-inclusive family proof through the calibrated
+// UObject::Class -> UStruct::SuperField chain. Guarded dword reads and
+// known-class validation only (cgClassOf/cgSuper) - no GetFullName, no Outer
+// walk - so it is safe on a recycled pointer and cheap enough for the
+// once-per-level scan look-alikes and the edge-triggered fire/write checks.
+// This is the ONLY way a differently-named subclass of a wanted family class
+// (e.g. a custom LumosSparklesTrigger derivative) may join the caches now;
+// a name never can, because "LumosSparklesEmitter" is also just a name.
+static BOOL lumosChainProves(void *obj, BOOL wantWall)
+{
+    if (!g_cgChainOK) return FALSE;
+    void *refs[2];
+    refs[0] = wantWall ? g_clsGenericColObj    : g_clsLumosTrigger;
+    refs[1] = wantWall ? g_clsKWBlockingVolume : g_clsLumosSparklesTrigger;
+    if (!refs[0] && !refs[1]) return FALSE;
+    void *chain[32]; int nc = 0;
+    for (void *c = cgClassOf(obj); c && nc < 32; c = cgSuper(c)) chain[nc++] = c;
+    return hp3lumos::chainContainsAny(chain, nc, refs, 2) ? TRUE : FALSE;
 }
 
 // One full table scan, once per level. Only the class/name match is needed;
@@ -8775,45 +8817,68 @@ static void lumosScanActors(void)
         g_lumosScanDone = FALSE; return;
     }
     char name[160];
-    int impostorTrig = 0, impostorWall = 0;   // v66.3 rejected look-alikes
+    int impostorTrig = 0, impostorWall = 0;   // rejected look-alikes
+    int chainTrig = 0, chainWall = 0;         // v66.4 chain-admitted subclasses
     for (int k = 0; k < n; k++) {
         void *obj = g_objArray->Data[k];
         if (!obj || IsBadReadPtr(obj, 0x100)) continue;
         objName(obj, name, sizeof(name));
-        // v66.3 crash fix: only the object's CLASS token (the word before the
-        // first space) decides membership. The v66 whole-string substring
-        // match also admitted "Class hgame.LumosTrigger" and the HUD asset
-        // "Texture hgame.LumosTriggerIcon"; with Lumos active the trigger
-        // loop then ran KWGame.KWPawn.Trigger on that Texture - the P2-Lumos
-        // general protection fault (receiver named in the crash history).
-        BOOL isLumosTrigger = hp3lumos::isLumosTriggerObject(name);
-        BOOL isSecretWall   = hp3lumos::isSecretWallObject(name);
-        if (!isLumosTrigger &&
-            (strstr(name, "LumosSparklesTrigger") || strstr(name, "LumosTrigger") ||
-             strstr(name, "LumosSparkles")))
-            impostorTrig++;
-        if (!isSecretWall && (strstr(name, "GenericColObj") || strstr(name, "KWBlockingVolume")))
-            impostorWall++;
+        // v66.4 crash fix: membership is the EXACT class token (the word
+        // before the first space) and nothing else. v66 substring-matched the
+        // whole GetFullName string and v66.3 substring-matched WITHIN the
+        // class token; the admitted look-alikes were "Class hgame.LumosTrigger"
+        // and the HUD asset "Texture hgame.LumosTriggerIcon" (first P2-Lumos
+        // GPF), then the placed sparkles actor class "LumosSparklesEmitter"
+        // (the v66.3-runtime P2-Lumos GPF, receiver named verbatim in the
+        // crash history). Only the two stock trigger classes / two wall
+        // classes pass by name now. A look-alike name can additionally be a
+        // true SUBCLASS of one of them; that joins through the chain pointer
+        // proof only - a string can never prove derivation.
+        BOOL tokTrig = hp3lumos::isLumosTriggerObject(name);
+        BOOL tokWall = hp3lumos::isSecretWallObject(name);
+        BOOL lookTrig = strstr(name, "LumosSparklesTrigger") != NULL ||
+                        strstr(name, "LumosTrigger") != NULL ||
+                        strstr(name, "LumosSparkles") != NULL;
+        BOOL lookWall = strstr(name, "GenericColObj") != NULL ||
+                        strstr(name, "KWBlockingVolume") != NULL;
+        BOOL subTrig = FALSE, subWall = FALSE;
+        if (!tokTrig && lookTrig && lumosChainProves(obj, FALSE)) { subTrig = TRUE; chainTrig++; }
+        if (!tokWall && lookWall && lumosChainProves(obj, TRUE))  { subWall = TRUE; chainWall++; }
+        BOOL isLumosTrigger = tokTrig || subTrig;
+        BOOL isSecretWall   = tokWall || subWall;
+        if (!isLumosTrigger && lookTrig) impostorTrig++;
+        if (!isSecretWall && lookWall) impostorWall++;
         if (isLumosTrigger && g_lumosTriggersN < LUMOS_MAX_ACTORS)
             g_lumosTriggers[g_lumosTriggersN++] = obj;
         if (isSecretWall && g_lumosWallsN < LUMOS_MAX_ACTORS)
             g_lumosWalls[g_lumosWallsN++] = obj;
     }
     g_lumosScanDone = TRUE;
+    // Chainless scan with unproven look-alikes pending: ask lumosTick for
+    // one re-run once the class chain verifies, so subclass admission is not
+    // lost to an init-order race. (Exact-name membership never needs this.)
+    g_lumosRescanOnChain =
+        (!g_cgChainOK && (impostorTrig + chainTrig + impostorWall + chainWall) > 0)
+        ? TRUE : FALSE;
     logf_("[lumos] scan: %d triggers, %d walls cached; %d+%d name look-alikes "
-          "rejected (v66.3 class-token rule)", g_lumosTriggersN, g_lumosWallsN,
-          impostorTrig, impostorWall);
+          "rejected, %d+%d subclasses chain-admitted (v66.4 exact-family rule)",
+          g_lumosTriggersN, g_lumosWallsN, impostorTrig, impostorWall,
+          chainTrig, chainWall);
 }
 
-// v66.3 crash fix: re-verify a cached object's class at the moment the mod is
-// about to RUN CODE ON IT (Trigger) or write actor collision bits into it.
-// The class-token scan is exact for what it saw at scan time, but a cached
+// v66.3/v66.4 crash fix: re-verify a cached object's class at the moment the
+// mod is about to RUN CODE ON IT (Trigger) or write actor collision bits into
+// it. The scan cache is exact for what it saw at scan time, but a cached
 // pointer can be recycled into a DIFFERENT object by mid-level teardown (a
 // destroyed sparkles trigger whose pool address is reused). cgClassOf is a
 // pair of IsBadReadPtr-guarded dword reads - no GetFullName, no Outer walk -
 // so this stays safe and cheap on the fire path and on wall writes. When the
-// class chain was never verified the (already class-token-strict) scan result
+// class chain was never verified the (already exact-token-strict) scan result
 // stands, matching the pre-v66.3 trust level for code paths we cannot prove.
+// v66.4: the final family test is the exact class token OR the chain pointer
+// proof - the v66.3 substring on this token is what admitted the emitter
+// "LumosSparklesEmitter" through this very gate (it IS a live actor; it is
+// NOT a Lumos trigger), so substring matching is gone from every Lumos gate.
 static BOOL lumosClassVerified(void *obj, BOOL wantWall)
 {
     if (!obj || IsBadReadPtr(obj, 0x30)) return FALSE;
@@ -8822,8 +8887,10 @@ static BOOL lumosClassVerified(void *obj, BOOL wantWall)
     if (!cls) return FALSE;                  // recycled memory / not a UObject of known class
     CgClass *ci = cgClassInfo(cls);
     if (!ci || !ci->isActor) return FALSE;   // Texture/UClass/Function impostor - never run Trigger on it
-    return wantWall ? (hp3lumos::isSecretWallClassToken(ci->token) ? TRUE : FALSE)
-                    : (hp3lumos::isLumosTriggerClassToken(ci->token) ? TRUE : FALSE);
+    if (wantWall ? hp3lumos::isSecretWallClassToken(ci->token)
+                 : hp3lumos::isLumosTriggerClassToken(ci->token)) return TRUE;
+    // Differently-named subclass of a family class: provable only by chain.
+    return lumosChainProves(obj, wantWall);
 }
 
 // Cached, liveness-validated wand lookup. The wand is stable for a level; the
@@ -8892,6 +8959,13 @@ static void lumosTick(void)
     else if (g_lumosTriggersN > 0 && !cgLiveObject(g_lumosTriggers[0])) {
         lumosInvalidate(); lumosScanActors();
     } else if (g_lumosWallsN > 0 && !cgLiveObject(g_lumosWalls[0])) {
+        lumosInvalidate(); lumosScanActors();
+    }
+    // v66.4: a first scan that raced the castgame class-chain calibration
+    // could not prove or reject its name look-alikes - re-run it once now
+    // that the chain verifies (subclass admission only; exact members are
+    // unaffected either way).
+    if (g_lumosScanDone && g_lumosRescanOnChain && g_cgChainOK) {
         lumosInvalidate(); lumosScanActors();
     }
 
@@ -8998,16 +9072,38 @@ static void lumosTick(void)
         BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, tloc, rad, hgt);
         if (lumosActive && nearPlayer && !g_lumosTrigFired[k]) {
             g_lumosTrigFired[k] = TRUE;
-            // v66.3 crash fix: never hand KWGame.KWPawn.Trigger to an object
-            // that is not provably a Lumos trigger actor RIGHT NOW (the P2
-            // Lumos GPF ran it on "Texture hgame.LumosTriggerIcon").
-            if (g_fnTrigger) {
-                if (lumosClassVerified(obj, FALSE))
-                    callFn(obj, g_fnTrigger, "LumosTrigger.Trigger");
-                else
-                    logf_("  [lumos] v66.3 BLOCKED Trigger() on %p - cached entry "
-                          "is not a live Lumos trigger actor", obj);
+            // v66.3 crash fix: never hand Trigger() to an object that is not
+            // provably a Lumos trigger actor RIGHT NOW (the first P2 Lumos
+            // GPF ran it on "Texture hgame.LumosTriggerIcon").
+            // v66.4 crash fix: and never hand it a FUNCTION the receiver's
+            // own class chain does not declare. v66.x fired one globally
+            // resolved KWGame.KWPawn.Trigger on every cached entry - the
+            // second P2 Lumos GPF ran that pawn bytecode on the emitter
+            // "LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0"
+            // (receiver AND function are both named in the crash history).
+            // With the class chain verified we fire the most-derived Trigger
+            // declaration found in the RECEIVER's chain (CgClass::fnTrigger,
+            // already mapped by the castgame index), falling back to
+            // Engine.Actor.Trigger - the base event every actor owns. Only
+            // the small window before the chain verifies keeps the v66.3
+            // trust level (exact-name scan + g_fnTrigger); every other gate
+            // has already proven this object by then.
+            const char *why = NULL;
+            void *fireFn = NULL;
+            if (!lumosClassVerified(obj, FALSE)) {
+                why = "cached entry is not a live Lumos trigger actor";
+            } else if (g_cgChainOK) {
+                CgClass *ci = cgClassInfo(cgClassOf(obj));
+                fireFn = (ci && ci->fnTrigger) ? ci->fnTrigger : g_fnActorTrigger;
+                if (!fireFn) why = "receiver's class chain declares no Trigger";
+            } else {
+                fireFn = g_fnTrigger;
+                if (!fireFn) why = "no Trigger function resolved";
             }
+            if (fireFn)
+                callFn(obj, fireFn, "LumosTrigger.Trigger");
+            else
+                logf_("  [lumos] v66.4 BLOCKED Trigger() on %p - %s", obj, why);
         }
         if (!lumosActive) g_lumosTrigFired[k] = FALSE;
     }
@@ -9034,8 +9130,9 @@ static void lumosTick(void)
         }
         signed char want = wantCollide ? 1 : 0;
         if (g_lumosWallColl[k] == want && !(reassert && want == 0)) continue;
-        // v66.3 crash fix: same verification as the Trigger() fire site - do
-        // not write actor collision bits into a recycled-pointer impostor.
+        // v66.3/v66.4 crash fix: same verification as the Trigger() fire site
+        // (exact family token OR chain proof) - do not write actor collision
+        // bits into a recycled-pointer impostor.
         if (!lumosClassVerified(obj, TRUE)) {
             g_lumosWallColl[k] = -1;         // retry only if it ever re-verifies
             continue;

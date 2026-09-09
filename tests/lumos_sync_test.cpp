@@ -89,10 +89,9 @@ int main()
     // 9a. Placed level actors accept (class token == wanted family).
     assert(isLumosTriggerObject("LumosTrigger HP3_InsideHub.LumosTrigger3"));
     assert(isLumosTriggerObject("LumosSparklesTrigger HP3_InsideHub.LumosSparklesTrigger7"));
-    assert(isLumosTriggerObject("LumosSparkles HP3_InsideHub.LumosSparkles2"));
     assert(isLumosTriggerObject("LumosTrigger Save0.LumosTrigger0"));
     // 9b. Non-actor look-alikes carrying the token in their own name reject.
-    assert(!isLumosTriggerObject("Texture hgame.LumosTriggerIcon"));   // the GPF receiver
+    assert(!isLumosTriggerObject("Texture hgame.LumosTriggerIcon"));   // the 1st GPF receiver
     assert(!isLumosTriggerObject("Class hgame.LumosTrigger"));
     assert(!isLumosTriggerObject("Class hgame.LumosSparklesTrigger"));
     assert(!isLumosTriggerObject("Function hgame.LumosTrigger.PostTouch"));
@@ -109,9 +108,7 @@ int main()
     assert(!isSecretWallObject("Texture KWGame.Tex.GenericColObjSkin"));
     assert(!isSecretWallObject("Mover HP3_InsideHub.Mover16"));
     assert(!isSecretWallObject(0));
-    // 9d. Substring still works within the class token itself (subclasses).
-    assert(isLumosTriggerObject("LumosTriggerLarge MyLevel.LumosTriggerLarge0"));
-    // 9e. classTokenOf edge behaviour.
+    // 9d. classTokenOf edge behaviour.
     {
         char tok[64];
         classTokenOf("LumosTrigger HP3_InsideHub.LumosTrigger3", tok, sizeof(tok));
@@ -125,7 +122,82 @@ int main()
         assert(0 == std::strcmp(tiny, "Lumos"));   // truncated, no overflow, still terminated
     }
 
-    std::puts("lumos sync: state, timer, light, proximity, passability and "
-              "v66.3 class-token scan assertions passed");
+    // 10. v66.4 crash regression: the SECOND 2026-09-09 Player-2 Lumos GPF,
+    //    on the same HP3_InsideHub gargoyle with v66.3 running. Crash history:
+    //      UObject::ProcessEvent <- (LumosSparklesEmitter
+    //         HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger)
+    //    v66.3's substring WITHIN the class token admitted that emitter class
+    //    (token "LumosSparklesEmitter" contains "LumosSparkles"); the fire
+    //    loop then ran pawn bytecode with the emitter as 'this'. The name rule
+    //    is now EXACT equality - no substring survives anywhere near it.
+    // 10a. THE v66.4 GPF receiver, verbatim from the crash history, rejects.
+    assert(!isLumosTriggerObject("LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0"));
+    assert(!isLumosTriggerClassToken("LumosSparklesEmitter"));
+    // 10b. Every other within-token substring look-alike rejects too, even
+    //    names that v66.3 deliberately accepted: membership by name is closed
+    //    to the two proven stock classes; differently-named subclasses can
+    //    only re-enter through the class-chain pointer proof (dllmain.cpp
+    //    lumosChainProves), exercised via chainContainsAny below.
+    assert(!isLumosTriggerObject("LumosSparkles HP3_InsideHub.LumosSparkles2"));
+    assert(!isLumosTriggerObject("LumosTriggerLarge MyLevel.LumosTriggerLarge0"));
+    assert(!isLumosTriggerClassToken("LumosSparkles"));
+    assert(!isLumosTriggerClassToken("LumosTriggerLarge"));
+    assert(!isLumosTriggerObject("LumosLight HP3_InsideHub.LumosLight0"));
+    assert(!isLumosTriggerObject("LumosSparklesTriggerIcon hgame.Um"));
+    assert(!isLumosTriggerClassToken(""));
+    assert(!isLumosTriggerClassToken(0));
+    assert(!isLumosTriggerObject("Trigger HP3_InsideHub.Trigger5"));  // Engine.Trigger, not Lumos
+    assert(!isLumosTriggerObject("SpellCursor HP3_InsideHub.SpellCursor1"));
+    // 10c. The exact stock names still accept, case-insensitively.
+    assert(isLumosTriggerClassToken("LumosTrigger"));
+    assert(isLumosTriggerClassToken("LumosSparklesTrigger"));
+    assert(isLumosTriggerClassToken("lumostrigger"));
+    assert(isLumosTriggerClassToken("LUMOSSPARKLESTRIGGER"));
+    assert(isSecretWallClassToken("GenericColObj"));
+    assert(isSecretWallClassToken("kwblockingvolume"));
+    assert(!isSecretWallClassToken("GenericColObjIcon"));
+    assert(!isSecretWallClassToken(0));
+    // 10d. tokenEquals: strict ASCII, case-insensitive, no prefix matching.
+    assert(tokenEquals("LumosTrigger", "lumosTRIGGER"));
+    assert(!tokenEquals("LumosTrigger", "LumosTriggerX"));
+    assert(!tokenEquals("LumosTrigger", "LumosTrigge"));
+    assert(!tokenEquals("LumosTrigger", 0));
+    assert(!tokenEquals(0, "LumosTrigger"));
+    // 10e. chainContainsAny: the subclass admission primitive. Build fake
+    //    class chains (receiver class first, as cgClassOf/cgSuper produce
+    //    them) and fake family-ref tables; only true pointer equality joins.
+    {
+        char clsEmitter[8], clsLumosTrig[8], clsSparklesTrig[8], clsActor[8],
+             clsColObj[8], clsCustomSub[8], clsObject[8];
+        // Emitter chain: LumosSparklesEmitter -> ... -> Actor -> Object.
+        // Contains NO family class: the v66.4 receiver must not be provable.
+        void *emitterChain[] = { clsEmitter, clsActor, clsObject };
+        void *trigRefs[] = { clsLumosTrig, clsSparklesTrig };
+        assert(!chainContainsAny(emitterChain, 3, trigRefs, 2));
+        // Stock LumosSparklesTrigger chain: itself -> LumosTrigger-ish base ->
+        // Actor. Hits ref at position 0...
+        void *stockChain[] = { clsSparklesTrig, clsActor, clsObject };
+        assert(chainContainsAny(stockChain, 3, trigRefs, 2));
+        // ...and at a deep position: custom subclass of LumosTrigger.
+        void *subChain[] = { clsCustomSub, clsLumosTrig, clsActor, clsObject };
+        assert(chainContainsAny(subChain, 4, trigRefs, 2));
+        // Wall family proofs.
+        void *wallRefs[] = { clsColObj, 0 };   // second ref unresolved in-game
+        void *wallChain[] = { clsColObj, clsActor, clsObject };
+        assert(chainContainsAny(wallChain, 3, wallRefs, 2));
+        // Guard rails: NULL/empty inputs never match.
+        assert(!chainContainsAny(0, 3, trigRefs, 2));
+        assert(!chainContainsAny(stockChain, 3, 0, 2));
+        assert(!chainContainsAny(stockChain, 0, trigRefs, 2));
+        assert(!chainContainsAny(stockChain, 3, trigRefs, 0));
+        void *noRefs[] = { 0, 0 };
+        assert(!chainContainsAny(stockChain, 3, noRefs, 2));
+        void *nullChain[] = { 0, 0, 0 };
+        assert(!chainContainsAny(nullChain, 3, trigRefs, 2));
+    }
+
+    std::puts("lumos sync: state, timer, light, proximity, passability, "
+              "v66.3 class-token and v66.4 exact-family/chain-proof scan "
+              "assertions passed");
     return 0;
 }
