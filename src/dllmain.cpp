@@ -40,6 +40,8 @@
 #include "charged_cast.h"
 #include "coop_trio.h"
 #include "lumos_sync.h"
+#include "live_index.h"
+#include "stuck_pawn.h"
 
 // v66 Lumos replication state. Defined here, next to the header that declares
 // its type, because it is used by cgDeliverHit (the cast-game Lumos hit hook)
@@ -52,6 +54,12 @@ static hp3lumos::State g_lumosState;
 // drop them on level travel so cached wall/trigger/light pointers never
 // outlive the level that owned them.
 static void lumosInvalidate(void);
+
+// v66.2 forward decls: the stuck-pawn escalation state is defined down by
+// driveePawn, but invalidateLevelCaches (level travel) has to reset it and
+// appears first in this file.
+namespace hp3stuck { struct State; }
+static hp3stuck::State g_stuckState[8];
 
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
@@ -155,8 +163,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v66.1"
-#define MOD_STAMP "build v66.1 - 2026-09-09 - SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66.2"
+#define MOD_STAMP "build v66.2 - 2026-09-09 - STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES. (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -501,17 +509,52 @@ static const char *objShortName(void *o, char *out, int cch)
 // an exact is-this-object-still-alive answer. Used on CACHED pointers and on
 // object references read out of live actors; freshly table-scanned objects
 // are live by construction and skip this check.
+// v66.2 PERF: this used to walk the whole table (plus an IsBadReadPtr over all
+// of it) on EVERY call. It is called from getPawn, cgWatchP1, the aim FX, the
+// cooperative bridge and - since v66 - once per cached Lumos trigger and once
+// per cached secret wall, every rendered frame. In HP3_InsideHub the table
+// holds 8820 objects, so a single split-ON frame paid dozens of full walks.
+// The answer is now served from a hash snapshot rebuilt at most once per
+// kLiveRefreshMs, which keeps v57's exact semantics (only live UObjects are
+// ever reported live) at O(1) per query.
+#define kLiveRefreshMs 16u
+static hp3live::Index g_liveIdx;
+
 static BOOL cgLiveObject(void *o)
 {
     if (!o || !g_objArray) return FALSE;
     int n = g_objArray->Num;
     if (n <= 0 || n > 400000) return FALSE;
-    if (IsBadReadPtr(g_objArray->Data, 4 * (DWORD)n)) return FALSE;
     void **data = g_objArray->Data;
+
+    // A table too big for the snapshot's 50% load cap can never become exact,
+    // so it would never become fresh either - every query would rebuild (and
+    // rebuild starts by clearing all kSlots entries) and then fall through to
+    // the linear walk anyway. That is strictly worse than not having an index,
+    // so oversized tables bypass it entirely. HP3_InsideHub peaks at 8820
+    // objects against a cap of 16384, so this is headroom, not the norm.
+    if (n > hp3live::kMaxEntries) {
+        if (IsBadReadPtr(data, 4 * (DWORD)n)) return FALSE;
+        for (int i = 0; i < n; i++)
+            if (data[i] == o) return TRUE;
+        return FALSE;
+    }
+
+    DWORD now = GetTickCount();
+    if (!g_liveIdx.fresh(data, n, now, kLiveRefreshMs)) {
+        if (IsBadReadPtr(data, 4 * (DWORD)n)) return FALSE;
+        g_liveIdx.build(data, n, now);
+    }
+    if (g_liveIdx.exact) return g_liveIdx.contains(o) ? TRUE : FALSE;
+    // Snapshot could not be built: fall back to the exact walk.
     for (int i = 0; i < n; i++)
         if (data[i] == o) return TRUE;
     return FALSE;
 }
+
+// Drop the snapshot so the next query rebuilds from the current table. Called
+// on level travel, where the v57 crash actually happened.
+static void cgLiveInvalidate(void) { g_liveIdx.reset(); }
 
 // True for UnrealScript reflection/metadata objects we never care about.
 static BOOL isReflection(const char *full)
@@ -587,14 +630,21 @@ static BOOL actorInCurrentLevel(void *o) {
     // liveness result is memoised per camera pointer because this helper is
     // on the candidate-scan hot path (thousands of calls per scan).
     static void *sCam = NULL; static DWORD sCamAt = 0; static BOOL sCamOK = FALSE;
+    static char  sCamName[256] = "";
     DWORD nowCam = GetTickCount();
     if (g_camActor != sCam || !sCamOK || !sCamAt ||
         (DWORD)(nowCam - sCamAt) > 250u) {
         sCam = g_camActor; sCamAt = nowCam; sCamOK = cgLiveObject(g_camActor);
+        // v66.2 PERF: the camera's full name was re-derived on EVERY call, and
+        // this helper is on the candidate-scan hot path (thousands of calls per
+        // scan) as well as the per-frame getPawn/cgWatchP1 path. It only
+        // changes when the camera does, so memoise it with the liveness.
+        sCamName[0] = 0;
+        if (sCamOK) objName(g_camActor, sCamName, sizeof(sCamName));
     }
-    if (!sCamOK) return FALSE;
-    char a[256], c[256]; objName(o,a,sizeof(a)); objName(g_camActor,c,sizeof(c));
-    return hp3aim::samePackage(a,c);
+    if (!sCamOK || !sCamName[0]) return FALSE;
+    char a[256]; objName(o,a,sizeof(a));
+    return hp3aim::samePackage(a,sCamName);
 }
 static float g_aimViewLoc[8][3];
 static int g_aimViewRot[8][3];
@@ -721,6 +771,28 @@ static BOOL nativeSetPhysics(void *pawn, BYTE physics)
     return TRUE; // invocation succeeded; the caller must VERIFY the contact
 }
 
+// Engine.Actor.SetLocation, driven the same way as the other natives (a VEC
+// token in the frame, not a parms block). Returns the native's own bool: FALSE
+// means the engine refused the move because the destination encroaches, which
+// is exactly the verdict the unstick ladder needs.
+static PFN_execActorFn g_execSetLocation = NULL;
+static BOOL nativeSetLocation(void *actor, const float at[3])
+{
+    if (!actor || !g_opsOK || !g_execSetLocation) return FALSE;
+    BYTE bc[16]; int p = 0;
+    bc[p++] = (BYTE)g_ops[OP_VEC].op;
+    *(float *)(bc+p) = at[0]; p += 4;
+    *(float *)(bc+p) = at[1]; p += 4;
+    *(float *)(bc+p) = at[2]; p += 4;
+    bc[p++] = (BYTE)g_ops[OP_END].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;   // guard
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = actor; st.Code = bc;
+    DWORD result = 0;
+    g_execSetLocation(actor, NULL, &st, &result);
+    return result != 0;
+}
+
 static void *spawnFX(void *actor, void *cls, void *owner,
                      const float loc[3], const int rot[3])
 {
@@ -753,6 +825,7 @@ static BOOL destroyActorFX(void *fx)
     st.Object = fx; st.Code = bc;
     DWORD result = 0;
     g_execDestroy(fx, NULL, &st, &result);
+    if (result) cgLiveInvalidate();   // v66.2: never report a freed actor live
     return result != 0;
 }
 
@@ -2271,12 +2344,19 @@ static void cgScanCandidates(void *self, BOOL force)
     char buf[300];
     for (int j = 0; j < n && g_cgNCand < CG_MAX_CAND; j++) {
         void *o = g_objArray->Data[j];
-        if (!o || o == self || IsBadReadPtr(o, 0x100) || cgIsPlayerPawn(o) || !actorInCurrentLevel(o)) continue;
-        objName(o, buf, sizeof(buf));
-        if (isReflection(buf)) continue;
-        const char *sp = strchr(buf, ' ');
-        if (!sp || !strchr(sp + 1, '.')) continue;
-        examined++;
+        if (!o || o == self || IsBadReadPtr(o, 0x100) || cgIsPlayerPawn(o)) continue;
+
+        // v66.2 PERF: the class filter now runs BEFORE anything that needs the
+        // object's name. cgClassInfo() is memoised per UClass, so for the
+        // handful of distinct classes in a level it is a lookup; the two
+        // filters it was moved ahead of each build the object's FULL NAME
+        // through UObject::GetFullName (a walk of the whole Outer chain plus a
+        // wide-to-narrow conversion per link). Field log for HP3_InsideHub:
+        // 8820 objects, of which only 4720 have a usable actor class, and the
+        // old order still paid GetFullName for all 8820 - twice over, since
+        // actorInCurrentLevel() named the camera as well. Reordering cuts the
+        // GetFullName count of one scan by roughly 3x, and every name we do
+        // build now belongs to an object that can actually become a candidate.
         int kind = CGC_NONE; void *spellCls = NULL; CgClass *info = NULL;
         if (g_cgChainOK) {
             void *cls = cgClassOf(o);
@@ -2288,6 +2368,15 @@ static void cgScanCandidates(void *self, BOOL force)
             for (int t = 0; t < 8 && kCharClass[t]; t++)
                 if (!_stricmp(info->token, kCharClass[t])) { trio = TRUE; break; }
             if (trio || ciHas(info->token, "Cursor") || ciHas(info->token, "Emitter")) continue;
+        }
+
+        if (!actorInCurrentLevel(o)) continue;
+        objName(o, buf, sizeof(buf));
+        if (isReflection(buf)) continue;
+        const char *sp = strchr(buf, ' ');
+        if (!sp || !strchr(sp + 1, '.')) continue;
+        examined++;
+        if (g_cgChainOK) {
             if (IsBadReadPtr(o, F.Location + 12) || cgDeleted(o)) continue;
             if (info->vulnOff > 0 && !IsBadReadPtr((BYTE *)o + info->vulnOff, 4)) {
                 void *v = *(void **)((BYTE *)o + info->vulnOff);
@@ -7316,11 +7405,13 @@ static void invalidateLevelCaches(const char *reason)
         g_suppressLandUntil[k] = g_hopkillT0[k] = 0;
         g_lastAirAt[k] = g_lastMoveAt[k] = 0;
         g_holdWalkUntil[k] = 0; g_holdArmed[k] = g_holdResync[k] = FALSE;
+        g_stuckState[k] = hp3stuck::State();   // v66.2: full ladder next level
     }
     nativeAimResetBindings();
     g_nAimFXFr=0; memset(g_texAimFXFr,0,sizeof(g_texAimFXFr));
     g_fnResolved = FALSE;      // UFunctions live in packages too
     g_defaultSpell = NULL;
+    cgLiveInvalidate();        // v66.2: the object table itself is changing
     g_lumosState.deactivate();
     lumosInvalidate();         // v66.1: drop cached lumos walls/triggers/lights
     cgResetLevel();            // v51: class index / candidates / pending hits
@@ -7808,6 +7899,15 @@ static BYTE  g_lastPhys[8] = {0};
 static BOOL  g_yawInit[8]  = {0};
 static DWORD g_lastTick[8] = {0};
 
+// v66.2 STUCK PAWN: per-player escalation state and the tunable ladder. The
+// policy itself (what counts as wedged, how far the ladder may go) lives in
+// src/stuck_pawn.h and is covered by tests/stuck_pawn_test.cpp; this is only
+// the storage plus the ini overrides.
+static hp3stuck::Config g_stuckCfg;
+// [recovery] Unstick=0 turns the whole ladder off (v66.1 had no off switch for
+// its physrecover poke; it was unconditional).
+static BOOL g_cfgNoUnstick = FALSE;
+
 static void driveePawn(int i, void *pawn)
 {
     if (!F.ok || !pawn || IsBadReadPtr(pawn, 0x500)) return;
@@ -8058,38 +8158,139 @@ static void driveePawn(int i, void *pawn)
 
     float *pl = (F.Location > 0) ? (float *)((BYTE *)pawn + F.Location) : NULL;
 
-    // v66.1: a driven companion can be left stranded in PHYS_Falling with no
-    // real falling motion (the Hogwarts door transition parks the pawn in the
-    // air while the engine's gravity never runs: Z stays flat, vz stays 0).
-    // Once vertical motion has been flat for a grace window, hand the engine
-    // PHYS_Walking back through the native so it re-acquires its Base/Floor.
-    // A genuine jump or ledge fall always moves Z or has g_jumpStanding /
-    // g_jumpPh set, so it can never trip this.
+    // v66.2 STUCK PAWN: hp3stuck owns the whole escalation. The v66.1 version
+    // of this block only flipped the physics bit, and its guard demanded
+    // g_jumpPh[i]==0, so a stranded pawn holding the standing-jump latch never
+    // even ran it - and when it did run, the level reverted Falling on the next
+    // tick. The field log for HP3_InsideHub shows the result: 15 identical
+    // "stranded Falling->Walking" lines over 20s at loc=(1004 1050 Z=137)
+    // vz=0 phys=2, with Harry 119 units away. The policy header now proves the
+    // wedge, clears the latch, and only then escalates to a verified teleport,
+    // all with hard caps (tests/stuck_pawn_test.cpp block 3 replays that
+    // signature end to end).
+    if (!g_cfgNoUnstick)
     {
-        static DWORD sStrandAt[8] = {0};
-        static float sStrandZ[8]  = {0.0f};
-        BYTE phRc = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 0;
-        float vzRc = (F.Velocity > 0 && !IsBadReadPtr(pawn, F.Velocity + 12))
-                   ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
-        BOOL stranded = (phRc == 2) && (g_jumpPh[i] == 0) &&
-                        !g_jumpStanding[i] &&
-                        (vzRc > -60.0f && vzRc < 60.0f) && (pl != NULL);
-        if (stranded) {
-            if (!sStrandAt[i]) {
-                sStrandAt[i] = now; sStrandZ[i] = pl[2];
-            } else if (fabsf(pl[2] - sStrandZ[i]) > 8.0f) {
-                // actually moving vertically (a real fall): not stranded
-                sStrandAt[i] = now; sStrandZ[i] = pl[2];
-            } else if (now - sStrandAt[i] >= 600) {
-                sStrandAt[i] = 0;
-                if (nativeSetPhysics(pawn, 1)) {
-                    if (g_FindBase) g_FindBase(pawn, NULL);
-                    logf_("  [physrecover] p%d stranded Falling->Walking "
-                          "(vz=%.0f Z=%.0f)", i, vzRc, pl[2]);
-                }
+        // Sample's constructor already zero-initialises every field, so there
+        // is no memset here: it has a user-provided constructor, and clearing
+        // it through memset would be both redundant and ill-formed.
+        hp3stuck::Sample sp;
+        sp.valid    = (pl != NULL);
+        sp.physics  = (F.Physics > 0) ? (int)*((BYTE *)pawn + F.Physics) : 0;
+        sp.vz       = (F.Velocity > 0 && !IsBadReadPtr(pawn, F.Velocity + 12))
+                    ? ((float *)((BYTE *)pawn + F.Velocity))[2] : 0.0f;
+        if (pl) memcpy(sp.location, pl, 12);
+        sp.jumpLatched = (g_jumpPh[i] != 0 || g_jumpStanding[i]) != 0;
+
+        // A rescue target. driveePawn() is only ever called for i > 0 - the
+        // driven companion - and the character it trails is player 0's pawn
+        // (field log: "player 1 -> Hermione", lead "harry" at dLead=119).
+        sp.haveLead = false;
+        if (i > 0) {
+            void *leadP = getPawn(0);
+            if (leadP && F.Location > 0 &&
+                !IsBadReadPtr((BYTE *)leadP + F.Location, 12)) {
+                float lp[3]; memcpy(lp, (BYTE *)leadP + F.Location, 12);
+                float dx = sp.location[0] - lp[0];
+                float dy = sp.location[1] - lp[1];
+                float dz = sp.location[2] - lp[2];
+                sp.haveLead = true;
+                sp.leadDist = sqrtf(dx * dx + dy * dy + dz * dz);
+                memcpy(sp.leadPos, lp, 12);
             }
-        } else {
-            sStrandAt[i] = 0;
+        }
+
+        hp3stuck::Action act = hp3stuck::step(g_stuckState[i], sp, g_stuckCfg, now);
+        // One log line per action. The policy already rate-limits the ladder
+        // to one step per wedge window, but ClearJumpLatch could in principle
+        // re-fire every frame if the game keeps re-latching the jump while the
+        // player holds the button, so the latch line is throttled too.
+        static DWORD sUnstickLog[8] = {0};
+        if (act != hp3stuck::None && (DWORD)(now - sUnstickLog[i]) < 250u)
+            act = hp3stuck::None;
+        else if (act != hp3stuck::None)
+            sUnstickLog[i] = now;
+
+        switch (act) {
+        case hp3stuck::ClearJumpLatch: {
+            // v66.1 deadlocked here: the standing-jump lock only released when
+            // PHYS != Falling, and PHYS only left Falling when the lock
+            // released. Break it unconditionally - the pawn is not flying.
+            g_jumpPh[i] = 0;
+            g_jumpStanding[i] = FALSE;
+            g_jumpLockUntil[i] = 0;
+            // ...and put back what the jump pinned, exactly as the standing-
+            // jump lock does when it releases normally. Both are 3-component.
+            if (F.DesiredRotation > 0) {
+                int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
+                dr[0] = g_savedDesRot[i][0];
+                dr[1] = g_savedDesRot[i][1];
+                dr[2] = g_savedDesRot[i][2];
+            }
+            if (F.RotationRate > 0) {
+                int *rr = (int *)((BYTE *)pawn + F.RotationRate);
+                rr[0] = g_savedRotRate[i][0];
+                rr[1] = g_savedRotRate[i][1];
+                rr[2] = g_savedRotRate[i][2];
+            }
+            // ...and keep the v66.1 physrecover poke, now that it can fire.
+            if (nativeSetPhysics(pawn, 1)) {
+                if (g_FindBase) g_FindBase(pawn, NULL);
+                logf_("  [unstick] p%d %s: latch cleared "
+                      "loc=(%.0f %.0f %.0f) vz=%.0f phys=%d",
+                      i, hp3stuck::actionName(hp3stuck::ClearJumpLatch),
+                      sp.location[0], sp.location[1], sp.location[2],
+                      sp.vz, sp.physics);
+            }
+            break;
+        }
+        case hp3stuck::Lift: {
+            // A physics bit flip is not enough: the level geometry keeps the
+            // pawn in Falling. Move it, and let SetLocation's own encroachment
+            // test be the verdict - never force a state the engine refused.
+            float dst[3] = { sp.location[0], sp.location[1],
+                             sp.location[2] + g_stuckCfg.liftHeight };
+            BOOL moved = nativeSetLocation(pawn, dst);
+            if (moved) {
+                nativeSetPhysics(pawn, 1);
+                if (g_FindBase) g_FindBase(pawn, NULL);
+            }
+            logf_("  [unstick] p%d lift %d/%d z+%.0f %s "
+                  "loc=(%.0f %.0f %.0f) vz=%.0f phys=%d",
+                  i, g_stuckState[i].lifts, hp3stuck::kMaxLifts,
+                  g_stuckCfg.liftHeight, moved ? "accepted" : "REFUSED",
+                  sp.location[0], sp.location[1], sp.location[2],
+                  sp.vz, sp.physics);
+            break;
+        }
+        case hp3stuck::Rescue: {
+            // Still stuck after the ladder: put the driven pawn back beside the
+            // player it is following. This is the same thing the trailing logic
+            // already does for a companion left behind, only immediate.
+            float dst[3] = { sp.leadPos[0], sp.leadPos[1], sp.leadPos[2] + 40.0f };
+            BOOL moved = nativeSetLocation(pawn, dst);
+            if (moved) {
+                nativeSetPhysics(pawn, 1);
+                if (g_FindBase) g_FindBase(pawn, NULL);
+            }
+            logf_("  [unstick] p%d RESCUE %d/%d to lead at (%.0f %.0f %.0f) "
+                  "d=%.0f %s",
+                  i, g_stuckState[i].rescues, g_stuckCfg.maxRescues,
+                  sp.leadPos[0], sp.leadPos[1], sp.leadPos[2], sp.leadDist,
+                  moved ? "accepted" : "REFUSED");
+            break;
+        }
+        case hp3stuck::GiveUp: {
+            logf_("  [unstick] p%d GIVE UP after %d lift(s) + %d rescue(s) "
+                  "at (%.0f %.0f %.0f) - backing off %ums "
+                  "([recovery] Unstick=0 disables this repair)",
+                  i, g_stuckState[i].lifts, g_stuckState[i].rescues,
+                  sp.location[0], sp.location[1], sp.location[2],
+                  g_stuckCfg.cooldownMs);
+            break;
+        }
+        case hp3stuck::None:
+        default:
+            break;
         }
     }
 
@@ -8463,10 +8664,17 @@ static void *getWandLumosLight(void *wand, void *pawn)
     }
     if (g_objArray && g_objArray->Data) {
         int n = g_objArray->Num;
+        // v66.2 PERF: this ran UObject::GetFullName over EVERY object in the
+        // table. In HP3_InsideHub that is 8820 GetFullName calls, and because
+        // Wand.TheLumosLight never resolved (field log: +0xFFFFFFFF) the cheap
+        // read above never short-circuits it, so it re-ran every second, per
+        // player, for the whole level. "LumosLight" is the object's own name,
+        // so GetName is enough for the substring test and skips building the
+        // whole outer chain.
         for (int k = 0; k < n && n <= 400000; k++) {
             void *o = g_objArray->Data[k];
             if (!o || IsBadReadPtr(o, 0x100)) continue;
-            char nb[128]; objName(o, nb, sizeof(nb));
+            char nb[128]; objShortName(o, nb, sizeof(nb));
             if (strstr(nb, "LumosLight")) {
                 if (wand && F.Base > 0 && *(void **)((BYTE *)o + F.Base) == wand) return o;
                 if (pawn && F.Base > 0 && *(void **)((BYTE *)o + F.Base) == pawn) return o;
@@ -8536,6 +8744,11 @@ static BOOL  g_lumosScanDone = FALSE;
 static void *g_lumosWand[8]  = {0};   // cached HPCharacter.Wand per player
 static void *g_lumosLight[8] = {0};   // cached LumosLight per player
 static BOOL  g_lumosTrigFired[LUMOS_MAX_ACTORS]; // edge-trigger guard per trigger
+// v66.2 PERF: what we last wrote to each secret wall's collision bits.
+// -1 = unknown (must write), 0 = passable, 1 = blocking. Without this the wall
+// loop rewrote both bitfields on every cached wall every frame, forever, even
+// while Lumos was off and the bits were already correct.
+static signed char g_lumosWallColl[LUMOS_MAX_ACTORS];
 
 static void lumosInvalidate(void)
 {
@@ -8543,6 +8756,7 @@ static void lumosInvalidate(void)
     g_lumosWallsN = 0;
     g_lumosScanDone = FALSE;
     memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));
+    memset(g_lumosWallColl, -1, sizeof(g_lumosWallColl));
     for (int p = 0; p < 8; p++) {
         g_lumosWand[p] = NULL;
         g_lumosLight[p] = NULL;
@@ -8647,9 +8861,16 @@ static void lumosTick(void)
         lumosInvalidate(); lumosScanActors();
     }
 
+    // v66.2 PERF: getPawn() was called four separate times per player per
+    // frame (light detection, replication, hiding, positions). It is not free:
+    // on a cache miss it does a GetFullName name compare or a
+    // findActorByClass walk. Resolve each player's pawn once per frame.
+    void *pw[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+    for (int p = 0; p < numP; p++) pw[p] = getPawn(p);
+
     // Scan for any active LumosLight (wand/light pointers are cached now).
     for (int p = 0; p < numP; p++) {
-        void *pawn = getPawn(p);
+        void *pawn = pw[p];
         if (!pawn) continue;
         void *light = lumosLightOf(p, pawn);
         if (light && !isLumosActorHidden(light)) {
@@ -8671,7 +8892,7 @@ static void lumosTick(void)
 
     if (lumosActive) {
         for (int p = 0; p < numP; p++) {
-            void *pawn = getPawn(p);
+            void *pawn = pw[p];
             if (!pawn) continue;
             void *light = lumosLightOf(p, pawn);
             if (light) {
@@ -8688,7 +8909,7 @@ static void lumosTick(void)
         }
     } else {
         for (int p = 1; p < numP; p++) {
-            void *pawn = getPawn(p);
+            void *pawn = pw[p];
             if (!pawn) continue;
             void *light = lumosLightOf(p, pawn);
             if (light && !isLumosActorHidden(light)) {
@@ -8699,10 +8920,23 @@ static void lumosTick(void)
         }
     }
 
+    // v66.2 PERF: with Lumos off, the only reason to look at the trigger and
+    // wall caches at all is to undo something we did while it was on. Both
+    // caches are edge-managed below, so "nothing left to undo" is knowable and
+    // the whole section - including a per-trigger and per-wall liveness probe
+    // and proximity test - is skipped for the rest of the level.
+    BOOL wallsDirty = FALSE;
+    for (int k = 0; k < g_lumosWallsN; k++)
+        if (g_lumosWallColl[k] == 0) { wallsDirty = TRUE; break; }
+    BOOL triggersDirty = FALSE;
+    for (int k = 0; k < g_lumosTriggersN; k++)
+        if (g_lumosTrigFired[k]) { triggersDirty = TRUE; break; }
+    if (!lumosActive && !wallsDirty && !triggersDirty) return;
+
     float playerPos[8][3];
     int validPlayers = 0;
     for (int p = 0; p < numP; p++) {
-        void *pawn = getPawn(p);
+        void *pawn = pw[p];
         if (pawn && F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
             memcpy(playerPos[validPlayers], (BYTE *)pawn + F.Location, 12);
             validPlayers++;
@@ -8736,17 +8970,30 @@ static void lumosTick(void)
         if (!lumosActive) g_lumosTrigFired[k] = FALSE;
     }
 
+    // v66.2: write the collision bits only when the wanted state differs from
+    // what we last applied, and re-assert on a 250ms cadence while Lumos is
+    // on so the game cannot quietly hand a secret wall back to us mid-spell.
+    // (v66.1 re-asserted every frame for every wall, in both states.)
+    static DWORD sWallAssertAt = 0;
+    BOOL reassert = lumosActive && (DWORD)(now - sWallAssertAt) >= 250u;
+    if (reassert) sWallAssertAt = now;
     for (int k = 0; k < g_lumosWallsN; k++) {
         void *obj = g_lumosWalls[k];
         if (!cgLiveObject(obj) || F.Location <= 0 ||
-            IsBadReadPtr((BYTE *)obj + F.Location, 12)) continue;
-        float *wloc = (float *)((BYTE *)obj + F.Location);
-        BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, wloc, 300.0f, 150.0f);
-        if (lumosActive && nearPlayer) {
-            setLumosActorCollision(obj, FALSE);
-        } else if (!lumosActive) {
-            setLumosActorCollision(obj, TRUE);
+            IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
+            g_lumosWallColl[k] = -1;   // unverifiable: force a rewrite next time
+            continue;
         }
+        BOOL wantCollide = TRUE;
+        if (lumosActive) {
+            float *wloc = (float *)((BYTE *)obj + F.Location);
+            wantCollide = !hp3lumos::anyPlayerNearTrigger(
+                playerPos, validPlayers, wloc, 300.0f, 150.0f);
+        }
+        signed char want = wantCollide ? 1 : 0;
+        if (g_lumosWallColl[k] == want && !(reassert && want == 0)) continue;
+        setLumosActorCollision(obj, wantCollide);
+        g_lumosWallColl[k] = want;
     }
 }
 
@@ -9456,6 +9703,11 @@ static DWORD WINAPI initThread(LPVOID)
         g_engine, "?FindBase@AActor@@QAEXXZ"));
     logf_("execSetPhysics = %p  FindBase = %p (v49 floor handoff)",
           (void *)g_execSetPhysics, (void *)g_FindBase);
+    // v66.2: the unstick ladder needs a real teleport, not just a physics poke.
+    g_execSetLocation = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?execSetLocation@AActor@@QAEXAAUFFrame@@QAX@Z"));
+    logf_("execSetLocation = %p (v66.2 unstick ladder)",
+          (void *)g_execSetLocation);
     g_execDrawPortal = (PFN_execDrawPortal)
         resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_DRAWPORT));
     logf_("execDrawPortal = %p", (void *)g_execDrawPortal);
@@ -9616,6 +9868,23 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         logf_("hp3mod.ini: camera dist=%.0f height=%.0f pitch=%d collision=%d aimedcast=%d castgameplay=%d",
               g_camDist, g_camHeight, g_camPitch, g_camCollide, g_aimedCast,
               g_castGameplay);
+
+        // v66.2 [recovery]: the stuck-pawn ladder. Defaults match the numbers
+        // that clear the HP3_InsideHub wedge in tests/stuck_pawn_test.cpp.
+        g_cfgNoUnstick = GetPrivateProfileIntA("recovery", "Unstick", 1, ini) == 0;
+        g_stuckCfg = hp3stuck::Config();
+        g_stuckCfg.wedgeMs        = (DWORD)GetPrivateProfileIntA("recovery", "WedgeMs",      (int)g_stuckCfg.wedgeMs, ini);
+        g_stuckCfg.liftHeight     = (float)GetPrivateProfileIntA("recovery", "LiftHeight",   (int)g_stuckCfg.liftHeight, ini);
+        g_stuckCfg.moveEps        = (float)GetPrivateProfileIntA("recovery", "MoveEps",      (int)g_stuckCfg.moveEps, ini);
+        g_stuckCfg.maxRescues     = (unsigned)GetPrivateProfileIntA("recovery", "MaxRescues", (int)g_stuckCfg.maxRescues, ini);
+        g_stuckCfg.rescueMaxDist  = (float)GetPrivateProfileIntA("recovery", "RescueMaxDist", (int)g_stuckCfg.rescueMaxDist, ini);
+        g_stuckCfg.cooldownMs     = (DWORD)GetPrivateProfileIntA("recovery", "CooldownMs",   (int)g_stuckCfg.cooldownMs, ini);
+        g_stuckCfg.jumpMaxFlightMs = (DWORD)GetPrivateProfileIntA("recovery", "JumpMaxFlightMs", (int)g_stuckCfg.jumpMaxFlightMs, ini);
+        logf_("hp3mod.ini: recovery unstick=%d wedge=%ums moveeps=%.0f lift=%.0fx%d rescue=%.0fx%d cd=%ums jumpflight=%ums",
+              g_cfgNoUnstick ? 0 : 1, g_stuckCfg.wedgeMs, g_stuckCfg.moveEps,
+              g_stuckCfg.liftHeight, hp3stuck::kMaxLifts,
+              g_stuckCfg.rescueMaxDist, g_stuckCfg.maxRescues,
+              g_stuckCfg.cooldownMs, g_stuckCfg.jumpMaxFlightMs);
 
         char sys[MAX_PATH];
         GetSystemDirectoryA(sys, MAX_PATH); strcat(sys, "\\d3d8.dll");

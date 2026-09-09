@@ -798,3 +798,42 @@ TROUBLESHOOTING
   The game will not start
       Delete d3d8.dll to confirm the mod is the cause, then send hp3mod.log.
   Set [debug] Log=0 in hp3mod.ini once everything works.
+
+
+===========================================================================
+  [recovery]  A COMPANION THAT STOPS MOVING (v66.2)
+===========================================================================
+
+  What it fixes
+      Entering Hogwarts through the door, a driven companion (Hermione or
+      Ron) can be left parked in the doorway: the transition puts it in
+      PHYS_Falling but nothing ever falls, so it sits at a fixed height with
+      zero vertical velocity. If you jumped while that was happening, the
+      standing-jump state stayed latched, which refused every later jump as
+      "airborne" and also disabled the repair itself.
+
+      v66.2 clears the leaked jump latch, then escalates: lift the companion
+      a little at a time, then put it back beside the character it follows,
+      then back off. hp3mod.log reports each step, e.g.
+
+          [unstick] p1 clear-jump-latch: latch cleared loc=(1004 1050 137)
+          [unstick] p1 lift 1/3 z+48 accepted loc=(1004 1050 137)
+          [unstick] p1 RESCUE 1/2 to lead at (...) d=119 accepted
+
+      "REFUSED" means the engine would not accept the move because the
+      destination was inside geometry; that is expected sometimes and is why
+      the ladder has more than one step.
+
+  Unstick=1        1 = repair a stuck companion (default). 0 = never.
+  WedgeMs=900      How long with no measurable movement, while "falling"
+                   but not really falling, counts as stuck.
+  MoveEps=4        Smallest movement that counts as progress, in units.
+  LiftHeight=48    How far each lift attempt raises the companion.
+  MaxRescues=2     Re-seats beside the lead character before backing off.
+  RescueMaxDist=2500  Never re-seat further than this from the lead.
+  CooldownMs=4000  Back-off after the ladder is exhausted.
+  JumpMaxFlightMs=2500  How long a real jump may stay airborne before its
+                   latch is treated as leaked.
+
+  If a companion is moved when it should not be, send hp3mod.log - the
+  [unstick] lines say exactly what the ladder decided and when.
