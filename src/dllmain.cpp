@@ -140,8 +140,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v56"
-#define MOD_STAMP "build v57 - 2026-09-09 - v57 ANY-HOLD TRIO + LEVEL-TRAVEL GPF FIX: the three-character cooperative hold now arms after ANY single character - Player 1's engine cursor lock OR a Player-2/Player-3 held cast - has kept the SAME game-verified cast target (the game's own vulnerableToClass/spell-handler targeting metadata, or the stock cursor lock) for more than 10 seconds; the behaviour-certification gate that never fired on hardware is no longer required to enter the shared hold (it only enriches discovery of metadata-less cooperative actors). Heroes the game itself already recruited on that target are borrowed untouched; the stock P1 SpellCursor.LockOn bridge is best-effort (a missing or refused ABI no longer cancels the trio borrow). Target flicker up to 250 ms no longer resets any holder's dwell. CRASH FIX for entering Hogwarts / any level travel as any character (UObject::GetPathName <- UObject::GetFullName <- FPlayerSceneNode::Render GPF): every cached actor pointer (pawns, cursor, camera, aim FX, coop heroes) is validated against the live GObjObjects table before any name/field use - IsBadReadPtr cannot tell freed-but-readable UObject memory from a live actor - and the level-change cache drop now runs every frame instead of every 45th, so stale pointers from the destroyed level are never dereferenced. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
+#define MOD_BUILD  "v58"
+#define MOD_STAMP "build v58 - 2026-09-09 - v58 TRIO FIRES ON RELEASE + RON AI FIX: the >10-second shared hold NO LONGER auto-launches when the interval completes. Borrowed heroes are no longer force-fed PressedFire (on the engine pawn Harry that entered the real fire pipeline - StateCast, finalizeSpell, SpawnSpell - 150-250 ms after arming with no release input; the mod's own P2 hold path proves StartCasting+playCastAim alone enter and hold the cast). When the holder RELEASES, the borrowed heroes fire exactly ONCE via a natural ReleasedFire while genuinely inside the game's held cast state (the stock companion release) - three near-same-frame real spells converge on the shared target, which its own script counts as the cooperative cast. No StopCasting-before-release and no same-frame currentSpell/spellTarget restore on fired heroes any more (those two produced the observed 'shouts, plays the animation, doesn't shoot' on every trio after the first). Cancellations (target changed/deleted, another player cast, level travel, split off) silently StopCasting the borrowed heroes with no ReleasedFire noise. RON AI: the trio re-gates to the genuine cooperative class family (CompanionSpellTrigger-type objects, or classes certified by the strict all-three observation this session) - v57's any-castable admission let every casual 10-second hold on a pumpkin/spawner force-borrow the AI heroes; split-ON proof certification from P1's plain cursor lock is likewise family-restricted. Borrowed AI heroes get their XY velocity and acceleration pinned each frame during the hold so their controller cannot run them back and forth. Post-arm reticle/cursor flicker (<=250 ms) no longer tears down the armed hold. The v57 level-travel GPF fix (live-object validation of every cached pointer + every-frame level-change detector) and the stock P1 SpellCursor.LockOn bridge are retained. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -3039,6 +3039,46 @@ static BOOL coopClassMatchesProof(void *cls)
     return FALSE;
 }
 
+// v58: the CompanionSpellTrigger class family - the level puzzle object the
+// stock game itself recruits Hermione and Ron for (CompanionSpellTrigger0/2/10
+// in the v56 hardware pelogs). The name token is checked on the class chain so
+// map-specific subclasses qualify. Results are memoized: the trio gate sits in
+// the per-tick hold path and GetFullName is not cheap there. Class UObjects
+// live in the package and survive map travel; each cached hit is re-validated
+// against the live class table to stay level-travel-safe.
+static BOOL coopClassHasCompanionToken(void *cls)
+{
+    if (!cls || !cgIsKnownClass(cls)) return FALSE;
+    enum { FAM_CACHE = 16 };
+    static void *sFamCls[FAM_CACHE]; static BOOL sFamYes[FAM_CACHE]; static int sNFam = 0;
+    for (int k = 0; k < sNFam; k++)
+        if (sFamCls[k] == cls && cgIsKnownClass(cls)) return sFamYes[k];
+    BOOL yes = FALSE;
+    void *walk = cls;
+    for (int depth = 0; walk && depth < 24 && cgIsKnownClass(walk); depth++) {
+        char full[260];
+        objName(walk, full, sizeof(full));
+        if (ciHas(full, "CompanionSpellTrigger")) { yes = TRUE; break; }
+        walk = cgSuper(walk);
+    }
+    if (sNFam < FAM_CACHE) { sFamCls[sNFam] = cls; sFamYes[sNFam] = yes; sNFam++; }
+    return yes;
+}
+
+// v58: the trio hold is re-gated to the game's genuine cooperative class
+// family - CompanionSpellTrigger (the observed trio-cast puzzle) plus any
+// class certified this session by the strict all-three companion observation.
+// v57 armed the shared hold for ANY living cast candidate (a pumpkin, a
+// spawner, any vulnerableToClass object): every casual 10-second player hold
+// then borrowed the AI heroes out of their follow/cast behaviour - Ron
+// visibly run-running back and forth to "cast together" mid-level was this
+// gate missing, not his AI.
+static BOOL coopClassIsCooperative(void *cls)
+{
+    if (!g_cgChainOK || !cls || !cgIsKnownClass(cls)) return FALSE;
+    return coopClassMatchesProof(cls) || coopClassHasCompanionToken(cls);
+}
+
 // A class is certified from behaviour, not its name: P1's unmodified cursor
 // is holding this exact object and BOTH of the real companions have independently
 // selected it too. This filters ordinary one-person SpellTriggers without
@@ -3107,6 +3147,15 @@ static void coopObserveP1(void *p1, void *cursorTarget)
     }
     void *cls = cgClassOf(cursorTarget);
     if (!cls || !cgIsKnownClass(cls)) return;
+
+    // v58: a split-ON cursor lock alone must not certify just ANY castable
+    // class - a casual 1.2-second P1 lock on a pumpkin used to enter the
+    // proof table and then admitted that class to the trio hold forever,
+    // which is one of the ways Ron kept getting hijacked by ordinary holds.
+    // Split-ON certification is limited to the CompanionSpellTrigger family;
+    // the strict all-three split-OFF observation remains the only way to
+    // certify a non-family class.
+    if (g_splitOn && !coopClassHasCompanionToken(cls)) return;
 
     // v54 certified a class only while split-screen was OFF: P1's cursor had
     // to be on the object AND both AI companions' pawn spellTarget had to
@@ -4484,7 +4533,11 @@ struct CoopCastHero {
     void *savedSpell;
     BOOL targetWritten;
     BOOL spellWritten;
-    BOOL firePressed;
+    // v58: set when the holder RELEASED the shared hold and this borrowed
+    // hero fired its one natural shot (ReleasedFire while genuinely in the
+    // held cast state). Such a hero is neither StopCasting-cancelled nor
+    // field-restored: its engine finalize still needs currentSpell ~300 ms.
+    BOOL firedTrio;
     BOOL started;
     BOOL alreadyHolding;   // v57: the game itself recruited this hero on this
                            // target (stock companion join) - never restarted,
@@ -4498,6 +4551,9 @@ struct CoopCastActive {
     void *cursor;
     BOOL cursorLocked;
     DWORD beganAt;
+    // v58: last tick the hold's target was positively re-confirmed after
+    // arming; a <=250 ms pick/cursor flicker no longer tears down the trio.
+    DWORD lastSeenAt;
     char name[160];
     CoopCastHero hero[3];       // Harry, Hermione, Ron only
 };
@@ -4532,34 +4588,32 @@ static BOOL coopTargetAlive(const hp3coop::Target &target)
     return actorInCurrentLevel((void *)target.object) && !cgDeleted((void *)target.object);
 }
 
-// Match a class FAMILY certified by the game's own P1/AI behaviour, not an
-// object name or a guessed script token. A generic SpellTrigger deliberately
-// remains ineligible unless its live stock cooperative hold was observed.
-// v57: this now only enriches DISCOVERY of cooperative actors without
-// targeting metadata (coopRefreshCertifiedCandidates). It is no longer an
-// admission requirement for the >10s hold itself - see coopCandidateTarget.
+// v58: the trio hold is re-gated to the genuine cooperative class family
+// (CompanionSpellTrigger-type objects, or classes certified by the strict
+// all-three observation this session). v57's any-candidate admission let a
+// casual 10-second hold on a pumpkin/spawner force-borrow Ron and Hermione
+// out of their AI follow behaviour mid-level. "Counts as a triple spell"
+// only has meaning for the game's own cooperative cast targets anyway. This
+// is a CLASS-FAMILY gate, not the v54-v56 behaviour-certification gate -
+// that one proved structurally unreachable on hardware (the game's own
+// companion join does not set the companions' pawn spellTarget fields, so a
+// proof-needing admission could never fire).
 static BOOL coopClassIsTarget(void *cls)
 {
-    return g_cgChainOK && cls && cgIsKnownClass(cls) && coopClassMatchesProof(cls);
+    return g_cgChainOK && cls && cgIsKnownClass(cls) && coopClassIsCooperative(cls);
 }
 
-// v57: the hold admission is the game's own targeting plus a deliberate
-// >10-second hold by ANY single character. A CgCand is a genuine cast target
-// by construction (its class carries live vulnerableToClass metadata, a
-// spell handler, or it is a stock SpellTrigger-family actor - exactly what
-// the engine's own cursor accepts), so any living candidate may be held.
-// The v54-v56 behaviour-certification gate proved structurally unreachable
-// on hardware: split OFF required BOTH companions' pawn spellTarget to equal
-// P1's cursor target during a stock join (the game's own companion recruit -
-// StateCasting.BeginState in the pelog - does not set those fields that way,
-// and Ron regularly never joined within the window), and split ON required
-// P1's OWN cursor lock while the holder was Player 2 or 3. The proof table
-// still feeds coopRefreshCertifiedCandidates for metadata-less actors.
+// The hold admission is the game's own targeting - a deliberate >10-second
+// hold by ANY single character on a target from the genuine cooperative
+// class family. A CgCand is a real cast target by construction (its class
+// carries live vulnerableToClass metadata, a spell handler, or it is a stock
+// SpellTrigger-family actor), and the v58 family gate keeps ordinary objects
+// from ever entering the shared trio hold.
 static BOOL coopCandidateTarget(CgCand *candidate, hp3coop::Target *out)
 {
     if (!candidate || !out || !g_cgChainOK || !cgCandAlive(candidate)) return FALSE;
     void *cls = candidate->info ? candidate->info->cls : cgClassOf(candidate->obj);
-    if (!cls || !cgIsKnownClass(cls)) return FALSE;
+    if (!cls || !cgIsKnownClass(cls) || !coopClassIsCooperative(cls)) return FALSE;
     out->object = candidate->obj;
     out->clazz = cls;
     out->slot = candidate->slot;
@@ -4824,7 +4878,30 @@ static void coopCallCursorUnlock(void *cursor)
     g_ProcessEvent(cursor, NULL, g_coopFnCursorUnlock, parms, NULL);
 }
 
-static void coopRestore(const char *why)
+// v58: two endings for the armed trio hold.
+//
+// fireTrio == TRUE: the holder deliberately RELEASED the cast. Their own
+// natural release path (the engine for P1, the mod cast-fire for P2/P3) has
+// already spawned their single projectile this frame or will finalise it in
+// the next few hundred ms. Every borrowed hero now RELEASES once too: one
+// ReleasedFire while they are genuinely in the game's held cast state -
+// exactly the stock companion release. Three near-same-frame real spells
+// converge on the shared target, which is what its script counts as the
+// cooperative cast. Crucially:
+//   * NO StopCasting first (v57 did StopCasting then ReleasedFire, so the
+//     release ran outside the cast state: the hero shouted the spell and
+//     played the release animation but SpawnSpell never ran), and
+//   * NO field restore on the fired heroes (the engine's StateCasting
+//     finalize re-reads currentSpell at AnimEnd ~300 ms later; v57 restored
+//     it to the pre-arm NULL in this same frame, so later trio fires spawned
+//     nothing - the user-visible "Harry shouts but doesn't shoot"). Their
+//     natural finalization consumes/resets the fields; the holder's own
+//     cast state owns theirs from release onward.
+// fireTrio == FALSE (target changed/deleted, another player cast, level
+// travel, split shutdown): a clean silent cancel - StopCasting only, no
+// ReleasedFire noise events on AI pawns (those events on an idle pawn were
+// also feeding Ron's cast/follow oscillation).
+static void coopRestore(const char *why, BOOL fireTrio)
 {
     if (!g_coopActive.active) return;
     char targetName[180] = "<gone>";
@@ -4833,28 +4910,52 @@ static void coopRestore(const char *why)
     const char *tn = targetName;
     if (coopTargetAlive(g_coopActive.target))
         tn = objName(g_coopActive.target.object, targetName, sizeof(targetName));
-    logf_("[coopcast] P%d ending shared hold on %s: %s",
-          g_coopActive.holder + 1, tn, why ? why : "reset");
 
-    // Stop before releasing Fire. This deliberately cancels the borrowed
-    // heroes instead of firing duplicate projectiles from them. The holder's
-    // normal release path has already fired its own spell when applicable.
-    for (int p = 0; p < 3; p++) {
-        CoopCastHero *hero = &g_coopActive.hero[p];
-        if (!coopActorAlive(hero->pawn)) continue;
-        if (hero->started && g_fnStopCast)
-            callFn(hero->pawn, g_fnStopCast, "StopCasting [coopcast restore]");
-        if (hero->firePressed && g_fnCharRelFire)
-            callFn(hero->pawn, g_fnCharRelFire, "HPCharacter.ReleasedFire [coopcast restore]");
-        if (hero->firePressed && g_fnFireRel)
-            callFn(hero->pawn, g_fnFireRel, "ReleasedFire [coopcast restore]");
+    // No fire against a vanished or dead target - degrade to a plain cancel.
+    if (fireTrio && !coopTargetAlive(g_coopActive.target)) fireTrio = FALSE;
+
+    if (fireTrio) {
+        logf_("[coopcast] P%d RELEASED the shared hold on %s: the trio fires "
+              "once (the holder's own release plus one natural companion "
+              "release each - the target's own script counts this as the "
+              "cooperative spell)",
+              g_coopActive.holder + 1, tn);
+        for (int p = 0; p < 3; p++) {
+            if (p == g_coopActive.holder) continue;  // holder released on its own path
+            CoopCastHero *hero = &g_coopActive.hero[p];
+            // The game's own joiners are left to the game's own release.
+            if (hero->alreadyHolding || !hero->started || hero->firedTrio) continue;
+            if (!coopActorAlive(hero->pawn)) continue;
+            hero->firedTrio = TRUE;
+            if (g_fnCharRelFire)
+                callFn(hero->pawn, g_fnCharRelFire,
+                       "HPCharacter.ReleasedFire [coopcast trio fire]");
+            logf_("  [coopcast] P%d releases its one cooperative shot at %s",
+                  p + 1, tn);
+        }
+    } else {
+        logf_("[coopcast] P%d ending shared hold on %s: %s",
+              g_coopActive.holder + 1, tn, why ? why : "reset");
+        for (int p = 0; p < 3; p++) {
+            CoopCastHero *hero = &g_coopActive.hero[p];
+            if (!coopActorAlive(hero->pawn)) continue;
+            if (hero->started && !hero->firedTrio && g_fnStopCast)
+                callFn(hero->pawn, g_fnStopCast, "StopCasting [coopcast cancel]");
+        }
     }
     if (g_coopActive.cursorLocked && coopActorAlive(g_coopActive.cursor))
         coopCallCursorUnlock(g_coopActive.cursor);
 
     // Do not overwrite a state that a real controller changed while the
     // temporary bridge was active. We only put back a field while it still
-    // contains the value we borrowed for this cooperative target.
+    // contains the value we borrowed for this cooperative target. On the
+    // RELEASE-fire ending nothing is restored at all: the fired heroes'
+    // engine finalize still reads currentSpell for another few hundred ms,
+    // and the holder's engine-driven cast owns its fields from release on.
+    if (fireTrio) {
+        memset(&g_coopActive, 0, sizeof(g_coopActive));
+        return;
+    }
     for (int p = 0; p < 3; p++) {
         CoopCastHero *hero = &g_coopActive.hero[p];
         if (!coopActorAlive(hero->pawn)) continue;
@@ -4883,17 +4984,15 @@ static void coopStopHolderForSplitShutdown(void)
     if (holder < 0 || holder > 2) return;
     CoopCastHero *hero = &g_coopActive.hero[holder];
     if (!coopActorAlive(hero->pawn)) return;
+    // v58: a plain StopCasting cancel. The ReleasedFire events after the
+    // stop used to play the release shout/animation with no projectile.
     if (g_fnStopCast)
         callFn(hero->pawn, g_fnStopCast, "StopCasting [coopcast split shutdown]");
-    if (g_fnCharRelFire)
-        callFn(hero->pawn, g_fnCharRelFire, "HPCharacter.ReleasedFire [coopcast split shutdown]");
-    if (g_fnFireRel)
-        callFn(hero->pawn, g_fnFireRel, "ReleasedFire [coopcast split shutdown]");
 }
 
 static void coopClearAll(const char *why)
 {
-    coopRestore(why);
+    coopRestore(why, FALSE);
     for (int i = 0; i < 8; i++) {
         hp3coop::clear(g_coopHold[i]);
         g_coopTryAt[i] = 0;
@@ -4937,10 +5036,13 @@ static void coopBeginBorrowedHero(CoopCastHero *hero, void *spell, int p)
     if (!hero || !coopActorAlive(hero->pawn) || !spell) return;
     if (g_fnShowWeapon) callFn(hero->pawn, g_fnShowWeapon, "ShowWeapon [coopcast]");
     if (g_fnSwitchFight) callFn(hero->pawn, g_fnSwitchFight, "SwitchToFightMode [coopcast]");
-    if (g_fnFire) {
-        callFn(hero->pawn, g_fnFire, "PressedFire [coopcast hold]");
-        hero->firePressed = TRUE;
-    }
+    // v58: NO PressedFire here. On the engine-controlled pawn (Harry) an
+    // unconditional PressedFire enters the genuine fire pipeline: StateCast
+    // -> finalizeSpell -> SpawnSpell 150-250 ms later with no release input -
+    // the user-visible "Harry auto-launches the spell as soon as the 10 s
+    // hold completes". The mod's own P2 hold path provably enters and holds
+    // StateCasting without PressedFire (StartCasting + playCastAim suffice),
+    // so the press was both harmful and redundant.
     if (g_fnStartCast) {
         // Same ABI used by beginCast(): StartCasting(class, charge). A plain
         // zero-parameter ProcessEvent call would not select the target spell.
@@ -4959,14 +5061,14 @@ static void coopMaintain(void)
     if (!g_coopActive.active) return;
     if (!coopTargetAlive(g_coopActive.target)) {
         g_coopBlocked[g_coopActive.holder] = TRUE;
-        coopRestore("target was deleted, replaced, or left this level");
+        coopRestore("target was deleted, replaced, or left this level", FALSE);
         return;
     }
     for (int p = 0; p < 3; p++) {
         CoopCastHero *hero = &g_coopActive.hero[p];
         if (!coopActorAlive(hero->pawn)) {
             g_coopBlocked[g_coopActive.holder] = TRUE;
-            coopRestore("one of the trio is unavailable");
+            coopRestore("one of the trio is unavailable", FALSE);
             return;
         }
         if (hero->targetWritten && g_offSpellTarget > 0 &&
@@ -4978,7 +5080,7 @@ static void coopMaintain(void)
             if (p != g_coopActive.holder && p < g_numPlayers && liveTarget &&
                 liveTarget != g_coopActive.target.object) {
                 g_coopBlocked[g_coopActive.holder] = TRUE;
-                coopRestore("another player selected a different target");
+                coopRestore("another player selected a different target", FALSE);
                 return;
             }
             *(void **)((BYTE *)hero->pawn + g_offSpellTarget) = g_coopActive.target.object;
@@ -4990,10 +5092,32 @@ static void coopMaintain(void)
             if (p != g_coopActive.holder && p < g_numPlayers && liveSpell &&
                 liveSpell != g_coopActive.spell) {
                 g_coopBlocked[g_coopActive.holder] = TRUE;
-                coopRestore("another player selected a different spell");
+                coopRestore("another player selected a different spell", FALSE);
                 return;
             }
             *(void **)((BYTE *)hero->pawn + g_offCurrentSpell) = g_coopActive.spell;
+        }
+        // v58: while a hero is borrowed by the mod and still driven by its
+        // own AI controller, the controller keeps pushing movement each tick
+        // while the pawn is supposed to stand and hold the cast - the
+        // user-visible "Ron runs back and forth to cast together". Pin the
+        // borrowed AI hero's horizontal motion for the duration of the hold
+        // (human-driven heroes are left to their human, and the holder - the
+        // initiating player - keeps full control).
+        if (p != g_coopActive.holder && p >= g_numPlayers && hero->started &&
+            !hero->alreadyHolding && F.Velocity > 0 &&
+            !IsBadReadPtr((BYTE *)hero->pawn + F.Velocity, 12) &&
+            !IsBadWritePtr((BYTE *)hero->pawn + F.Velocity, 12)) {
+            float *vv = (float *)((BYTE *)hero->pawn + F.Velocity);
+            if (vv[0] != 0.0f || vv[1] != 0.0f) { vv[0] = 0.0f; vv[1] = 0.0f; }
+            if (F.Acceleration > 0 &&
+                !IsBadReadPtr((BYTE *)hero->pawn + F.Acceleration, 12) &&
+                !IsBadWritePtr((BYTE *)hero->pawn + F.Acceleration, 12)) {
+                float *aa = (float *)((BYTE *)hero->pawn + F.Acceleration);
+                if (aa[0] != 0.0f || aa[1] != 0.0f || aa[2] != 0.0f) {
+                    aa[0] = 0.0f; aa[1] = 0.0f; aa[2] = 0.0f;
+                }
+            }
         }
     }
 }
@@ -5005,7 +5129,10 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
     // state, the mod only borrows the other two heroes alongside.
     if (g_coopActive.active || holder < 0 || holder > 2 || !candidate ||
         !coopTargetAlive(key)) return FALSE;
-    if (!g_fnFire || !g_fnStartCast || !g_fnStopCast ||
+    // v58: StartCasting enters the borrowed hold, StopCasting cancels it,
+    // HPCharacter.ReleasedFire is what a borrowed hero fires with when the
+    // holder releases - PressedFire is deliberately NOT used any more.
+    if (!g_fnCharRelFire || !g_fnStartCast || !g_fnStopCast ||
         g_offSpellTarget <= 0 || g_offCurrentSpell <= 0) {
         g_coopBlocked[holder] = TRUE;
         logf_("[coopcast] P%d cannot arm %s: casting reflection is incomplete",
@@ -5028,6 +5155,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
     next.target = key;
     next.spell = spell;
     next.beganAt = GetTickCount();
+    next.lastSeenAt = next.beganAt;   // v58 post-arm flicker grace anchor
     strncpy(next.name, candidate->name, sizeof(next.name) - 1);
     next.name[sizeof(next.name) - 1] = 0;
 
@@ -5078,7 +5206,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
         g_coopActive.cursorLocked = TRUE;
         if (!coopCursorAcceptedTarget(cursor, key.object)) {
             g_coopBlocked[holder] = TRUE;
-            coopRestore("stock P1 cursor rejected the requested target");
+            coopRestore("stock P1 cursor rejected the requested target", FALSE);
             logf_("[coopcast] P%d left %s unchanged: P1 LockOn did not retain target",
                   holder + 1, next.name);
             return FALSE;
@@ -5090,7 +5218,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
             IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget, 4) ||
             IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell, 4)) {
             g_coopBlocked[holder] = TRUE;
-            coopRestore("stock P1 bridge changed the active level/state");
+            coopRestore("stock P1 bridge changed the active level/state", FALSE);
             return FALSE;
         }
         // LockOn owns P1's target/spell choice. Mark either field as borrowed if
@@ -5122,7 +5250,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
         // real P2/P3 hold remains authoritative.
         if (!coopSetFields(hero, key.object, spell)) {
             g_coopBlocked[holder] = TRUE;
-            coopRestore("could not write a borrowed cast field");
+            coopRestore("could not write a borrowed cast field", FALSE);
             return FALSE;
         }
     }
@@ -5144,7 +5272,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
         coopBeginBorrowedHero(hero, spell, p);
         if (!hero->started) {
             g_coopBlocked[holder] = TRUE;
-            coopRestore("a borrowed hero could not enter the held cast state");
+            coopRestore("a borrowed hero could not enter the held cast state", FALSE);
             return FALSE;
         }
     }
@@ -5178,11 +5306,24 @@ static void coopTick(int i, void *pawn, BOOL held)
     // >10s arming; this branch only maintains/restores an active P1 hold.
     if (i == 0) {
         if (!g_coopActive.active || g_coopActive.holder != 0) return;
-        if (!held || !g_p1CursorLockedTarget ||
-            g_p1CursorLockedTarget != g_coopActive.target.object)
-            coopRestore(!held ? "holder released cast" : "holder changed target");
-        else
+        // v58: P1's "held" is the stock cursor lock, and the lock state
+        // already carries the 250 ms None-frame grace (coopObserveP1). When
+        // the lock ends the player released: the holder's engine cast fires
+        // its one shot and the borrowed heroes release alongside - the trio
+        // fires exactly once.
+        if (!held) {
+            coopRestore("holder released cast", TRUE);
+            return;
+        }
+        if (g_p1CursorLockedTarget &&
+            g_p1CursorLockedTarget == g_coopActive.target.object) {
+            g_coopActive.lastSeenAt = now;
             coopMaintain();
+        } else if ((DWORD)(now - g_coopActive.lastSeenAt) <= kCoopFlickerGrace) {
+            coopMaintain();   // brief lock flicker after arming: keep holding
+        } else {
+            coopRestore("holder changed target", FALSE);
+        }
         return;
     }
 
@@ -5209,10 +5350,22 @@ static void coopTick(int i, void *pawn, BOOL held)
     }
 
     if (g_coopActive.active && g_coopActive.holder == i) {
-        if (!valid || !hp3coop::sameTarget(g_coopActive.target, key))
-            coopRestore(!held ? "holder released cast" : "holder changed target");
-        else
+        // v58: the RELEASE is the trio's fire moment, not a cancellation -
+        // the holder's own normal release already fires its one shot at the
+        // shared target and the borrowed heroes release one natural shot each
+        // (see coopRestore). A reticle flicker (<=250 ms) while the button
+        // stays held no longer tears down the armed hold; only a real target
+        // change/deletion past the grace cancels silently.
+        if (!held) {
+            coopRestore("holder released cast", TRUE);
+        } else if (valid && hp3coop::sameTarget(g_coopActive.target, key)) {
+            g_coopActive.lastSeenAt = now;
             coopMaintain();
+        } else if ((DWORD)(now - g_coopActive.lastSeenAt) <= kCoopFlickerGrace) {
+            coopMaintain();
+        } else {
+            coopRestore("holder changed target", FALSE);
+        }
     }
     if (!valid) {
         g_coopTryAt[i] = 0;
@@ -5237,11 +5390,11 @@ static void coopTick(int i, void *pawn, BOOL held)
 // because the stock cursor can report None for a frame or two between
 // controller updates.
 //
-// A single 10-second uninterrupted cursor lock implicitly certifies the
-// class and then fires the cooperative path - no separate 1.2-second cert
-// gate is required. A deliberate sustained lock IS the evidence; the proof
-// is added the same way coopObserveP1 would have, so any later P2/P3 hold
-// still benefits from the certification entry as well.
+// v58: the locked object's CLASS must belong to the genuine cooperative
+// family (CompanionSpellTrigger-type or session-certified). A 10-second lock
+// on an ordinary castable (a pumpkin, a spawner) no longer arms the trio and
+// no longer certifies its class - that self-certification was the poisoned
+// gate that let any casual 10-second hold hijack Ron out of his AI routine.
 static void coopP1HoldTry(void *p1)
 {
     if (!g_coopCastFallback || !g_castGameplay || g_coopActive.active ||
@@ -5258,35 +5411,14 @@ static void coopP1HoldTry(void *p1)
     if (!cgLiveObject(target) || !actorInCurrentLevel(target) || cgDeleted(target)) return;
     void *cls = cgClassOf(target);
     if (!cls || !cgIsKnownClass(cls)) return;
-    // v57: still RECORD the proof (a 10s lock is strong evidence, and the
-    // proof table feeds discovery of metadata-less cooperative actors), but
-    // the shared hold no longer depends on the table - a full table must not
-    // cancel the arm the way it did in v56.
-    BOOL alreadyCertified = FALSE;
-    for (int p = 0; p < g_nCoopProof; p++)
-        if (g_coopProof[p].cls == cls) { alreadyCertified = TRUE; break; }
-    if (!alreadyCertified) {
-        if (g_nCoopProof < (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
-            CoopClassProof *proof = &g_coopProof[g_nCoopProof++];
-            proof->cls = cls; proof->observedAt = now;
-            char full[180];
-            objName(cls, full, sizeof(full));
-            const char *sp = strchr(full, ' ');
-            strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
-            proof->path[sizeof(proof->path) - 1] = 0;
-            char targetName[180];
-            logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's "
-                  "sustained >%lu-second cursor lock on %s",
-                  proof->path, (unsigned long)g_coopCastHoldMs / 1000u,
-                  objName(target, targetName, sizeof(targetName)));
-        } else {
-            char targetName[180];
-            logf_("[coopcast] P1 >%lu-second hold on %s: proof table full - "
-                  "arming the shared hold anyway (v57: certification is no "
-                  "longer required to hold)",
-                  (unsigned long)g_coopCastHoldMs / 1000u,
-                  objName(target, targetName, sizeof(targetName)));
-        }
+    if (!coopClassIsCooperative(cls)) {
+        char tname[180];
+        logf_("[coopcast] P1 >%lu-second cursor lock on %s: not the cooperative "
+                "CompanionSpellTrigger class family - no trio arm (ordinary "
+                "holds stay a plain single-character cast in v58)",
+              (unsigned long)g_coopCastHoldMs / 1000u,
+              objName(target, tname, sizeof(tname)));
+        return;
     }
     // Find a CgCand for the locked object (the normal list prefers, the
     // certified list as fallback). Whichever is found, build the hp3coop
@@ -5299,10 +5431,10 @@ static void coopP1HoldTry(void *p1)
             if (g_coopDiscovered[k].obj == target) { cand = &g_coopDiscovered[k]; break; }
     }
     if (!cand) {
-        // No candidate found - the locked object isn't in either scan
-        // (a fragile certified-class without metadata). We still try
-        // coopStart with an ad-hoc candidate; it will reject unless the
-        // class is already in the proof table (which it is now).
+        // No candidate found - the locked object isn't in either scan (a
+        // cooperative-family actor with no vulnerable-class metadata). Build
+        // an ad-hoc candidate; the class already passed the v58 family gate
+        // above, so the arm itself is allowed.
         static CgCand sAdHoc = {};
         sAdHoc = {};
         sAdHoc.obj = target;
@@ -5340,7 +5472,7 @@ static void coopYieldToNormalCast(int i)
 {
     if (g_coopActive.active && i >= 0 && i < 3) {
         g_coopBlocked[g_coopActive.holder] = TRUE;
-        coopRestore("another player began a normal cast");
+        coopRestore("another player began a normal cast", FALSE);
     }
 }
 
@@ -6106,7 +6238,7 @@ static void coopMonitor(void)
         !coopActorAlive(g_coopActive.hero[holder].pawn) ||
         (g_pawn[holder] && g_pawn[holder] != g_coopActive.hero[holder].pawn)) {
         if (holder >= 0 && holder < 8) g_coopBlocked[holder] = TRUE;
-        coopRestore("holder is no longer under split-screen control");
+        coopRestore("holder is no longer under split-screen control", FALSE);
         return;
     }
     coopMaintain();

@@ -30,43 +30,60 @@ V57 COOPERATIVE SUSTAINED CAST - THE HOVERING TRIPLE CAST FROM ANY CHARACTER
     Hermione's controller put her into the held-cast state on its own. The
     trigger's own script decides when the converged holds complete it.
 
-  USE (v57 - any character, any mode):
-    Keep a cast held on the SAME game-verified cast target for more than
+  USE (v58 - any character, any mode, fires on release only):
+    Keep a cast held on the SAME cooperative cast target (the game's own
+    trio puzzle object - CompanionSpellTrigger class family, or a class the
+    strict all-three observation certified this session) for more than
     CoopCastHoldMs (default 10 seconds) - Player 1 with the mouse (the
     engine cursor lock counts as the hold) or any split-screen player with
-    their cast key. The target must be one the game's own targeting accepts
-    (live vulnerableToClass / spell-handler / SpellTrigger metadata, or the
-    stock cursor lock itself). After the delay the real trio holds the
-    target's own spell: the two non-holders are placed in the game's existing
-    held-cast state through StartCasting(class, 1.0)/PressedFire/playCastAim,
-    heroes the game already recruited itself are left untouched, and the real
-    P1 SpellCursor.LockOn bridges the engine's hover-lock whenever its
-    reflected one-target ABI and paired no-input UnLock are safe (if the
-    cursor's ABI cannot be verified the trio still holds; the log says so).
-    The object's own script decides what happens; the holder's normal release
-    is the only injected projectile fire.
+    their cast key. NOTHING fires when the interval completes: after the
+    delay the real trio simply holds the target's own spell - the two
+    non-holders are placed in the game's existing held-cast state through
+    StartCasting(class, 1.0)/playCastAim (v58: no PressedFire - the engine
+    pawn would auto-throw from it), heroes the game already recruited
+    itself are left untouched, and the real P1 SpellCursor.LockOn bridges
+    the engine's hover-lock whenever its reflected one-target ABI and
+    paired no-input UnLock are safe (if the cursor's ABI cannot be verified
+    the trio still holds; the log says so). While borrowed, AI heroes stand
+    still: their controller's per-tick movement pushes are pinned, so no
+    more "Ron runs back and forth".
 
-    The v54-v56 per-level behaviour certification is no longer required to
-    hold - it never fired on real hardware (the stock companion join does not
-    set both companions' pawn spellTarget, and a split-ON holder is never the
-    player whose cursor the old test watched). It is still collected when a
-    stock P1 lock demonstrates a class ([coopcast] CERTIFIED ...) and then
-    only helps discover cooperative actors that carry no targeting metadata.
+    The RELEASE is the fire: when the holder lets go, their own natural
+    release fires one shot and every borrowed companion releases one
+    natural shot from the real held-cast state - three near-same-frame
+    spells converge on the shared target, exactly once, and the target's
+    own script counts it as the cooperative spell. There is deliberately
+    no StopCasting-first and no pre-finalize field restore on the fired
+    heroes (that pair in v57 produced "shouts the spell, plays the
+    animation, doesn't shoot" on every repeat).
 
-    Target flicker up to 250ms (cursor None frames for P1, aim-pick gaps for
-    P2/P3) does not reset the dwell; a real release does.
+    Ordinary non-cooperative targets (pumpkins, spawners, generic cast
+    triggers) never arm the trio in v58 - a 10s hold there stays a plain
+    single-character cast, so Ron and Hermione are never pulled out of
+    their follow AI by accident. The v54-v56 behaviour certification only
+    enriches discovery of metadata-less cooperative actors; a 10s P1 lock
+    on an ordinary object no longer certifies its class.
 
-    Releasing Cast, aiming at another object, another player's normal cast,
-    target deletion, map travel, F10/split shutdown, or a missing trio
-    cancels the bridge and restores fields/states borrowed from P1 and the
-    companions. Under [actions], CoopCastFallback=0 disables it.
-    CoopCastHoldMs has a default/minimum of 10000; it cannot be lowered into
-    a normal short-cast shortcut.
+    Target flicker up to 250ms (cursor None frames for P1, aim-pick gaps
+    for P2/P3) does not reset the dwell and does not tear down an armed
+    hold; a real release does end it (as the trio fire).
+
+    Aiming at another object, another player's normal cast, target
+    deletion, map travel, F10/split shutdown, or a missing trio member
+    cancels the bridge silently (StopCasting only, no ReleasedFire noise)
+    and restores the fields/liberty borrowed from P1 and the companions.
+    Under [actions], CoopCastFallback=0 disables it.
+    CoopCastHoldMs has a default/minimum of 10000; it cannot be lowered
+    into a normal short-cast shortcut.
 
   WHAT TO LOOK FOR IN hp3mod.log:
     [coopcast] P2 started continuous >10-second hold on <target>  (dwell starts)
     [coopcast] P2 held <target> for more than 10 seconds: the trio now
     holds <spell> on <target> (N borrowed ..., cursor bridge locked/skipped)
+    [coopcast] P2 RELEASED the shared hold on <target>: the trio fires once
+      (the holder's own release plus one natural companion release each ...)
+    [coopcast] P1/P2/P3 >10-second hold on <ordinary object>: not the
+      cooperative CompanionSpellTrigger class family - no trio arm
     If the arm is refused the reason is logged on the [coopcast] line
     (busy hero, reflection incomplete, target replaced...). Test first on a
     reloadable save and send hp3mod.log if the trio hold behaves differently
