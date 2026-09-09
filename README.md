@@ -13,7 +13,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 - **Distinct characters per view** (Harry / Hermione / Ron), each with their own camera, floor and collision
 - Real spellcasting through the game's own script VM (Rictusempra, Depulso, Lumos, ... ) with hold-to-aim, vertical aim, and (v51) player-1-faithful gameplay activation: statues, jump pads, doors and lesson objects react to player 2's spells
 - **Native HP3 aim effects (v52/v53)**: original seeking particles and target-sized hovered spell icons; hardware verification pending.
-- **Single-caster cooperative charge (v59, fires on release)**: hold a cast on a cooperative-family target for 10 seconds to arm x3 power. The interval never auto-fires. On release, the holder casts normally and the mod creates two additional game-native spell shots from that same pawn and target. No companion pawn is recruited, moved, retargeted, animated, or released, so Ron’s AI remains entirely untouched and no pawn can be teleported into a group cast.
+- **Single-caster cooperative charge (v60, fires on release)**: hold a cast on a cooperative-family target for 10 seconds to arm x3 power. The interval never auto-fires. On release, the holder casts normally and the mod launches and independently tracks two additional game-native spell shots from that same pawn to the same target. The mod never borrows or casts through another hero. When P1’s stock cursor makes the unmodified game recruit an AI companion during the hold, only that AI pawn’s movement impulses are held at zero until release, preventing Ron’s run/cast/run oscillation.
 - Camera that slides against walls instead of clipping, gamepad camera-follow + orbit (v13+)
 - Works on free-roam levels; survives level changes
 
@@ -24,7 +24,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v56`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v60`.
 
 ## Player 2 controls
 
@@ -46,19 +46,19 @@ sudo apt install g++-mingw-w64-i686
 ./build.sh          # -> dist/d3d8.dll
 ```
 
-Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, the cooperative hold lifecycle is in `src/coop_cast.h`, and the native visual adapter is in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
+Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, the cooperative hold lifecycle is in `src/coop_cast.h`, charged-projectile planning is in `src/charged_cast.h`, and the native visual adapter is in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
 
-Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aim geometry, continuous cooperative-hold identity/timing, and native-effect lifecycle using an engine double—not HP3's actual VM, collision, animation, or rendering.
+Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aim geometry, continuous cooperative-hold identity/timing, charged-projectile trajectories, and native-effect lifecycle using engine-independent policy code—not HP3's actual VM, collision, animation, or rendering.
 
-### v59 single-caster charged x3 cast
+### v60 single-caster charged x3 cast
 
 The stock cooperative interaction is recognized by a sustained lock on the game’s cooperative target family (`CompanionSpellTrigger` and verified subclasses). The mod waits for `CoopCastHoldMs` (minimum/default 10 seconds) and only **arms** an x3 charge; it does not fire at the threshold.
 
-When the holder releases, the normal cast remains shot 1. Two additional calls to the game’s own `HPPawn.SpawnSpell(class, target)` are made on the **same player pawn**, producing shots 2 and 3 with the same spell class and target. This gives the puzzle three normal spell deliveries without manufacturing a completion event.
+When the holder releases, the normal cast remains shot 1. Two additional calls to the game’s own `HPPawn.SpawnSpell(class, target)` are made on the **same player pawn**, producing shots 2 and 3 with the same spell class and target. Both bonus actors are detached from the caster, moved outside the caster’s collision body, aimed at the target’s real center, given projectile physics/velocity, and assigned independent hit-delivery watches. P2’s ordinary shot also retains its target candidate and watch. This fixes v59’s stationary red light and ensures all three spell deliveries can reach the target, including when P1 is the holder.
 
-No other hero is borrowed. The mod does not write companion target/spell fields, call companion `StartCasting`/`ReleasedFire`, pin AI movement, reposition pawns, or force Player 1’s cursor. Thus Ron’s AI and every non-holding player remain untouched. Target loss, deletion, level travel, or split shutdown cancels the armed bonus silently.
+No other hero is borrowed: the mod does not write companion target/spell fields, call companion `StartCasting`/`ReleasedFire`, replace controller links, or force P1’s cursor. The unmodified game itself can recruit AI companions as soon as P1 locks a `CompanionSpellTrigger`, before the ten-second mod threshold. During that P1 hold only, v60 zeros horizontal velocity/acceleration on companions that remain AI-controlled; this prevents Ron’s stock run/cast/run loop without changing his controller, follow setup, spell fields, or release events. Normal AI movement resumes immediately after P1 unlocks.
 
-`CoopCastFallback=0` disables this behavior. Keep `CastGameplay=1`.
+Target loss, deletion, level travel, or split shutdown cancels the armed bonus silently. `CoopCastFallback=0` disables this behavior. Keep `CastGameplay=1`.
 
 ### v57 level-travel crash fix
 
@@ -92,7 +92,7 @@ For the same optional Zig 0.13 cross-build used for the prebuilt binary:
 
 ```bash
 mkdir -p dist
-zig c++ -target x86-windows-gnu -O2 -shared -static \
+zig c++ -target x86-windows-gnu -O2 -s -shared -static \
   -o dist/d3d8.dll src/dllmain.cpp src/d3d8.def -lwinmm -Wall -Wextra
 ```
 
@@ -171,6 +171,7 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v57** removes the hardware-unreachable certification gate from the cooperative hold: ANY single character (P1 cursor lock or P2/P3 held cast) holding the same game-verified cast target for >10 seconds arms the trio hold directly. Heroes the game itself already recruited are borrowed untouched, the P1 `SpellCursor.LockOn` bridge is best-effort, and P2/P3 holds get the same 250ms flicker grace. It also fixes the hard level-travel GPF (entering Hogwarts): every cached actor is validated against the live `GObjObjects` table before any name/field/destroy use, and the level-change cache drop runs every frame instead of every 45th. `bin/d3d8.dll` is refreshed to match the source banner (it had been stale since v54).
 - **v58** fixes both hardware-test findings on v57's trio: (1) the hold no longer auto-launches at 10 s — borrowed heroes are never fed `PressedFire` (that event put the engine pawn through the real fire pipeline), and when the holder *releases*, each borrowed hero fires exactly one natural `ReleasedFire` shot from the genuine held-cast state (three converging spells counting as the cooperative cast) — with no `StopCasting`-first and no same-frame `currentSpell` restore, fixing the repeat "shouts but doesn't shoot" desync; (2) Ron's AI keeps behaving: arming is re-gated to the genuine cooperative class family (`CompanionSpellTrigger`-chain objects or session-certified classes — casual 10 s holds on pumpkins/spawners no longer borrow the AI heroes), split-ON proof certification from a plain P1 cursor lock is family-restricted, and borrowed AI heroes get their movement push pinned for the duration of the hold. Post-arm target flicker (≤250 ms) no longer tears down an armed hold. The v57 level-travel crash fix is retained unchanged.
 - **v59** replaces companion borrowing with a same-caster x3 release. The 10-second threshold only arms the charge; release produces the holder’s normal projectile plus two `SpawnSpell` projectiles from the same pawn. No companion fields, controllers, cast states, movement, or P1 cursor are touched.
+- **v60** completes v59’s raw `SpawnSpell` bonuses: each is moved clear of the holder, aimed, given velocity/projectile physics, and watched in its own delivery slot for every holder (including P1). P2/P3’s original target watch is retained as well, so x3 means three effective deliveries rather than one normal shot plus stationary red actors. If P1’s stock cursor recruits an AI Ron/Hermione during the cooperative lock, only that AI pawn’s horizontal movement impulses are suppressed until unlock, stopping the stock run/cast/run oscillation without borrowing the companion or changing controller/cast/release state.
 
 ## Disclaimer
 

@@ -14,80 +14,57 @@ WHAT IT DOES
   engine's own DrawPortal once per player.
 
 
-V57 COOPERATIVE SUSTAINED CAST - THE HOVERING TRIPLE CAST FROM ANY CHARACTER
-  This is a general fallback for real HP3 objects that require Harry,
-  Hermione and Ron to keep casting together. It is NOT a Pixie-well-only
-  solution, does not complete a minigame directly, and never calls generic
-  Trigger(), synthetic Touch(), repeated spell impacts, or a guessed target
-  property.
+V60 SINGLE-CASTER CHARGED X3 CAST - ANY CHARACTER, RELEASE ONLY
+  This is a fallback for HP3 objects that normally expect three converging
+  spell deliveries. It does not complete a puzzle directly and does not cast
+  through Harry, Hermione, or Ron as substitutes for the initiating player.
 
-  HOW THE STOCK GAME HOLDS THE TRIO CAST (established from the HP2-family
-  script source and the v56 hardware ProcessEvent capture):
-    The engine player's held cast plus the SpellCursor lock is what recruits
-    the companions. LockOn(Actor TargetActor) also runs ChooseSpell FROM THE
-    TARGET's own vulnerable spell class, so the hovered spell is always the
-    one the object wants; about 0.7s after the lock in the capture,
-    Hermione's controller put her into the held-cast state on its own. The
-    trigger's own script decides when the converged holds complete it.
+  USE:
+    Keep a cast held on the SAME cooperative target (the
+    CompanionSpellTrigger class family or a class verified from the stock
+    interaction) for more than CoopCastHoldMs. The default and minimum are
+    10000 milliseconds. Player 1's stock cursor lock is the hold signal;
+    split-screen players hold their cast key.
 
-  USE (v58 - any character, any mode, fires on release only):
-    Keep a cast held on the SAME cooperative cast target (the game's own
-    trio puzzle object - CompanionSpellTrigger class family, or a class the
-    strict all-three observation certified this session) for more than
-    CoopCastHoldMs (default 10 seconds) - Player 1 with the mouse (the
-    engine cursor lock counts as the hold) or any split-screen player with
-    their cast key. NOTHING fires when the interval completes: after the
-    delay the real trio simply holds the target's own spell - the two
-    non-holders are placed in the game's existing held-cast state through
-    StartCasting(class, 1.0)/playCastAim (v58: no PressedFire - the engine
-    pawn would auto-throw from it), heroes the game already recruited
-    itself are left untouched, and the real P1 SpellCursor.LockOn bridges
-    the engine's hover-lock whenever its reflected one-target ABI and
-    paired no-input UnLock are safe (if the cursor's ABI cannot be verified
-    the trio still holds; the log says so). While borrowed, AI heroes stand
-    still: their controller's per-tick movement pushes are pinned, so no
-    more "Ron runs back and forth".
+    NOTHING fires when the interval completes. The charge merely arms.
+    Release is the fire: the initiating player's ordinary release remains
+    shot 1, then that SAME pawn creates shots 2 and 3 with the target's own
+    spell class. v60 explicitly moves both bonus actors clear of the caster,
+    aims them at the target, gives them projectile velocity/physics, and
+    tracks both bonuses independently. P2's ordinary shot keeps its existing
+    delivery watch as well. A charged P1 cast therefore cannot leave v59's
+    permanent red light under Harry, and a P2 cast does not lose one of its
+    bonus deliveries.
 
-    The RELEASE is the fire: when the holder lets go, their own natural
-    release fires one shot and every borrowed companion releases one
-    natural shot from the real held-cast state - three near-same-frame
-    spells converge on the shared target, exactly once, and the target's
-    own script counts it as the cooperative spell. There is deliberately
-    no StopCasting-first and no pre-finalize field restore on the fired
-    heroes (that pair in v57 produced "shouts the spell, plays the
-    animation, doesn't shoot" on every repeat).
+    The mod never borrows a companion, swaps a controller, writes a companion
+    spell target/current spell, calls companion StartCasting/ReleasedFire,
+    or repositions another hero. The stock game itself may recruit an AI
+    Ron/Hermione soon after P1 locks a CompanionSpellTrigger. During that P1
+    cooperative lock only, v60 holds horizontal movement impulses at zero on
+    companions that are still AI-controlled. This stops Ron's run/cast/run
+    oscillation without taking over his controller or cast lifecycle. Human
+    split-screen characters are never movement-guarded, and ordinary AI
+    movement resumes as soon as P1 unlocks.
 
-    Ordinary non-cooperative targets (pumpkins, spawners, generic cast
-    triggers) never arm the trio in v58 - a 10s hold there stays a plain
-    single-character cast, so Ron and Hermione are never pulled out of
-    their follow AI by accident. The v54-v56 behaviour certification only
-    enriches discovery of metadata-less cooperative actors; a 10s P1 lock
-    on an ordinary object no longer certifies its class.
-
-    Target flicker up to 250ms (cursor None frames for P1, aim-pick gaps
-    for P2/P3) does not reset the dwell and does not tear down an armed
-    hold; a real release does end it (as the trio fire).
-
-    Aiming at another object, another player's normal cast, target
-    deletion, map travel, F10/split shutdown, or a missing trio member
-    cancels the bridge silently (StopCasting only, no ReleasedFire noise)
-    and restores the fields/liberty borrowed from P1 and the companions.
-    Under [actions], CoopCastFallback=0 disables it.
-    CoopCastHoldMs has a default/minimum of 10000; it cannot be lowered
-    into a normal short-cast shortcut.
+    Ordinary targets such as pumpkins and spawners do not arm charged x3; a
+    long hold on them remains a plain single cast. Cursor/aim flicker up to
+    250ms does not reset a dwell or tear down an armed charge. A different
+    target, another player's cast, target deletion, map travel, or split
+    shutdown cancels without bonus actors. CoopCastFallback=0 disables the
+    charged behavior; CastGameplay=1 is required.
 
   WHAT TO LOOK FOR IN hp3mod.log:
-    [coopcast] P2 started continuous >10-second hold on <target>  (dwell starts)
-    [coopcast] P2 held <target> for more than 10 seconds: the trio now
-    holds <spell> on <target> (N borrowed ..., cursor bridge locked/skipped)
-    [coopcast] P2 RELEASED the shared hold on <target>: the trio fires once
-      (the holder's own release plus one natural companion release each ...)
-    [coopcast] P1/P2/P3 >10-second hold on <ordinary object>: not the
-      cooperative CompanionSpellTrigger class family - no trio arm
-    If the arm is refused the reason is logged on the [coopcast] line
-    (busy hero, reflection incomplete, target replaced...). Test first on a
-    reloadable save and send hp3mod.log if the trio hold behaves differently
-    from the stock P1 interaction.
+    [coopcast] P2 started continuous >10-second hold on <target>
+    [coopcast] P2 held <target> for more than 10 seconds: same-caster
+      charged x3 <spell> armed on <target>; fires only on release
+    [coopcast] P2 RELEASED charged cast on <target>: one normal shot + two
+      same-caster bonus shots
+    [coopcast] P2 bonus shot 2/3 launched ...
+    [coopcast] P2 bonus shot 3/3 launched ...
+    [coopcast] P1 stock companion-join guard: <Ron/Hermione> AI movement
+      held at zero while charging <target>
+    If either bonus says it could not be launched/tracked, or the in-game
+    result differs, preserve hp3mod.log and report the complete test sequence.
 
 
 V57 LEVEL-TRAVEL CRASH FIX (ENTERING HOGWARTS)
