@@ -1254,3 +1254,56 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       flicker.
     * Release: v62 holder-origin volley fires once; icons vanish.
     * A pumpkins/spawner hold still produces no trio and no gestures.
+
+23. V66 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY (2026-09-09)
+-------------------------------------------------------------------------------
+- User request:
+  1. Fix Spongify view rotation lock where camera is restricted to vertical
+     movement only (horizontal/yaw rotation locked).
+  2. Research Lumos pass-through mechanics on see-through walls (temporary
+     state/timer on main character vs wall collision) and replicate the
+     mechanic on other player/companion characters so all players can walk
+     through revealed walls.
+
+- ROOT CAUSE 1 (SPONGIFY / JUMP VIEW YAW LOCK):
+  In src/dllmain.cpp (driveePawn), during standing jumps or Spongify pad bounces
+  (g_jumpStanding[i] == TRUE while airborne in PHYS_Falling, phNowLock == 2),
+  g_viewYaw[i] was continuously overwritten each frame with g_jumpYawLock[i].
+  While vertical pitch (g_lookPitch[i]) updated freely from stick/mouse input,
+  horizontal yaw rotation was wiped out every frame.
+  Fix: Remove the mid-air g_viewYaw[i] = g_jumpYawLock[i] assignment in
+  driveePawn. The companion's DesiredRotation continues to track g_viewYaw[i]
+  with RotationRate = 0 so the companion AI cannot pull the pawn toward stale
+  waypoints in mid-air, while rot[1] = g_viewYaw[i] keeps the mesh facing the
+  player's camera view. Horizontal and vertical camera/aim rotation are now
+  both fully free during Spongify launches and jumps.
+
+- ROOT CAUSE 2 (LUMOS & SEE-THROUGH SECRET WALL PASSABILITY):
+  In single-player HP3, casting Lumos on a gargoyle attaches and activates
+  TheLumosLight (a LumosLight actor) on the hero's wand (harry.Wand.TheLumosLight)
+  and starts a temporary Lumos timer. LumosSparklesTrigger / LumosTrigger at secret
+  walls detect the proximity/touch of TheLumosLight (or active Lumos wand) and
+  manage transparency and collision for GenericColObj / KWBlockingVolume.
+  In splitscreen:
+  1. When a companion (P2/P3) casts Lumos on a gargoyle or when Lumos is
+     activated, companion wands did not have TheLumosLight active/unhidden.
+  2. When companions approached the secret wall without Lumos on their own wand,
+     LumosSparklesTrigger never detected Lumos nearby.
+  3. GenericColObj / KWBlockingVolume retained companion-blocking collision.
+  Fix (src/lumos_sync.h + dllmain.cpp):
+  1. Pure state policy header src/lumos_sync.h tracking active state, timer/duration
+     (DefaultLumosDurationMs = 25s), light property verification, cylinder
+     proximity detection, and secret wall passability.
+  2. In cgDeliverHit, hitting a gargoyle or casting Lumos activates the Lumos
+     state.
+  3. In lumosTick (called every frame), active Lumos state is synchronized across
+     all player pawns and wands: TheLumosLight is activated (LT_Steady, brightness
+     255, collision enabled) and ShowWeapon is called.
+  4. Nearby LumosSparklesTrigger / LumosTrigger are triggered for any player
+     carrying Lumos, and GenericColObj / KWBlockingVolume collision is unblocked
+     (bCollideActors / bBlockPlayers = 0) so all players can walk seamlessly
+     through revealed see-through walls.
+
+- VERIFICATION: tests/lumos_sync_test.cpp asserts state activation, expiration,
+  tick-wrapping safety, light property checks, cylinder proximity detection,
+  and passability rules. All test suites pass via ./tests/run.sh.
