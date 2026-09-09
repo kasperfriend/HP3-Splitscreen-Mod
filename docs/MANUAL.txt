@@ -43,9 +43,12 @@ V63 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
     walking into range remain free to walk; all pins release on unlock.
 
     While the charge is armed on P2 or P3, the holder's single floating
-    wet-shader spell is joined by two companion wet-spell gestures near the
-    target - the same "one floating spell becomes three" look as stock P1's
-    held cast plus its AI companions joining. P1 already shows that look
+    wet-shader spell is joined by two companion wet-spell gestures. All three
+    hover at the stock gesture distance in FRONT of the target, each companion
+    icon sits on its own hero's side, and every icon glides in the air after
+    the aim and its hero (MoveSmooth chase, snapped once at lock) - the same
+    "one floating spell becomes three, moving a bit in the air" look as stock
+    P1's held cast plus its AI companions joining. P1 already shows that look
     through the stock cursor/companion-join path. The companion gestures are
     purely visual and do not change what fires.
 
@@ -128,7 +131,7 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v63 ...
+          === hp3mod build v64 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
       d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave

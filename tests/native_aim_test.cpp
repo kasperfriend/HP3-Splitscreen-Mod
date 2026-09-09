@@ -1,6 +1,7 @@
 // Runs the production adapter with an in-memory engine double. This checks
 // calls, ownership and transitions, NOT the Windows VM ABI or D3D8 rendering.
 #include "../src/aim_policy.h"
+#include "../src/coop_trio.h"
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -148,6 +149,22 @@ int main() {
     candidate=&c;assert(updateNativeAim(1,pawn,TRUE,cam,rot));
     assert(spawned==2&&destroyed==1&&changes==1&&readies==1&&choices==1);
     assert(lastIcon==uint32_t(uintptr_t(&iconToken))&&lastRadius==60&&!hidden(1));
+    // v64: the LOCK gesture snaps once at lock (stock SetLocation), then
+    // chases the moved goal with MoveSmooth((goal-loc)*10*dt) - it eases,
+    // never teleports, and converges.
+    {
+        float *locP=(float *)(fake(g_aimFX[1])->data+F.Location);
+        assert(std::fabs(locP[0]-(400.0f-68.0f))<0.01f);     // snap at lock
+        int newRot[3]={0,4096,0};
+        clockMs+=16;
+        assert(updateNativeAim(1,pawn,TRUE,cam,newRot));
+        float dir2[3];hp3aim::direction(newRot,dir2);
+        float g2[3]={400.0f-dir2[0]*68.0f,-dir2[1]*68.0f,-dir2[2]*68.0f};
+        // one frame moved partway toward the new goal, not all the way
+        assert(locP[0]>332.0f&&locP[0]<g2[0]+0.01f);
+        for(int f=0;f<200;f++){clockMs+=16;updateNativeAim(1,pawn,TRUE,cam,newRot);}
+        for(int j=0;j<3;j++) assert(std::fabs(locP[j]-g2[j])<0.05f);
+    }
     c.radius=120;assert(updateNativeAim(1,pawn,TRUE,cam,rot));assert(spawned==2&&readies==2&&lastRadius==120);
     canCast=false;updateNativeAim(1,pawn,TRUE,cam,rot);nativeAimPaneVisible(1);assert(hidden(1));
     canCast=true;updateNativeAim(1,pawn,TRUE,cam,rot);assert(!hidden(1));

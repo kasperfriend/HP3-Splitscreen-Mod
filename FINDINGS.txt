@@ -1103,3 +1103,76 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       ordinary single cast.
     * A hold shorter than 8 seconds must not arm and must not show the trio.
     * Level travel mid-hold: no crash, no orphaned companion gestures.
+
+21. V64 STOCK COOP GESTURE MOTION - FLOATING IN THE AIR (2026-09-09)
+-------------------------------------------------------------------------------
+- User request: "triple cast works alongside with triple wet shader animation,
+  but I want this animation to be improved. Right now it seems to just spawn 2
+  additional spell icons on side, but I want it to exactly replicate original
+  main character coop cast behaviour - when you hold a cast and AI companions
+  join, it shows floating wet shader spell icon moving a bit in air, not just
+  locked. Find how main character does it with companions, compare to existing
+  triple cast and replicate."
+
+- HOW THE ORIGINAL MOVES THE GESTURE (HP2 KWGame source, same family; HP3
+  docs table: "Gesture placement ... The original cursor also smooths its
+  motion."):
+    * SpellCursor.LockOn does NOT leave the gesture where it spawned: it
+      snaps it once with SpellGesture.SetLocation(vLOS_End) (in front of the
+      target at 1.1*CollisionRadius*SizeModifier + 2 + GestureDistance).
+    * stateLockedOn.Tick then chases every frame with
+      SpellGesture.MoveSmooth((goal - SpellGesture.Location) * rate * dt):
+      rate 10 while the target is still the current possible target
+      (goal = vLOS_End, which moves with the camera ray), rate 8 on the
+      centre-offset goal (target.Location + CentreOffset +
+      Normal(heroLoc - targetLoc) * dist) during a target flicker. So the
+      icon is never "locked": it glides after the aim/its hero.
+    * UnLock just hides the gesture; the same actor is reused.
+
+- WHAT V63 DID WRONG: coopTrioUpdate spawned the two companion SpellGesture
+  actors at centre +/- lateral spacing AT THE TARGET PLANE (z+6), never moved
+  them after spawn, and destroyed/re-created them on any target-candidate
+  flicker. The native-aim LOCK gesture was also SetLocation-ed at its goal
+  every frame (a teleport). Result: three icons, two "on side", all pinned.
+
+- V64 FIX (src/coop_trio.h + dllmain coopTrioUpdate + native_aim.h):
+    * New pure policy header src/coop_trio.h: stock per-hero goal
+      (heroGoal), front-of-target point (frontPoint), the split-screen
+      cluster goal (clusterGoal = front point + hero direction projected
+      perpendicular to the pane's view * v63 spacing), MoveSmooth chase
+      semantics, facing yaw, lateral fallback. Host tests in
+      tests/coop_trio_test.cpp (added to tests/run.sh).
+    * Companion goals now = stock front point pushed sideways along each
+      hero's own line of sight, so the three icons float in FRONT of the
+      target on their heroes' sides, not at the target plane; live hero
+      positions are read every frame (getPawn(hero slot)), so the goals move
+      with the heroes.
+    * Every icon (holder's native LOCK + two companions) is chased with
+      hp3trio::moveSmooth((goal-loc) * 10 * dt), snapped once at
+      spawn/lock exactly like LockOn.SetLocation; dt from GetTickCount,
+      clamped to kMaxDt (0.05 s).
+    * Target flicker: while coopActiveCandidate() is NULL, the overlay keeps
+      its last centre/dist (t.centre/t.dist) and keeps gliding on the last
+      goals - matching the stock lock, which survives aCurrentTarget
+      flicker. Only a real target loss (outside the 250 ms grace, handled by
+      coopRestore) or missing cached geometry disarms.
+    * Fallback: lateralGoal(front, holderLoc, radius, side) (the v63 recipe,
+      now anchored to the front point) only when a companion pawn is
+      unavailable/stale.
+
+- VERIFICATION: purity/motion tests pass on the host (coop_trio + native_aim
+  suite); the x86 Windows DLL cross-build succeeds (Zig 0.13 in this
+  sandbox; CI builds with 32-bit MinGW) with the v64 banner and
+  Direct3DCreate8/Direct3DCreate8@4 exports. bin/d3d8.dll is refreshed.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v64 (else an old DLL is being tested).
+    * Hold a CompanionSpellTrigger as P2/P3 past 8 s: THREE wet icons now
+      hover together in front of the target (not two beside it), and when
+      you nudge the aim/camera or a hero moves, the icons GLIDE - a short
+      damped drift, never a jump; on the first lock they appear in place
+      (stock snap), after that they always ease.
+    * Quick aim wiggle during the hold: the holder's icon trails the aim
+      smoothly; the two companion icons drift with their heroes' sides.
+    * Release: v62 holder-origin volley fires once; icons vanish.
+    * A pumpkins/spawner hold still produces no trio and no gestures.

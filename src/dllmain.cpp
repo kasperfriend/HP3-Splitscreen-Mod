@@ -38,6 +38,7 @@
 #include "aim_policy.h"
 #include "coop_cast.h"
 #include "charged_cast.h"
+#include "coop_trio.h"
 
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
@@ -141,8 +142,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v63"
-#define MOD_STAMP "build v63 - 2026-09-09 - 8-SECOND ARM + THREE FLOATING SPELLS: the charged x3 hold now arms after an 8-second continuous hold (was 10) on a cooperative-family target; nothing still fires at the threshold and x3 still fires once on release from the holder, unchanged from v62. When the charge is armed on P2/P3, the holder's single floating wet-shader spell is joined by two companion wet-spell gestures - the same three-floating-spells look as stock P1's held cast plus its AI companions joining (P1 already gets that look from the stock cursor/companions). The companion gestures are visual only: they never touch companion controllers, cast state, target/spell fields, or AI, and they change nothing about what fires. v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v64"
+#define MOD_STAMP "build v64 - 2026-09-09 - STOCK COOP GESTURE MOTION: the three floating wet-shader spells now behave like the original hero's SpellCursor/companion join instead of pinning two icons beside the target. All three icons hover at the stock gesture distance (1.1*CollisionRadius*SizeModifier + 2 + GestureDistance) in FRONT of the target; the two companions sit on their own heroes' sides of that point (v63 left them beside the target plane without depth), and every icon is chased with the stock SpellGesture MoveSmooth (goal-loc)*rate*dt - snapped once at lock like LockOn.SetLocation, then gliding in the air after the aim and its hero, rate 10/8. The holder's native-aim LOCK gesture gets the same chase; the two companion gestures survive the 250 ms target flicker, use the live hero positions, and fall back to the v63 lateral recipe only when a companion pawn is unavailable. Purely visual: it still owns only its gesture actors, never touches companion controllers, cast state, target/spell fields, or AI, and v63's 8-second arm + once-on-release x3 firing are unchanged. v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -5144,7 +5145,7 @@ static CgCand *coopActiveCandidate(void)
 }
 
 // ===========================================================================
-// v63: cooperative wet-shader "three floating spells" overlay.
+// v64: cooperative wet-shader "three floating spells" overlay, stock motion.
 //
 // The stock cooperative hold shows one floating wet-texture SpellGesture per
 // joined hero: P1's own cursor lock turns on the gesture, then the AI
@@ -5152,9 +5153,21 @@ static CgCand *coopActiveCandidate(void)
 // becomes three. v59-v62 keep the HOLDER's ordinary gesture (the engine
 // cursor for P1, the native-aim LOCK gesture for P2/P3) but deliberately no
 // longer borrow companions, so a mod-driven P2/P3 charged hold showed only
-// the holder's one floating spell. This overlay adds the two companion
-// gestures so an armed charge reads as three floating spells, exactly like
-// stock. It is a PURE VISUAL: it owns two extra SpellGesture actors and never
+// the holder's one floating spell. v63 added the two companion gestures and
+// PINNED them beside the target plane; v64 replaces that with the stock
+// recipe:
+//   * every icon hovers at fFinalGestureDistance =
+//     1.1 * CollisionRadius * SizeModifier + 2 + GestureDistance in FRONT of
+//     the target (the pane's vLOS_End, what LockOn.SetLocation snaps to);
+//   * each companion icon is pushed sideways along its own hero's direction
+//     (the stock Normal(heroLoc - targetLoc) contribution), so the three
+//     float clustered in front of the target as in the single-player coop view;
+//   * each icon is chased with the stock stateLockedOn.Tick motion,
+//     SpellGesture.MoveSmooth((goal - loc) * 10 * fTimeDelta) - snapped once
+//     at lock, then gliding in the air after the aim and its hero;
+//   * the icons survive the same 250 ms target flicker the hold tolerates
+//     (the stock lock keeps its gesture while aCurrentTarget flickers).
+// It is a PURE VISUAL: it owns two extra SpellGesture actors and never
 // touches any companion controller, cast state, target/spell field, or AI,
 // and it changes nothing about what fires on release.
 //
@@ -5172,6 +5185,16 @@ struct CoopTrioFX {
     DWORD spawnedAt[2];
     BOOL  configured[2];
     float radius;                // last SetReadyToCast radius applied
+    // v64: each companion gesture belongs to a hero and moves the way the
+    // stock SpellCursor moves its gesture (hero-relative goal + MoveSmooth
+    // chase), instead of being pinned beside the target.
+    int   hero[2];               // hero slot (0 Harry, 1 Hermione, 2 Ron)
+    float centre[3];             // last target aim centre (flicker survival)
+    BOOL  haveCentre;
+    float dist;                  // stock gesture distance (cached)
+    float cur[2][3];             // MoveSmooth position per gesture
+    DWORD curAt[2];
+    BOOL  smoothStarted[2];
 };
 static CoopTrioFX g_coopTrio = {};
 
@@ -5209,6 +5232,8 @@ static void coopTrioDisarm(const char *why)
         t.slot[k] = -1;
         t.spawnedAt[k] = 0;
         t.configured[k] = FALSE;
+        t.smoothStarted[k] = FALSE;
+        t.curAt[k] = 0;
     }
     if (destroyed)
         logf_("  [cooptrio] companion wet-spell gestures removed (%s)",
@@ -5254,44 +5279,106 @@ static void coopTrioUpdate(void)
         t.spell = spell;
         t.icon = icon;
         t.radius = -1.0f;
+        t.haveCentre = FALSE;
+        // The companions are the two heroes that are not the holder.
+        int comp[2], n = 0;
+        for (int h = 0; h < 3 && n < 2; h++)
+            if (h != holder) comp[n++] = h;
+        t.hero[0] = comp[0]; t.hero[1] = comp[1];
         char iconName[200];
         logf_("  [cooptrio] P%d charge armed: holder spell joined by two companion "
               "wet-spell gestures (%s) - three floating spells",
               holder + 1, objName(icon, iconName, sizeof(iconName)));
     }
 
+    DWORD now = GetTickCount();
     CgCand *cand = coopActiveCandidate();
-    if (!cand) { coopTrioDisarm("target candidate gone"); return; }
-    float centre[3];
-    cgAimPoint(cand, centre);
-    float radius = cgHitRadius(cand);
+    float centre[3], radius = t.radius, dist = t.dist;
+    if (cand) {
+        cgAimPoint(cand, centre);
+        radius = cgHitRadius(cand);
+        float sm = 1.0f, gd = 0.0f;
+        if (cand->info && cand->info->sizeOff > 0 &&
+            !IsBadReadPtr((BYTE *)cand->obj + cand->info->sizeOff, 4)) {
+            sm = *(float *)((BYTE *)cand->obj + cand->info->sizeOff);
+            if (!std::isfinite(sm) || sm < 0 || sm > 20) sm = 1.0f;
+        }
+        if (g_naB.gestureDistance > 0 &&
+            !IsBadReadPtr((BYTE *)cand->obj + g_naB.gestureDistance, 4)) {
+            gd = *(float *)((BYTE *)cand->obj + g_naB.gestureDistance);
+            if (!std::isfinite(gd) || fabsf(gd) > 2000) gd = 0.0f;
+        }
+        // Stock gesture distance: 1.1 * CollisionRadius * SizeModifier + 2 +
+        // GestureDistance (SpellCursor.LockOn's fFinalGestureDistance).
+        dist = hp3aim::gestureDistance(radius, sm, gd);
+        memcpy(t.centre, centre, 12);
+        t.radius = radius; t.dist = dist; t.haveCentre = TRUE;
+    } else if (t.haveCentre) {
+        // Same 250 ms target flicker tolerance as the hold: the stock lock
+        // keeps its gesture while aCurrentTarget flickers, so the three icons
+        // keep gliding on their last goals instead of disappearing for a frame.
+        memcpy(centre, t.centre, 12);
+    } else {
+        coopTrioDisarm("target candidate gone");
+        return;
+    }
+    if (!(dist > 0.0f) || dist > 2000.0f) dist = 68.0f;
 
-    // Lateral (perpendicular-to-view) spacing from the holder to the target.
     float *pl = (float *)((BYTE *)pawn + F.Location);
-    float hx = centre[0] - pl[0], hy = centre[1] - pl[1];
-    float hl = sqrtf(hx * hx + hy * hy);
-    if (hl < 1.0f) { hx = 1.0f; hy = 0.0f; hl = 1.0f; }
-    float ux = -hy / hl, uy = hx / hl;
+    // The pane's viewer direction: the holder's live camera ray (what the
+    // stock SpellCursor's vLOS_Dir is), fallen back to the hero->target line.
+    float viewDir[3];
+    if (holder >= 0 && holder < 8 && g_aimViewValid[holder]) {
+        hp3aim::direction(g_aimViewRot[holder], viewDir);
+    } else {
+        hp3trio::direction(pl, centre, viewDir);    // pawn -> target
+    }
+    float backDir[3] = { -viewDir[0], -viewDir[1], -viewDir[2] };
+    int viewYaw = hp3trio::facingYaw(backDir);      // faces the pane viewer
+    float front[3];
+    hp3trio::frontPoint(centre, viewDir, dist, front);
     float spacing = radius * 0.9f + 25.0f;
     if (spacing < 50.0f) spacing = 50.0f;
     if (spacing > 120.0f) spacing = 120.0f;
-    // Gesture faces opposite the line of sight (target -> holder), like the
-    // native-aim LOCK gesture faces opposite the camera direction.
-    float yawF = atan2f(-hy, -hx) * (65536.0f / 6.283185307179586f);
-    int facing[3] = { 0, (int)yawF & 65535, 0 };
-    DWORD now = GetTickCount();
 
     for (int k = 0; k < 2; k++) {
-        float s = (k == 0) ? spacing : -spacing;
-        float at[3] = { centre[0] + ux * s, centre[1] + uy * s, centre[2] + 6.0f };
+        float goal[3];
+        int yawF = viewYaw;
+        BOOL heroOK = FALSE;
+        void *hp = (t.hero[k] >= 0 && t.hero[k] < 8) ? getPawn(t.hero[k]) : NULL;
+        if (hp && hp != pawn && coopActorAlive(hp) && F.Location > 0 &&
+            !IsBadReadPtr((BYTE *)hp + F.Location, 12)) {
+            float *hl = (float *)((BYTE *)hp + F.Location);
+            float dirH[3];
+            // Stock goal geometry: target.Location + CentreOffset +
+            // Normal(heroLoc - targetLoc) * fFinalGestureDistance - the icon
+            // floats in front of the target on that hero's own side.
+            if (hp3trio::direction(centre, hl, dirH)) {
+                hp3trio::clusterGoal(centre, viewDir, dirH, dist, spacing, goal);
+                heroOK = TRUE;
+            }
+        }
+        if (!heroOK) {
+            // Companion unavailable (not in level / stale): keep the v63
+            // lateral recipe so the three-icon look survives.
+            hp3trio::lateralGoal(front, pl, radius, k, goal);
+        }
+        int facing[3] = { 0, yawF & 0xFFFF, 0 };
+
         if (t.fx[k] && !coopTrioFxAlive(k)) {
             t.fx[k] = NULL;
             t.slot[k] = -1;
             t.spawnedAt[k] = 0;
             t.configured[k] = FALSE;
+            t.smoothStarted[k] = FALSE;
+            t.curAt[k] = 0;
         }
         if (!t.fx[k]) {
-            t.fx[k] = spawnFX(pawn, g_naB.gestureClass, pawn, at, facing);
+            // Stock LockOn snaps the new gesture at its goal once
+            // (SetLocation); the MoveSmooth chase starts on the next frame.
+            t.smoothStarted[k] = FALSE;
+            t.curAt[k] = 0;
+            t.fx[k] = spawnFX(pawn, g_naB.gestureClass, pawn, goal, facing);
             if (!t.fx[k]) { coopTrioDisarm("companion gesture spawn failed"); return; }
             t.slot[k] = -1;
             for (int slot = 0; slot < g_objArray->Num; slot++)
@@ -5303,7 +5390,18 @@ static void coopTrioUpdate(void)
                 return;
             }
         }
-        if (!naPlace(t.fx[k], at, facing)) continue;
+        // Stock stateLockedOn.Tick chases the goal with
+        // MoveSmooth((goal-loc)*10*dt) - the icon floats in the air after its
+        // hero instead of teleporting to a pinned side position.
+        float dt = t.curAt[k] ? (float)(now - t.curAt[k]) / 1000.0f : 0.0f;
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > hp3trio::kMaxDt) dt = hp3trio::kMaxDt;
+        bool started = t.smoothStarted[k] != FALSE;
+        hp3trio::moveSmooth(t.cur[k], started, goal,
+                            (float)hp3trio::kSmoothRate, dt);
+        t.curAt[k] = now;
+        t.smoothStarted[k] = started ? TRUE : FALSE;
+        if (!naPlace(t.fx[k], t.cur[k], facing)) continue;
         if (!t.configured[k]) {
             if (!naParticles(t.fx[k], g_naB.gestureClass, 2)) {
                 setBoolProp(t.fx[k], g_naB.hidden, g_naB.hiddenMask, TRUE);

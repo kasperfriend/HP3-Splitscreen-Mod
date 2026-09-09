@@ -13,6 +13,9 @@ mkdir -p "$DIR/dist/tests"
     "$DIR/tests/coop_cast_test.cpp" -o "$DIR/dist/tests/coop_cast_test.exe"
 "$DIR/dist/tests/coop_cast_test.exe"
 "${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
+    "$DIR/tests/coop_trio_test.cpp" -o "$DIR/dist/tests/coop_trio_test.exe"
+"$DIR/dist/tests/coop_trio_test.exe"
+"${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
     "$DIR/tests/charged_cast_test.cpp" -o "$DIR/dist/tests/charged_cast_test.exe"
 "$DIR/dist/tests/charged_cast_test.exe"
 "${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
