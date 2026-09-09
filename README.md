@@ -13,7 +13,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 - **Distinct characters per view** (Harry / Hermione / Ron), each with their own camera, floor and collision
 - Real spellcasting through the game's own script VM (Rictusempra, Depulso, Lumos, ... ) with hold-to-aim, vertical aim, and (v51) player-1-faithful gameplay activation: statues, jump pads, doors and lesson objects react to player 2's spells
 - **Native HP3 aim effects (v52/v53)**: original seeking particles and target-sized hovered spell icons; hardware verification pending.
-- **Cooperative sustained-cast fallback (v54/v55)**: after a deliberate over-10-second P2/P3 hold on a class proven live by the game's own Player-1 cursor behavior (in a split-ON session) or by the stock P1-plus-companions demonstration (split OFF), the real Harry/Hermione/Ron enter the normal shared hold; ordinary spell targets are untouched.
+- **Cooperative sustained-cast fallback (v54/v55/v56)**: after a deliberate over-10-second P2/P3 hold (v55) — or a deliberate over-10-second Player-1 cursor lock on the same object (v56) — on a class proven live by the game's own Player-1 cursor behavior (in a split-ON session) or by the stock P1-plus-companions demonstration (split OFF), the real Harry/Hermione/Ron enter the normal shared hold; ordinary spell targets are untouched. v56 also adds 250ms cursor-flicker tolerance so frame-level None between same-target frames does not reset the dwell.
 - Camera that slides against walls instead of clipping, gamepad camera-follow + orbit (v13+)
 - Works on free-roam levels; survives level changes
 
@@ -24,7 +24,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v55`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v56`.
 
 ## Player 2 controls
 
@@ -50,14 +50,15 @@ Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`
 
 Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aim geometry, continuous cooperative-hold identity/timing, and native-effect lifecycle using an engine double—not HP3's actual VM, collision, animation, or rendering.
 
-### v54/v55 cooperative sustained cast (v55 fixes the split-ON dead gate; needs in-game verification)
+### v54/v55/v56 cooperative sustained cast (v55 fixes the split-ON dead gate; v56 adds a 10s P1 hold path and 250ms flicker tolerance; needs in-game verification)
 
 This is a **general fallback for genuine three-character sustained-cast interactions**, not a Pixie-well shortcut. The class is intentionally not guessed from a name or a generic `SpellTrigger`. The mod certifies a class only from live game behavior — never from a class/object name:
 
 - **split OFF** (stock demonstration): P1's real `SpellCursor` is locked on the object and both real companions independently report that same object as their spell target;
 - **split ON** (live session; this is the v55 fix): P1's genuine stock cursor lock on the object is sufficient evidence — while split is on, the companions are AI/mod-driven and their pawn `spellTarget` cannot demonstrate a shared hold, so the old code never certified anything and a >10-second P2/P3 hold stayed a plain cast.
+- **P1's own >10s cursor lock (v56 addition)**: a single uninterrupted Player-1 cursor lock of more than 10 seconds on an object ALSO fires the three-character cooperative hold directly. The engine continues to drive P1's normal cast; the mod borrows Hermione and Ron alongside. The 10s window tolerates up to 250ms of `aCurrentTarget = None` between same-target frames, so the v55 log's frame-level cursor flicker no longer resets the dwell.
 
-The log records admission as `[coopcast] CERTIFIED ...`; the proof lasts for the current level. A Player 2 or Player 3 player can then hold cast continuously on an instance of that certified class for **more than 10 seconds** — no Player-1-only ceremony is needed mid-session. The bridge calls the genuine Player-1 `SpellCursor.LockOn` only after reflection confirms its one-target input and the paired `UnLock` has no inputs; it also confirms that P1's live cursor retained the requested target. It then gives the actual trio the target spell/held casting state and lets the target's own script decide the result. It never invokes generic `Trigger`, synthetic `Touch`, repeated projectile impacts, or a guessed completion field.
+The log records admission as `[coopcast] CERTIFIED ...`; the proof lasts for the current level. A Player 1, 2, or 3 holder can then keep casting on an instance of that certified class for **more than 10 seconds** — no Player-1-only ceremony is needed mid-session (P1's path is itself the ceremony in v56). The bridge calls the genuine Player-1 `SpellCursor.LockOn` only after reflection confirms its one-target input and the paired `UnLock` has no inputs; it also confirms that P1's live cursor retained the requested target. It then gives the actual trio the target spell/held casting state and lets the target's own script decide the result. It never invokes generic `Trigger`, synthetic `Touch`, repeated projectile impacts, or a guessed completion field.
 
 The temporary P1/companion state is canceled and restored when the holder releases, changes target, another real player begins a different cast, the target disappears, the map changes, or F10 turns split-screen off. `CoopCastFallback=0` disables it; `CoopCastHoldMs` is clamped to a minimum/default of `10000`. Keep `CastGameplay=1`. Because this deliberately reaches the previously avoided P1 controller route, test it first on a save you can reload and send `hp3mod.log` if the game does not emit `[coopcast] CERTIFIED` or behaves differently from the stock P1 interaction.
 
@@ -131,14 +132,14 @@ README.md            this file
 FINDINGS.txt         the reverse-engineering findings (engine internals, offsets,
                      the cast pipeline, animation/physics quirks, dead ends)
 build.sh             build script (32-bit MinGW)
-src/dllmain.cpp      mod / engine integration (v55)
+src/dllmain.cpp      mod / engine integration (v56)
 src/cast_ground.h    testable post-cast floor-handoff policy
 src/aim_policy.h     testable camera/radius/ownership helpers
 src/coop_cast.h      testable continuous cooperative-hold identity/timing policy
 src/native_aim.h     original HP3 effect adapter (included by dllmain.cpp)
 src/d3d8.def         Direct3DCreate8 export alias
 src/hp3mod.ini       default configuration
-bin/d3d8.dll         prebuilt v54 binary (this PR changes src only; the GitHub Actions workflow rebuilds bin/d3d8.dll into the v55 release)
+bin/d3d8.dll         prebuilt v54 binary (this PR changes src only; the GitHub Actions workflow rebuilds bin/d3d8.dll into the v56 release)
 bin/hp3mod.ini       shipped configuration
 docs/MANUAL.txt      full in-game manual (all ini options, controls, troubleshooting)
 docs/NATIVE_AIM.md  package findings, limitations, hardware acceptance checklist
@@ -164,6 +165,7 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v53** resolves hovered SpellGesture icons on each chosen spell's class chain and accepts the game's wet/shader glyph materials instead of rejecting them as plain textures.
 - **v54** behavior-certifies genuine P1-led three-character cast classes live, then gives a P2/P3 player who continuously holds such a target for more than 10 seconds a scoped P1-cursor/trio-held-cast bridge. It restores all temporary state on every cancellation boundary and does not use generic trigger/touch/completion shortcuts. In-game verification pending.
 - **v55** fixes the v54 regression where a split-ON session never certified a class (the observer only ran while split was OFF), so a >10-second P2/P3 hold fell back to ordinary single casts. Certification now also runs live from P1's genuine stock cursor lock during a split session; the castable scan admits handler-only objects per object instead of suppressing them whenever any other class in the level declares a vulnerable property.
+- **v56** adds a Player-1 holder path and 250ms cursor-flicker tolerance. A single uninterrupted >10-second Player-1 cursor lock on an object now fires the three-character cooperative hold directly (P1's own cast goes through the engine; the mod borrows Hermione and Ron alongside), so a deliberate P1 hold on a CompanionSpellTrigger class enters the shared hold without depending on a separate P2/P3 >10s attempt. Brief None frames between same-target frames (<=250ms) no longer reset the cert dwell or the 10s fire dwell; a real release (>250ms) re-arms both. The P2/P3 >10s hold path is unchanged.
 
 ## Disclaimer
 

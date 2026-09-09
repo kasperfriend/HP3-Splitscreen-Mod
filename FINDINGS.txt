@@ -569,3 +569,78 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   continuous-hold threshold, the real P1 SpellCursor.LockOn bridge and the
   real trio StartCasting path are unchanged; no Trigger/Touch/impact/completion
   shortcut was added. Hardware re-verification pending (v55 build).
+
+15. V56: V55 P1-HOLD STILL DEAD - 10S P1 CURSOR LOCK DIRECTLY FIRES THE HOLD
+    + 250MS FLICKER TOLERANCE (2026-09-09)
+-----------------------------------------------------------------------------
+- Hardware capture of v55 confirmed the v55 cert fix worked in principle
+  (a deliberate 1.2s+ continuous P1 cursor lock emits [coopcast] CERTIFIED),
+  but a >10-second P1 hold on Save0.CompanionSpellTrigger10 still never
+  produced a triple cast. The stock P1 cursor was flicking its aCurrentTarget
+  through None for a frame or two between controller updates (cursor log:
+  ...->CompanionSpellTrigger10 -> None -> ...->CompanionSpellTrigger10
+  interleaved every 1-2 frames). v55's coopObserveP1 cleared the cert
+  pending-since on every None frame, so the 1200ms split-ON minDwell was
+  almost never reached, and the cooperative path was never armed before
+  P1's normal cast released.
+- Separate issue: v55's design only made P1 a *certification* source, not
+  a holder. coopStart / coopTick / coopMonitor all rejected holder < 1, so
+  even a P1 cursor lock that did certify a class still required a P2/P3
+  >10s hold to fire the triple cast - P1's own >10s hold was a no-op
+  past the cert step.
+- v56 fix 1 (P1 holder): coopStart / coopTick / coopMonitor /
+  coopStopHolderForSplitShutdown now accept holder=0 (P1). coopStart's
+  borrowed-hero loop is unchanged - it still skips p == holder, so for
+  holder=0 Hermione and Ron receive the StartCasting/PressedFire sequence
+  while the engine drives P1's own cast state. coopRestore's "stop before
+  release" loop calls StopCasting/ReleasedFire only on heroes whose
+  hero->started is true; for holder=0 that excludes hero[0] (P1's started
+  is FALSE because the mod never borrowed P1's cast state - the engine
+  already had it), so the engine's normal P1 cast release fires P1's
+  spell unchanged and the borrowed heroes are cleaned up without
+  spawning duplicate projectiles.
+- v56 fix 2 (P1's own 10s cursor lock fires the hold): a new
+  coopP1HoldTry() runs every frame in cgWatchP1, after coopObserveP1.
+  When g_p1CursorLockedAt is set and the cursor has stayed on the same
+  object for >= g_coopCastHoldMs (default 10s, set by [actions]
+  CoopCastHoldMs=10000), coopP1HoldTry certifies the class (if not
+  already in g_coopProof[]) and calls coopStart(0, candidate, key). The
+  candidate is the cursor's exact aCurrentTarget object, found via
+  cgFindCand or the certified-only g_coopDiscovered table; a static
+  ad-hoc CgCand is built if neither list contains it. The single
+  uninterrupted 10s lock is BOTH the cert evidence and the fire
+  condition, so a deliberate P1 hold on a CompanionSpellTrigger class
+  enters the shared hold without depending on a separate P2/P3 >10s
+  attempt.
+- v56 fix 3 (flicker tolerance, 250ms grace): a new g_p1CursorLockedTarget
+  / g_p1CursorLockedAt / g_p1CursorLastSeen / g_p1CursorFired quartet
+  tracks P1's cursor pointer and tolerates a brief None or different-
+  target gap of up to kP1CursorGrace (250ms). A gap longer than 250ms
+  resets the dwell and the latch; a different object pointer also
+  resets the dwell. The cert's pendingSince is anchored to
+  g_p1CursorLockedAt (the first-seen-at) so a frame-level None does
+  not restart the 1.2s cert dwell either. The same grace applies to
+  g_p1CursorFired: a real release (>250ms gap) re-arms the 10s fire
+  path for a subsequent lock, while a frame-level None inside the
+  grace window does not.
+- v56 unchanged from v55: the v55 cert mode split (split-ON P1 lock
+  admits the class; split-OFF keeps the strict all-three demonstration),
+  the per-object handler admission in cgScanCandidates, the stock P1
+  SpellCursor.LockOn/UnLock bridge, the real trio StartCasting path, the
+  native SpellGesture icon-chain / wet-shader fix and 770-unit aim. No
+  Trigger / Touch / impact / completion shortcut. The P2/P3 >10s hold
+  path is unchanged; v56's relax-of-holder-bound is a superset change
+  that does not modify the holder=1 / holder=2 flow.
+- Build environment: i686-w64-mingw32-g++ is not available on this build
+  host. The v56 source changes have been syntax-checked by running the
+  host policy tests (cast_ground, aim_policy, coop_cast, native_aim)
+  green; the full d3d8.dll cross-compile is deferred to a host with
+  mingw installed (the existing build.sh is unchanged). bin/d3d8.dll on
+  disk is still the stale v54 build; the v56 source banner is "build
+  v56" and must match the rebuilt binary.
+- Hardware re-verification pending (v56 build): the user's v55 test
+  trace showed the cursor flicker; v56 should now (a) certify the class
+  despite the flicker (cert dwell anchored to first-seen-at) and
+  (b) fire the cooperative path on P1's own 10s cursor lock without
+  requiring a separate P2/P3 >10s attempt. P2/P3 >10s hold on a
+  certified class is unchanged.

@@ -140,8 +140,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v55"
-#define MOD_STAMP "build v55 - 2026-09-09 - v54 REGRESSION FIX: class certification now runs during a live split session (stock P1 cursor lock admits the class; split-OFF keeps the strict all-three demonstration), so a continuous over-10-second P2/P3 hold on that class enters the normal three-character hold path with the real trio; castable-scan handler admission is per object, not suppressed by one level-wide vulnerable class. No generic Trigger bypass. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
+#define MOD_BUILD  "v56"
+#define MOD_STAMP "build v56 - 2026-09-09 - v55 P1-HOLD FIX: a single uninterrupted >10-second Player-1 cursor lock on an object ALSO fires the three-character cooperative hold (P1's own cast goes through the engine, the trio is borrowed alongside; cursor flicker up to 250 ms no longer resets the proof/hold dwell), so a deliberate P1 hold on a CompanionSpellTrigger class enters the shared hold without depending on a separate P2/P3 >10s attempt; P2/P3 >10s hold on a certified class still works unchanged. No generic Trigger bypass. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1672,6 +1672,16 @@ static CoopClassProof g_coopProof[8] = {};
 static int g_nCoopProof = 0;
 static void *g_coopProofPendingTarget = NULL, *g_coopProofPendingClass = NULL;
 static DWORD g_coopProofPendingSince = 0;
+// v56: P1's cursor lock also fires the cooperative path on its own. A real
+// game cursor can flicker its aCurrentTarget through None for a frame or two
+// between controller updates, so we record the target pointer + the last time
+// we observed it and treat a brief gap (<= kP1CursorGrace) as the same lock.
+// A longer gap, a different object, or an invalid pointer resets the dwell.
+static void *g_p1CursorLockedTarget = NULL;
+static DWORD g_p1CursorLockedAt    = 0;   // GetTickCount of first-seen-at
+static DWORD g_p1CursorLastSeen   = 0;   // last tick we saw any non-NULL t
+static int   g_p1CursorFired       = 0;   // 1 once coopStart was called here
+static const DWORD kP1CursorGrace = 250u;
 // Some stock cooperative actors intentionally have no vulnerableToClass and
 // therefore never enter g_cgCand. Keep a small, current-level cache of only
 // behaviour-certified actors so they can still be selected with the same
@@ -1682,6 +1692,7 @@ static int g_nCoopDiscovered = 0;
 static DWORD g_coopDiscoveredAt = 0;
 static BOOL coopClassMatchesProof(void *cls);
 static void coopObserveP1(void *p1, void *cursorTarget);
+static void coopP1HoldTry(void *p1);
 
 static void cgResetLevel(void)
 {
@@ -1697,6 +1708,9 @@ static void cgResetLevel(void)
     g_nCoopProof = 0;
     g_coopProofPendingTarget = g_coopProofPendingClass = NULL;
     g_coopProofPendingSince = 0;
+    g_p1CursorLockedTarget = NULL;
+    g_p1CursorLockedAt = g_p1CursorLastSeen = 0;
+    g_p1CursorFired = 0;
     memset(g_coopDiscovered, 0, sizeof(g_coopDiscovered));
     g_nCoopDiscovered = 0; g_coopDiscoveredAt = 0;
     g_cgP1Windows = 0;
@@ -2918,6 +2932,22 @@ static void cgWatchP1(void)
         if (sOffCur <= 0 || IsBadReadPtr((BYTE *)cur + sOffCur, 4)) {
             coopObserveP1(p1, NULL);
         }
+        // v56: P1's own uninterrupted >10-second cursor lock on the same
+        // object also fires the cooperative path. The cursor lock is the
+        // engine's "P1 is holding cast on this target" signal - the engine
+        // already handles PressedFire/ReleasedFire/cast state on the
+        // release; the mod borrows the other two heroes alongside. P1's
+        // natural release still fires its single spell, the trio then
+        // converges through coopMaintain until the holder releases.
+        coopP1HoldTry(p1);
+        // Drive the cooperative hold for P1: when the cursor is locked,
+        // P1 is "holding cast"; when the cursor releases, the shared hold
+        // restores (holder released). coopTick takes the same path as a
+        // P2/P3 hold - maintain, restore, fire (no-op once coopStart ran).
+        {
+            BOOL p1Held = (g_p1CursorLockedTarget != NULL);
+            coopTick(0, p1, p1Held);
+        }
         if (sOffPos > 0 && !IsBadReadPtr((BYTE *)cur + sOffPos, 4)) {
             void *t = *(void **)((BYTE *)cur + sOffPos);
             if (t != sLastPos) {
@@ -2953,10 +2983,64 @@ static BOOL coopClassMatchesProof(void *cls)
 // needing a brittle guessed class/property name from an unavailable package.
 static void coopObserveP1(void *p1, void *cursorTarget)
 {
-    if (!p1 || !cursorTarget || g_offSpellTarget <= 0 ||
-        !actorInCurrentLevel(cursorTarget) || cgDeleted(cursorTarget)) {
+    if (!p1) {
         g_coopProofPendingTarget = g_coopProofPendingClass = NULL;
         g_coopProofPendingSince = 0;
+        g_p1CursorLockedTarget = NULL; g_p1CursorLockedAt = 0; g_p1CursorFired = 0;
+        g_p1CursorLastSeen = 0;
+        return;
+    }
+    DWORD now = GetTickCount();
+    BOOL validTarget = cursorTarget && g_offSpellTarget > 0 &&
+                       actorInCurrentLevel(cursorTarget) &&
+                       !cgDeleted(cursorTarget) &&
+                       cgIsKnownClass(cgClassOf(cursorTarget));
+
+    // v56: P1 cursor flicker tolerance. The stock game cursor can briefly
+    // report None or a different object between controller updates (the
+    // v55 hardware log showed CompanionSpellTrigger10 -> None -> back in
+    // adjacent frames). Resetting every dwell timer on a single None frame
+    // means a deliberate 10+ second P1 hold never satisfies either the cert
+    // (1.2s split-ON) or the 10s P1 hold path. The grace window is small
+    // (250 ms) so a real cursor that has moved away is still treated as
+    // moved away; a held cursor with frame-level flicker is not.
+    if (validTarget) {
+        g_p1CursorLastSeen = now;
+        if (g_p1CursorLockedTarget != cursorTarget) {
+            // a *new* object (or the first one) - reset everything unless
+            // the previous target just disappeared briefly (covered by the
+            // grace check below at the None branch)
+            g_p1CursorLockedTarget = cursorTarget;
+            g_p1CursorLockedAt = now;
+            g_p1CursorFired = 0;
+            g_coopProofPendingTarget = g_coopProofPendingClass = NULL;
+            g_coopProofPendingSince = 0;
+        }
+    } else if (g_p1CursorLockedTarget) {
+        if ((DWORD)(now - g_p1CursorLastSeen) > kP1CursorGrace) {
+            // gap longer than grace: the cursor really has moved away
+            g_p1CursorLockedTarget = NULL;
+            g_p1CursorLockedAt = 0;
+            g_p1CursorFired = 0;
+            g_coopProofPendingTarget = g_coopProofPendingClass = NULL;
+            g_coopProofPendingSince = 0;
+        }
+        // otherwise: brief None - keep the lock state intact
+    }
+
+    if (!validTarget) {
+        // a brief None while we have a pending cert is not a hard reset;
+        // a real absence (gap > grace) already cleared the state above.
+        if (g_p1CursorLockedTarget == NULL) {
+            g_coopProofPendingTarget = g_coopProofPendingClass = NULL;
+            g_coopProofPendingSince = 0;
+        }
+        // The proof's pendingSince follows the lock's first-seen-at so a
+        // frame-level None does not restart the cert dwell.
+        if (g_p1CursorLockedTarget == g_coopProofPendingTarget &&
+            g_p1CursorLockedAt && g_coopProofPendingSince == 0) {
+            g_coopProofPendingSince = g_p1CursorLockedAt;
+        }
         return;
     }
     void *cls = cgClassOf(cursorTarget);
@@ -2991,9 +3075,14 @@ static void coopObserveP1(void *p1, void *cursorTarget)
             return;
         }
     }
-    DWORD now = GetTickCount();
     if (g_coopProofPendingTarget != cursorTarget || g_coopProofPendingClass != cls) {
-        g_coopProofPendingTarget = cursorTarget; g_coopProofPendingClass = cls; g_coopProofPendingSince = now;
+        g_coopProofPendingTarget = cursorTarget; g_coopProofPendingClass = cls;
+        // Anchor cert dwell to the cursor lock's first-seen-at so frame-level
+        // None/different-target flickers inside the grace window do not reset
+        // the dwell. The lock state was cleared/reset by the cursor block
+        // above; we only get here when cursorTarget is the same as
+        // g_p1CursorLockedTarget.
+        g_coopProofPendingSince = g_p1CursorLockedAt ? g_p1CursorLockedAt : now;
         return;
     }
     // Let one full controller update settle before recording proof; a single
@@ -3023,6 +3112,105 @@ static void coopObserveP1(void *p1, void *cursorTarget)
     else
         logf_("[coopcast] CERTIFIED P1 cooperative class %s after Harry, Hermione and Ron held %s; P2/P3 fallback may now use this class in this level",
               proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
+}
+
+// v56: P1's own uninterrupted >10-second cursor lock on the same object
+// fires the three-character cooperative path. The cursor lock is P1's
+// "holding cast on this target" signal; P1's normal cast state is already
+// authoritative (the engine drives PressedFire/ReleasedFire/cast state on
+// release), so the mod only has to borrow Hermione and Ron alongside. A
+// short cursor flicker (<= kP1CursorGrace) is tolerated: a deliberate P1
+// hold on a CompanionSpellTrigger would otherwise never satisfy this dwell
+// because the stock cursor can report None for a frame or two between
+// controller updates.
+//
+// A single 10-second uninterrupted cursor lock implicitly certifies the
+// class and then fires the cooperative path - no separate 1.2-second cert
+// gate is required. A deliberate sustained lock IS the evidence; the proof
+// is added the same way coopObserveP1 would have, so any later P2/P3 hold
+// still benefits from the certification entry as well.
+static void coopP1HoldTry(void *p1)
+{
+    if (!g_coopCastFallback || !g_castGameplay || g_coopActive.active ||
+        g_p1CursorFired || g_p1CursorLockedTarget == NULL || !p1)
+        return;
+    if (g_offSpellTarget <= 0) return;
+    DWORD now = GetTickCount();
+    if (g_p1CursorLockedAt == 0) return;
+    if ((DWORD)(now - g_p1CursorLockedAt) <= g_coopCastHoldMs) return;
+    // Latch so we only fire once per lock; release of the cursor resets the
+    // latch (handled in coopObserveP1 when the target changes/gone).
+    g_p1CursorFired = 1;
+    void *target = g_p1CursorLockedTarget;
+    if (!actorInCurrentLevel(target) || cgDeleted(target)) return;
+    void *cls = cgClassOf(target);
+    if (!cls || !cgIsKnownClass(cls)) return;
+    // Implicitly certify the class if a 1.2s cert was previously interrupted
+    // by cursor flicker. The 10s uninterrupted lock is the proof.
+    BOOL alreadyCertified = FALSE;
+    for (int p = 0; p < g_nCoopProof; p++)
+        if (g_coopProof[p].cls == cls) { alreadyCertified = TRUE; break; }
+    if (!alreadyCertified &&
+        g_nCoopProof < (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
+        CoopClassProof *proof = &g_coopProof[g_nCoopProof++];
+        proof->cls = cls; proof->observedAt = now;
+        char full[180];
+        objName(cls, full, sizeof(full));
+        const char *sp = strchr(full, ' ');
+        strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
+        proof->path[sizeof(proof->path) - 1] = 0;
+        char targetName[180];
+        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's "
+              "sustained >10s cursor lock on %s; firing shared hold now",
+              proof->path, objName(target, targetName, sizeof(targetName)));
+    } else if (!alreadyCertified) {
+        logf_("[coopcast] P1 10s hold on %s: proof table full; cannot certify class",
+              cls ? "object" : "?");
+        return;
+    }
+    // Find a CgCand for the locked object (the normal list prefers, the
+    // certified list as fallback). Whichever is found, build the hp3coop
+    // key from the same slot/object/class the candidate was built from.
+    if (g_castGameplay) cgScanCandidates(p1, FALSE);
+    CgCand *cand = cgFindCand(target);
+    if (!cand) {
+        coopRefreshCertifiedCandidates();
+        for (int k = 0; k < g_nCoopDiscovered; k++)
+            if (g_coopDiscovered[k].obj == target) { cand = &g_coopDiscovered[k]; break; }
+    }
+    if (!cand) {
+        // No candidate found - the locked object isn't in either scan
+        // (a fragile certified-class without metadata). We still try
+        // coopStart with an ad-hoc candidate; it will reject unless the
+        // class is already in the proof table (which it is now).
+        static CgCand sAdHoc = {};
+        sAdHoc = {};
+        sAdHoc.obj = target;
+        sAdHoc.slot = -1;
+        sAdHoc.info = cgClassInfo(cls);
+        objName(target, sAdHoc.name, sizeof(sAdHoc.name));
+        if (F.Location > 0 && !IsBadReadPtr((BYTE *)target + F.Location, 12))
+            memcpy(sAdHoc.loc, (BYTE *)target + F.Location, 12);
+        cand = &sAdHoc;
+    }
+    // Look up the slot in GObjObjects - coopTargetAlive/recoopStart both
+    // require a valid slot index.
+    int slot = cand->slot;
+    if (slot < 0 && g_objArray) {
+        int n = g_objArray->Num;
+        for (int j = 0; j < n && j < 400000; j++)
+            if (g_objArray->Data[j] == target) { slot = j; break; }
+    }
+    if (slot < 0) {
+        logf_("[coopcast] P1 10s hold on %s: target not in GObjObjects - "
+              "skip cooperative arming", objName(target, cand->name, sizeof(cand->name)));
+        return;
+    }
+    hp3coop::Target key = { target, cls, slot };
+    char tname[180];
+    logf_("[coopcast] P1 10s hold on %s (cursor lock, split=%s): arming shared hold",
+          objName(target, tname, sizeof(tname)), g_splitOn ? "ON" : "OFF");
+    coopStart(0, cand, key);
 }
 
 // Pick something worth casting at. A companion's natural targets in this game
@@ -4695,7 +4883,7 @@ static void coopStopHolderForSplitShutdown(void)
 {
     if (!g_coopActive.active) return;
     int holder = g_coopActive.holder;
-    if (holder < 1 || holder > 2) return;
+    if (holder < 0 || holder > 2) return;
     CoopCastHero *hero = &g_coopActive.hero[holder];
     if (!coopActorAlive(hero->pawn)) return;
     if (g_fnStopCast)
@@ -4815,7 +5003,10 @@ static void coopMaintain(void)
 
 static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
 {
-    if (g_coopActive.active || holder < 1 || holder > 2 || !candidate ||
+    // v56: holder is the zero-based split slot (0 = P1, 1 = P2, 2 = P3).
+    // P1 is accepted as a holder: the engine already drives their cast
+    // state, the mod only borrows the other two heroes alongside.
+    if (g_coopActive.active || holder < 0 || holder > 2 || !candidate ||
         !coopTargetAlive(key)) return FALSE;
     if (!g_fnFire || !g_fnStartCast || !g_fnStopCast ||
         g_offSpellTarget <= 0 || g_offCurrentSpell <= 0) {
@@ -4954,7 +5145,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
 
 static void coopTick(int i, void *pawn, BOOL held)
 {
-    if (i < 1 || i > 2) return;       // Player 2 or Player 3 only
+    if (i < 0 || i > 2) return;       // Players 1..3 (0 = P1, 1 = P2, 2 = P3)
     DWORD now = GetTickCount();
     hp3coop::Target key = {};
     key.slot = -1;
@@ -5761,10 +5952,10 @@ static void coopMonitor(void)
 {
     if (!g_coopActive.active) return;
     int holder = g_coopActive.holder;
-    if (holder < 1 || holder > 2 || g_letAI[holder] ||
+    if (holder < 0 || holder > 2 || g_letAI[holder] ||
         !coopActorAlive(g_coopActive.hero[holder].pawn) ||
         (g_pawn[holder] && g_pawn[holder] != g_coopActive.hero[holder].pawn)) {
-        if (holder >= 1 && holder < 8) g_coopBlocked[holder] = TRUE;
+        if (holder >= 0 && holder < 8) g_coopBlocked[holder] = TRUE;
         coopRestore("holder is no longer under split-screen control");
         return;
     }
