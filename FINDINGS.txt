@@ -942,3 +942,75 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   cross-build succeeds; Direct3DCreate8 and Direct3DCreate8@4 exports plus the
   v60 startup banner are present. In-game HP3 behavior is not available in the
   sandbox and must be checked on hardware.
+
+18. v61 hardware-report diagnosis and source correction (2026-09-09)
+  v60 hardware report (same tester, split OFF + 2-player split): Ron's AI is
+  better - joint casts with P1 now happen - but he still runs/casts/runs, and
+  the >10-second triple-cast extras remain visual-only with no added effect.
+  Two log excerpts pin the causes:
+
+    * P1 solo (split OFF), Save0.CompanionSpellTrigger2: one normal shot plus
+      two bonuses launched at 700 u/s over dist 485 with a 1393 ms window, yet
+      neither bonus ever logs Touch/ProcessTouch. Root cause: renderSplit-
+      Portals' split-OFF branch returned after cgWatchP1 without calling
+      cgTick, so P1's bonus pendings armed but never ticked - natural collision
+      alone was expected to deliver, and it did not.
+    * P2 (split ON), HP3_InsideHub.CompanionSpellTrigger9: all three Depulso-
+      Spell actors log Touch+ProcessTouch (delivery worked) yet the trigger
+      still does not complete. Same-caster x3 hits are therefore not what the
+      trigger counts: it wants distinct casters (the stock game recruits
+      Hermione/Ron to hold with Harry for a reason), and three same-tick hits
+      from one pawn do not satisfy it.
+
+  v61 keeps "no borrowing" but stops pretending one caster is three. Every
+  10-second charged release now fires a VIRTUAL TRIO: the holder's untouched
+  normal shot #1, plus two bonus projectiles launched from the other two trio
+  members' wand positions at staggered speeds (shot #2 at 100%, shot #3 at 75%)
+  with their Instigator fields labelled to those companions (resolved by name
+  via Engine.Projectile/Actor.Instigator; Owner stays the holder so bonuses
+  still cannot collide with the spawning pawn). The trigger observes three
+  distinct casters arriving as three separate hits; no companion controller,
+  cast state, target/spell field, or AI is written - only the two new spell
+  actors. Dead/missing companions fall back to holder origin/Instigator.
+  cgTick now runs on the split-OFF path too, so P1's solo bonuses deliver.
+
+  The guard is rebuilt around the engine tick order. A PostRender velocity/
+  accel zero is overwritten by the next AI tick before physics integrates, so
+  v60's impulse-only guard could not hold Ron - and pinning from the first
+  lock also blocked the legitimate approach-to-range walk. v61 pins only
+  companions that are actually casting (the engine's own IsAimingOrCasting
+  query, falling back to a held currentSpell), and pins GroundSpeed/AccelRate
+  with save/restore - the same mechanism driveePawn uses for idle split pawns
+  - while non-casting companions keep walking. Pins release per-slot when a
+  companion stops casting, when its slot goes human, on P1 unlock/reset, and
+  the flags drop on level travel (fresh pawns spawn with engine stats).
+
+  Preserved: nothing auto-fires at 10 seconds (x3 fires once on release), the
+  cooperative-family gate (CompanionSpellTrigger token or behaviour proof),
+  native wet SpellGesture icon, 770-unit aim, cast gameplay, and v58 level-
+  travel safety.
+
+  Local validation: all five host policy suites pass (cast_ground, aim_policy,
+  coop_cast, charged_cast, native_aim); the exact v61 function bodies
+  (coopUnguardStockCompanion(s), coopQuietStockCompanionMotion,
+  coopInstigatorOffset, coopLaunchBonusProjectile, coopRestore) compile clean
+  under g++ -Wall -Wextra against stubs plus the real charged_cast.h/
+  coop_cast.h, and a brace/paren audit of dllmain.cpp balances. No Windows
+  cross toolchain exists in this sandbox (mingw/zig unavailable, release-asset
+  host unreachable), so dist/d3d8.dll and bin/d3d8.dll could NOT be rebuilt
+  here - build via CI (build-release.yml) or a local MinGW/zig toolchain and
+  confirm line 2 of hp3mod.log says build v61.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v61 (else an old DLL is being tested).
+    * P1 solo vs a CompanionSpellTrigger: hold 10 s, release - the log shows
+      the normal shot plus two "[virtual trio]" bonuses from Hermione/Ron
+      positions, then Touch/ProcessTouch for the bonuses (delivery now ticks
+      with split OFF), and the trigger completes.
+    * P2 hold in a 2-player split: same three distinct origins/Instigators in
+      the log, arrivals visibly staggered, trigger completes.
+    * Ron during a P1 cooperative hold: walks to range unpinned, then holds
+      still while casting ("casting held still (GS/AR pinned)"), and resumes
+      following on unlock ("guard released ... (p1 unlock)"). No run/cast/run.
+    * 10 s hold on a pumpkin/other object - NO trio, ordinary single cast.
+    * Level travel mid-hold - no crash, no stuck pins (regression check).
