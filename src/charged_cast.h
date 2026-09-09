@@ -1,11 +1,11 @@
 #ifndef HP3_CHARGED_CAST_H
 #define HP3_CHARGED_CAST_H
 
-// Pure trajectory planner for the two same-caster projectiles added by a
-// charged cooperative cast. SpawnSpell can return a projectile at the pawn's
-// origin with zero velocity; leaving it there creates the permanent red glow
-// seen in the v59 hardware report. The runtime applies this plan to each bonus
-// actor before the next engine tick.
+// Pure fallback trajectory planner for charged cooperative casts. P2/P3 bonus
+// spells normally copy the holder's real projectile kinematics exactly. The
+// stock P1 projectile is engine-owned, so its first bonus uses this planner at
+// the holder's position and the second bonus clones that result. SpawnSpell can
+// otherwise leave an actor at the pawn with zero velocity (the v59 red glow).
 #include <cmath>
 
 namespace hp3charged {
