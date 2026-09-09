@@ -1381,3 +1381,75 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
     * After entering Hogwarts as P1 while split is ON, Hermione moves again;
       the log shows "[physrecover] p1 stranded Falling->Walking" if she ever
       parks in mid-air.
+
+==========================================================================
+2026-09-09 (evening) - v66.3: LUMOS AS PLAYER 2 GPF (Texture receiver)
+==========================================================================
+
+- FIELD REPORT: casting Lumos as Player 2 (Hermione, driven pawn index p1)
+  crashed the game with the Windows fault dialog:
+
+    History: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon,
+             Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render
+             <- UGameEngine::Draw <- UWindowsViewport::Repaint <- ...
+
+  hp3mod.log ends one ProcessEvent earlier: "-> ProcessEvent
+  LumosTrigger.Trigger" right after "[lumos] p1 delivered Lumos hit to
+  gargoyle HP3_InsideHub.gargoyle6 - Lumos activated for 25s".
+
+- ROOT CAUSE: the v66 per-level Lumos scan (lumosScanActors) admitted ANY
+  object whose whole GetFullName string ("<Class> <Package>.<ObjectName>")
+  contained "LumosTrigger"/"LumosSparklesTrigger"/"LumosSparkles". Besides
+  the placed trigger actors that also means:
+
+    * the UClass objects themselves: "Class hgame.LumosTrigger",
+      "Class hgame.LumosSparklesTrigger";
+    * the spell's HUD texture: "Texture hgame.LumosTriggerIcon" - loaded
+      into the object table alongside Lumos.
+
+  A cached Texture then passed every fire-time guard in lumosTick:
+  cgLiveObject says live (it IS a live UObject), and the Location
+  (+0x150) / CollisionRadius reads at ACTOR offsets land inside the shared
+  UObject allocator arena, so IsBadReadPtr passes and garbage floats can
+  satisfy the player-proximity cylinder. The trigger loop then called
+  callFn(texture, g_fnTrigger="KWGame.KWPawn.Trigger") - pawn script
+  bytecode executing with a texture-sized object as 'this'. Instant GPF,
+  receiver named verbatim in the crash history. The GenericColObj /
+  KWBlockingVolume secret-wall scan had the same flaw (its substring matched
+  the wall classes themselves, which then got actor collision bits written
+  into class memory).
+
+- FIX (v66.3):
+    * Scan: membership is decided by the object's CLASS TOKEN only (the word
+      before the first space of the full name) - hp3lumos::isLumosTriggerObject /
+      isSecretWallObject in src/lumos_sync.h. Rejected look-alikes are counted
+      and logged once per scan ("[lumos] scan: ... name look-alikes rejected").
+    * Fire/write sites (defense in depth): immediately before ProcessEvent
+      and before any wall collision write, lumosClassVerified() re-checks the
+      receiver through the calibrated UObject::Class chain (cgClassOf ->
+      cgClassInfo, guarded dword reads only - no GetFullName, no Outer walk,
+      safe on a recycled pointer). A proven non-actor/wrong-family object is
+      skipped and logged once. While the class chain is not yet verified
+      (fresh level, index not rebuilt), the strict scan classification stands.
+      This also closes the pointer-recycling variant: a destroyed trigger's
+      pool address being reused by a different object mid-level.
+
+- VERIFICATION: host policy suites pass (tests/run.sh) - the lumos suite now
+  replays the exact crash names ("Texture hgame.LumosTriggerIcon",
+  "Class hgame.LumosTrigger", "LumosSpell HP3_InsideHub.LumosSpell1",
+  "Class KWGame.KWBlockingVolume", ...) against the new classifiers. The
+  Windows DLL could NOT be rebuilt in this sandbox (no i686 MinGW toolchain;
+  package install blocked), so dist/d3d8.dll and bin/d3d8.dll are NOT
+  refreshed here - build via CI (build-release.yml, workflow_dispatch) and
+  confirm line 2 of hp3mod.log says build v66.3.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v66.3 (else an old DLL is being tested).
+    * The per-level line "[lumos] scan: N triggers, M walls cached; A+B name
+      look-alikes rejected (v66.3 class-token rule)" appears once per level.
+    * Casting Lumos as Player 2 (index p1) at the HP3_InsideHub gargoyle no
+      longer crashes; "-> ProcessEvent LumosTrigger.Trigger" is followed by
+      normal [pelog]/[castwatch] traffic instead of the detach line, and any
+      rejected entry would show as "[lumos] v66.3 BLOCKED Trigger()".
+    * Secret walls still open for every player while a Lumos light is
+      carried (the real trigger/wall actors are unchanged by this fix).

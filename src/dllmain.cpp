@@ -163,8 +163,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v66.2"
-#define MOD_STAMP "build v66.2 - 2026-09-09 - STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES. (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66.3"
+#define MOD_STAMP "build v66.3 - 2026-09-09 - LUMOS-AS-P2 TEXTURE TRIGGER CRASH FIXED. (1) CRASH: casting Lumos (reported as Player 2 on a gargoyle in HP3_InsideHub) GPF'd inside UGameEngine::Draw with the crash history naming the receiver: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger). The per-level Lumos scan admitted ANY object whose full GetFullName string contained the token - the placed trigger actors, but also the UClass entries (Class hgame.LumosTrigger) and the spell's HUD asset Texture hgame.LumosTriggerIcon that the engine loads alongside Lumos. A cached Texture is a live UObject (cgLiveObject passes) and the Location/CollisionRadius reads at actor offsets land in the shared UObject allocator arena (IsBadReadPtr passes), so garbage floats could pass the proximity test and the mod ran pawn Trigger() bytecode with a Texture as 'this'. Scan membership is now decided by the CLASS TOKEN only (hp3lumos class-token helpers in src/lumos_sync.h, regression-tested in tests/lumos_sync_test.cpp with the exact crash names), look-alike rejections are counted and logged per scan, and - defense in depth against a cached pointer being recycled into a different object mid-level - the Trigger() fire site and the secret-wall collision writes re-verify the receiver's class through the calibrated UObject::Class chain (guarded dword reads only, no GetFullName) before running or writing anything; a proven impostor is skipped and logged once. (2) The same class-token rule now guards the GenericColObj/KWBlockingVolume wall cache, which previously also cached the class objects themselves and wrote actor collision bits into them. v66.2 STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES: (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -8775,21 +8775,55 @@ static void lumosScanActors(void)
         g_lumosScanDone = FALSE; return;
     }
     char name[160];
+    int impostorTrig = 0, impostorWall = 0;   // v66.3 rejected look-alikes
     for (int k = 0; k < n; k++) {
         void *obj = g_objArray->Data[k];
         if (!obj || IsBadReadPtr(obj, 0x100)) continue;
         objName(obj, name, sizeof(name));
-        BOOL isLumosTrigger = strstr(name, "LumosSparklesTrigger") ||
-                              strstr(name, "LumosTrigger") ||
-                              strstr(name, "LumosSparkles");
-        BOOL isSecretWall   = strstr(name, "GenericColObj") ||
-                              strstr(name, "KWBlockingVolume");
+        // v66.3 crash fix: only the object's CLASS token (the word before the
+        // first space) decides membership. The v66 whole-string substring
+        // match also admitted "Class hgame.LumosTrigger" and the HUD asset
+        // "Texture hgame.LumosTriggerIcon"; with Lumos active the trigger
+        // loop then ran KWGame.KWPawn.Trigger on that Texture - the P2-Lumos
+        // general protection fault (receiver named in the crash history).
+        BOOL isLumosTrigger = hp3lumos::isLumosTriggerObject(name);
+        BOOL isSecretWall   = hp3lumos::isSecretWallObject(name);
+        if (!isLumosTrigger &&
+            (strstr(name, "LumosSparklesTrigger") || strstr(name, "LumosTrigger") ||
+             strstr(name, "LumosSparkles")))
+            impostorTrig++;
+        if (!isSecretWall && (strstr(name, "GenericColObj") || strstr(name, "KWBlockingVolume")))
+            impostorWall++;
         if (isLumosTrigger && g_lumosTriggersN < LUMOS_MAX_ACTORS)
             g_lumosTriggers[g_lumosTriggersN++] = obj;
         if (isSecretWall && g_lumosWallsN < LUMOS_MAX_ACTORS)
             g_lumosWalls[g_lumosWallsN++] = obj;
     }
     g_lumosScanDone = TRUE;
+    logf_("[lumos] scan: %d triggers, %d walls cached; %d+%d name look-alikes "
+          "rejected (v66.3 class-token rule)", g_lumosTriggersN, g_lumosWallsN,
+          impostorTrig, impostorWall);
+}
+
+// v66.3 crash fix: re-verify a cached object's class at the moment the mod is
+// about to RUN CODE ON IT (Trigger) or write actor collision bits into it.
+// The class-token scan is exact for what it saw at scan time, but a cached
+// pointer can be recycled into a DIFFERENT object by mid-level teardown (a
+// destroyed sparkles trigger whose pool address is reused). cgClassOf is a
+// pair of IsBadReadPtr-guarded dword reads - no GetFullName, no Outer walk -
+// so this stays safe and cheap on the fire path and on wall writes. When the
+// class chain was never verified the (already class-token-strict) scan result
+// stands, matching the pre-v66.3 trust level for code paths we cannot prove.
+static BOOL lumosClassVerified(void *obj, BOOL wantWall)
+{
+    if (!obj || IsBadReadPtr(obj, 0x30)) return FALSE;
+    if (!g_cgChainOK) return TRUE;
+    void *cls = cgClassOf(obj);
+    if (!cls) return FALSE;                  // recycled memory / not a UObject of known class
+    CgClass *ci = cgClassInfo(cls);
+    if (!ci || !ci->isActor) return FALSE;   // Texture/UClass/Function impostor - never run Trigger on it
+    return wantWall ? (hp3lumos::isSecretWallClassToken(ci->token) ? TRUE : FALSE)
+                    : (hp3lumos::isLumosTriggerClassToken(ci->token) ? TRUE : FALSE);
 }
 
 // Cached, liveness-validated wand lookup. The wand is stable for a level; the
@@ -8964,8 +8998,16 @@ static void lumosTick(void)
         BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, tloc, rad, hgt);
         if (lumosActive && nearPlayer && !g_lumosTrigFired[k]) {
             g_lumosTrigFired[k] = TRUE;
-            if (g_fnTrigger)
-                callFn(obj, g_fnTrigger, "LumosTrigger.Trigger");
+            // v66.3 crash fix: never hand KWGame.KWPawn.Trigger to an object
+            // that is not provably a Lumos trigger actor RIGHT NOW (the P2
+            // Lumos GPF ran it on "Texture hgame.LumosTriggerIcon").
+            if (g_fnTrigger) {
+                if (lumosClassVerified(obj, FALSE))
+                    callFn(obj, g_fnTrigger, "LumosTrigger.Trigger");
+                else
+                    logf_("  [lumos] v66.3 BLOCKED Trigger() on %p - cached entry "
+                          "is not a live Lumos trigger actor", obj);
+            }
         }
         if (!lumosActive) g_lumosTrigFired[k] = FALSE;
     }
@@ -8992,6 +9034,12 @@ static void lumosTick(void)
         }
         signed char want = wantCollide ? 1 : 0;
         if (g_lumosWallColl[k] == want && !(reassert && want == 0)) continue;
+        // v66.3 crash fix: same verification as the Trigger() fire site - do
+        // not write actor collision bits into a recycled-pointer impostor.
+        if (!lumosClassVerified(obj, TRUE)) {
+            g_lumosWallColl[k] = -1;         // retry only if it ever re-verifies
+            continue;
+        }
         setLumosActorCollision(obj, wantCollide);
         g_lumosWallColl[k] = want;
     }

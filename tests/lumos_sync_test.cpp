@@ -80,6 +80,52 @@ int main()
     assert(!shouldSecretWallBePassable(false, true));
     assert(!shouldSecretWallBePassable(false, false));
 
-    std::puts("lumos sync: state, timer, light, proximity and passability assertions passed");
+    // 9. v66.3 crash regression: the per-level scan must accept only objects
+    //    whose CLASS token is the Lumos trigger / secret wall family. Replays
+    //    the exact 2026-09-09 Player-2 Lumos GPF, whose history named
+    //    (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger):
+    //    the old whole-string substring cache admitted that HUD texture and
+    //    later fired KWPawn.Trigger on it.
+    // 9a. Placed level actors accept (class token == wanted family).
+    assert(isLumosTriggerObject("LumosTrigger HP3_InsideHub.LumosTrigger3"));
+    assert(isLumosTriggerObject("LumosSparklesTrigger HP3_InsideHub.LumosSparklesTrigger7"));
+    assert(isLumosTriggerObject("LumosSparkles HP3_InsideHub.LumosSparkles2"));
+    assert(isLumosTriggerObject("LumosTrigger Save0.LumosTrigger0"));
+    // 9b. Non-actor look-alikes carrying the token in their own name reject.
+    assert(!isLumosTriggerObject("Texture hgame.LumosTriggerIcon"));   // the GPF receiver
+    assert(!isLumosTriggerObject("Class hgame.LumosTrigger"));
+    assert(!isLumosTriggerObject("Class hgame.LumosSparklesTrigger"));
+    assert(!isLumosTriggerObject("Function hgame.LumosTrigger.PostTouch"));
+    assert(!isLumosTriggerObject("Sound hgame.Sounds.LumosTriggerOn"));
+    assert(!isLumosTriggerObject("LumosSpell HP3_InsideHub.LumosSpell1"));
+    assert(!isLumosTriggerObject("WetTexture hgame.SpellFX.LumosWet1"));
+    assert(!isLumosTriggerObject(""));
+    assert(!isLumosTriggerObject(0));
+    // 9c. Secret walls: placed actors accept, class/asset look-alikes reject.
+    assert(isSecretWallObject("GenericColObj HP3_InsideHub.GenericColObj12"));
+    assert(isSecretWallObject("KWBlockingVolume HP3_InsideHub.KWBlockingVolume5"));
+    assert(!isSecretWallObject("Class KWGame.KWBlockingVolume"));
+    assert(!isSecretWallObject("Class KWGame.GenericColObj"));
+    assert(!isSecretWallObject("Texture KWGame.Tex.GenericColObjSkin"));
+    assert(!isSecretWallObject("Mover HP3_InsideHub.Mover16"));
+    assert(!isSecretWallObject(0));
+    // 9d. Substring still works within the class token itself (subclasses).
+    assert(isLumosTriggerObject("LumosTriggerLarge MyLevel.LumosTriggerLarge0"));
+    // 9e. classTokenOf edge behaviour.
+    {
+        char tok[64];
+        classTokenOf("LumosTrigger HP3_InsideHub.LumosTrigger3", tok, sizeof(tok));
+        assert(0 == std::strcmp(tok, "LumosTrigger"));
+        classTokenOf("NoSpaceHere", tok, sizeof(tok));
+        assert(0 == std::strcmp(tok, "NoSpaceHere"));
+        classTokenOf(0, tok, sizeof(tok));
+        assert(0 == std::strcmp(tok, ""));
+        char tiny[6];
+        classTokenOf("LumosSparklesTrigger X.Y", tiny, sizeof(tiny));
+        assert(0 == std::strcmp(tiny, "Lumos"));   // truncated, no overflow, still terminated
+    }
+
+    std::puts("lumos sync: state, timer, light, proximity, passability and "
+              "v66.3 class-token scan assertions passed");
     return 0;
 }
