@@ -141,8 +141,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v61"
-#define MOD_STAMP "build v61 - 2026-09-09 - v61 VIRTUAL TRIO + DELIVERY TICK + STATE-AWARE RON GUARD: v60 hardware proved three things - (1) P1's split-OFF bonus pendings never ticked because renderSplitPortals returned before cgTick, so solo triple-cast extras flew visually but never delivered; (2) P2's same-caster x3 Touch+ProcessTouch still did not satisfy CompanionSpellTrigger, which counts distinct casters, not same-caster hits; (3) Ron's PostRender-only velocity zero is overwritten by the next AI tick before physics integrates, so the run/cast/run oscillation survived and always-on pinning also blocked the approach-to-range walk. Every 10-second charged release now fires a VIRTUAL TRIO: the holder's untouched normal shot #1 plus two bonus projectiles launched from the other two trio members' wand positions at staggered speeds (100%/75%) with their Instigators labelled to those companions, so the trigger observes three distinct casters arriving as three separate hits - without borrowing any companion's controller, cast state, or AI. cgTick now also runs on the split-OFF path so P1's solo bonuses deliver. The stock-join guard now pins only companions that are actually casting (IsAimingOrCasting/currentSpell) and pins GroundSpeed+AccelRate with save/restore so the hold survives the AI tick, while non-casting companions keep walking to range; all pins restore on unlock and level travel. Nothing auto-fires at 10 seconds; x3 still fires once on release. v58 level-travel safety, cooperative-family gate, native wet SpellGesture icon, 770-unit aim, and cast gameplay retained."
+#define MOD_BUILD  "v62"
+#define MOD_STAMP "build v62 - 2026-09-09 - HOLDER-ORIGIN VIRTUAL TRIO: charged x3 keeps the v61 distinct-Instigator virtual trio, but all three spells now leave from the player who completed the 10-second hold. On P2/P3 release, each bonus copies the normal shot's exact Location, Velocity, Rotation, DesiredRotation, projectile speed, max speed, physics and acceleration before the next engine tick. P1's engine-owned shot is not exposed to the mod, so its two bonuses use one identical holder-origin target-directed launch plan. The other heroes are labels only: their Instigators still let CompanionSpellTrigger count three casters, but their distant positions can no longer send bonus spells into walls. This works symmetrically for P1, P2 and P3. Nothing auto-fires at 10 seconds; x3 fires once on release. v61 split-OFF delivery tick and state-aware companion movement guard, v58 level-travel safety, cooperative-family gate, native wet SpellGesture icon, 770-unit aim, and cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -5161,20 +5161,17 @@ static int coopInstigatorOffset(void)
 }
 
 // SpawnSpell's normal script caller gives a new projectile its launch setup.
-// A raw ProcessEvent call does not: v59 hardware showed both P1 bonuses and
-// one P2 bonus sitting at the pawn forever as a red glow. Give every charged
-// bonus actor an explicit, target-directed projectile launch before the next
-// engine tick. This changes only the newly spawned spell actor.
-//
-// v61 virtual trio: the bonus launches from originPawn's wand position (one
-// of the other two trio members) at speed*speedScale, and its Instigator is
-// labelled to that companion - so the cooperative trigger observes a genuine
-// three-caster volley arriving as separate hits, while no companion's
-// controller, cast state, or AI is touched. A NULL/dead originPawn falls back
-// to the holder's own position and Instigator.
+// A raw ProcessEvent call does not, so each bonus must be initialized before
+// the next engine tick. v62 always launches from the HOLDER. When the mod owns
+// the holder's normal shot (P2/P3), sourceSpell supplies an exact kinematic
+// snapshot: both bonuses receive its location, velocity, rotations, speed,
+// acceleration and physics. P1's normal shot is engine-owned and unavailable;
+// that path computes the same holder-origin target-directed plan for each
+// bonus. apparentCaster changes only Instigator, preserving v61's three-caster
+// trigger identity without using a distant companion's position.
 static BOOL coopLaunchBonusProjectile(int holder, void *pawn, void *spawned,
                                       CgCand *candidate, int shot,
-                                      void *originPawn, float speedScale)
+                                      void *apparentCaster, void *sourceSpell)
 {
     if (!pawn || !spawned || !candidate || !cgCandAlive(candidate) ||
         F.Location <= 0 || F.Velocity <= 0 ||
@@ -5183,90 +5180,142 @@ static BOOL coopLaunchBonusProjectile(int holder, void *pawn, void *spawned,
         IsBadWritePtr((BYTE *)spawned + F.Velocity, 12))
         return FALSE;
 
-    void *origin = coopActorAlive(originPawn) ? originPawn : pawn;
-    if (IsBadReadPtr((BYTE *)origin + F.Location, 12)) origin = pawn;
-    float aim[3]; cgAimPoint(candidate, aim);
-    float *pl = (float *)((BYTE *)origin + F.Location);
+    BOOL copied = sourceSpell && sourceSpell != spawned &&
+                  cgLiveObject(sourceSpell) && !cgDeleted(sourceSpell) &&
+                  !IsBadReadPtr((BYTE *)sourceSpell + F.Location, 12) &&
+                  !IsBadReadPtr((BYTE *)sourceSpell + F.Velocity, 12);
+    float *sl = (float *)((BYTE *)spawned + F.Location);
+    float *sv = (float *)((BYTE *)spawned + F.Velocity);
     float speed = 1200.0f;
-    if (g_offProjSpeed > 0 &&
-        !IsBadReadPtr((BYTE *)spawned + g_offProjSpeed, 4)) {
-        float nativeSpeed = *(float *)((BYTE *)spawned + g_offProjSpeed);
-        if (nativeSpeed > 100.0f && nativeSpeed < 20000.0f) speed = nativeSpeed;
+
+    if (copied) {
+        float *sourceLoc = (float *)((BYTE *)sourceSpell + F.Location);
+        float *sourceVel = (float *)((BYTE *)sourceSpell + F.Velocity);
+        float sourceSpeed = sqrtf(sourceVel[0] * sourceVel[0] +
+                                  sourceVel[1] * sourceVel[1] +
+                                  sourceVel[2] * sourceVel[2]);
+        // Reject a stale/stationary source rather than cloning another v59
+        // caster glow. The fallback below still launches from this holder.
+        if (!(sourceSpeed > 20.0f) || !(sourceSpeed < 20000.0f)) {
+            copied = FALSE;
+        } else {
+            memcpy(sl, sourceLoc, 12);
+            memcpy(sv, sourceVel, 12);
+            speed = sourceSpeed;
+        }
     }
-    if (speedScale < 0.5f || speedScale > 1.5f) speedScale = 1.0f;
-    speed *= speedScale;
-    // Match the ordinary mod projectile's chest/wand-height spawn rather than
-    // launching along the floor from the pawn origin.
-    hp3charged::Vec3 org = { pl[0], pl[1], pl[2] + 45.0f };
-    hp3charged::Vec3 target = { aim[0], aim[1], aim[2] };
-    hp3charged::LaunchPlan plan =
-        hp3charged::planTargetedLaunch(org, target, speed);
-    if (!plan.valid) return FALSE;
+
+    if (!copied) {
+        float aim[3]; cgAimPoint(candidate, aim);
+        float *pl = (float *)((BYTE *)pawn + F.Location);
+        if (g_offProjSpeed > 0 &&
+            !IsBadReadPtr((BYTE *)spawned + g_offProjSpeed, 4)) {
+            float nativeSpeed = *(float *)((BYTE *)spawned + g_offProjSpeed);
+            if (nativeSpeed > 100.0f && nativeSpeed < 20000.0f)
+                speed = nativeSpeed;
+        }
+        hp3charged::Vec3 org = { pl[0], pl[1], pl[2] + 45.0f };
+        hp3charged::Vec3 target = { aim[0], aim[1], aim[2] };
+        hp3charged::LaunchPlan plan =
+            hp3charged::planTargetedLaunch(org, target, speed);
+        if (!plan.valid) return FALSE;
+        sl[0] = plan.location.x; sl[1] = plan.location.y;
+        sl[2] = plan.location.z;
+        sv[0] = plan.velocity.x; sv[1] = plan.velocity.y;
+        sv[2] = plan.velocity.z;
+    }
 
     if (F.Base > 0 && !IsBadWritePtr((BYTE *)spawned + F.Base, 4) &&
         *(void **)((BYTE *)spawned + F.Base) == pawn)
         *(void **)((BYTE *)spawned + F.Base) = NULL;
 
-    float *sl = (float *)((BYTE *)spawned + F.Location);
-    float *sv = (float *)((BYTE *)spawned + F.Velocity);
-    sl[0] = plan.location.x; sl[1] = plan.location.y; sl[2] = plan.location.z;
-    sv[0] = plan.velocity.x; sv[1] = plan.velocity.y; sv[2] = plan.velocity.z;
-
-    const float flat = sqrtf(plan.velocity.x * plan.velocity.x +
-                             plan.velocity.y * plan.velocity.y);
-    const int pitch = (int)(atan2(plan.velocity.z, flat) *
+    // Exact-copy all reflected kinematics when the normal holder shot is
+    // available. Otherwise derive matching rotations from the shared fallback
+    // velocity; both fallback bonuses use the same inputs and are identical.
+    const float flat = sqrtf(sv[0] * sv[0] + sv[1] * sv[1]);
+    const int pitch = (int)(atan2(sv[2], flat) *
                             (65536.0 / 6.283185307179586));
-    const int yaw = (int)(atan2(plan.velocity.y, plan.velocity.x) *
+    const int yaw = (int)(atan2(sv[1], sv[0]) *
                           (65536.0 / 6.283185307179586));
     if (F.Rotation > 0 && !IsBadWritePtr((BYTE *)spawned + F.Rotation, 12)) {
-        int *r = (int *)((BYTE *)spawned + F.Rotation);
-        r[0] = pitch; r[1] = yaw; r[2] = 0;
+        if (copied && !IsBadReadPtr((BYTE *)sourceSpell + F.Rotation, 12))
+            memcpy((BYTE *)spawned + F.Rotation,
+                   (BYTE *)sourceSpell + F.Rotation, 12);
+        else {
+            int *r = (int *)((BYTE *)spawned + F.Rotation);
+            r[0] = pitch; r[1] = yaw; r[2] = 0;
+        }
     }
     if (F.DesiredRotation > 0 &&
         !IsBadWritePtr((BYTE *)spawned + F.DesiredRotation, 12)) {
-        int *r = (int *)((BYTE *)spawned + F.DesiredRotation);
-        r[0] = pitch; r[1] = yaw; r[2] = 0;
+        if (copied &&
+            !IsBadReadPtr((BYTE *)sourceSpell + F.DesiredRotation, 12))
+            memcpy((BYTE *)spawned + F.DesiredRotation,
+                   (BYTE *)sourceSpell + F.DesiredRotation, 12);
+        else {
+            int *r = (int *)((BYTE *)spawned + F.DesiredRotation);
+            r[0] = pitch; r[1] = yaw; r[2] = 0;
+        }
+    }
+    if (F.Acceleration > 0 &&
+        !IsBadWritePtr((BYTE *)spawned + F.Acceleration, 12)) {
+        if (copied && !IsBadReadPtr((BYTE *)sourceSpell + F.Acceleration, 12))
+            memcpy((BYTE *)spawned + F.Acceleration,
+                   (BYTE *)sourceSpell + F.Acceleration, 12);
+        else
+            memset((BYTE *)spawned + F.Acceleration, 0, 12);
     }
     if (g_offProjSpeed > 0 &&
-        !IsBadWritePtr((BYTE *)spawned + g_offProjSpeed, 4))
-        *(float *)((BYTE *)spawned + g_offProjSpeed) = speed;
+        !IsBadWritePtr((BYTE *)spawned + g_offProjSpeed, 4)) {
+        if (copied &&
+            !IsBadReadPtr((BYTE *)sourceSpell + g_offProjSpeed, 4))
+            *(float *)((BYTE *)spawned + g_offProjSpeed) =
+                *(float *)((BYTE *)sourceSpell + g_offProjSpeed);
+        else
+            *(float *)((BYTE *)spawned + g_offProjSpeed) = speed;
+    }
     if (g_offProjMaxSpeed > 0 &&
-        !IsBadWritePtr((BYTE *)spawned + g_offProjMaxSpeed, 4))
-        *(float *)((BYTE *)spawned + g_offProjMaxSpeed) = speed * 1.5f;
-    if (F.Physics > 0 && !IsBadWritePtr((BYTE *)spawned + F.Physics, 1))
-        *((BYTE *)spawned + F.Physics) = 6;       // PHYS_Projectile
+        !IsBadWritePtr((BYTE *)spawned + g_offProjMaxSpeed, 4)) {
+        if (copied &&
+            !IsBadReadPtr((BYTE *)sourceSpell + g_offProjMaxSpeed, 4))
+            *(float *)((BYTE *)spawned + g_offProjMaxSpeed) =
+                *(float *)((BYTE *)sourceSpell + g_offProjMaxSpeed);
+        else
+            *(float *)((BYTE *)spawned + g_offProjMaxSpeed) = speed * 1.5f;
+    }
+    if (F.Physics > 0 && !IsBadWritePtr((BYTE *)spawned + F.Physics, 1)) {
+        if (copied && !IsBadReadPtr((BYTE *)sourceSpell + F.Physics, 1))
+            *((BYTE *)spawned + F.Physics) =
+                *((BYTE *)sourceSpell + F.Physics);
+        else
+            *((BYTE *)spawned + F.Physics) = 6; // PHYS_Projectile
+    }
 
-    // Label this bonus with its apparent companion caster so a trigger that
-    // counts distinct Instigators observes a three-caster volley. Owner is
-    // deliberately left as the SpawnSpell caller (the holder), so the bonus
-    // still cannot collide with the pawn that spawned it; only the newly
-    // spawned spell actor is written.
-    if (origin != pawn) {
+    void *identity = coopActorAlive(apparentCaster) ? apparentCaster : pawn;
+    if (identity != pawn) {
         int offI = coopInstigatorOffset();
         if (offI > 0 && !IsBadWritePtr((BYTE *)spawned + offI, 4))
-            *(void **)((BYTE *)spawned + offI) = origin;
+            *(void **)((BYTE *)spawned + offI) = identity;
     }
 
-    {
-        char originName[160];
-        logf_("  [coopcast] P%d bonus shot %d/3 launched from %s (%.0f %.0f %.0f) "
-              "toward (%.0f %.0f %.0f) at %.0f units/s (x%.2f)%s",
-              holder + 1, shot,
-              objName(origin, originName, sizeof(originName)),
-              sl[0], sl[1], sl[2], aim[0], aim[1], aim[2], speed, speedScale,
-              origin != pawn ? " [virtual trio]" : " [holder origin fallback]");
-    }
+    char identityName[160];
+    logf_("  [coopcast] P%d bonus shot %d/3 at HOLDER origin "
+          "(%.0f %.0f %.0f), velocity=(%.0f %.0f %.0f), %s; "
+          "Instigator=%s",
+          holder + 1, shot, sl[0], sl[1], sl[2], sv[0], sv[1], sv[2],
+          copied ? "copied from holder shot" : "shared holder fallback",
+          objName(identity, identityName, sizeof(identityName)));
     return TRUE;
 }
 
-// v61 has two endings for the armed charge.
+// v62 has two endings for the armed charge.
 //
 // fireTrio == TRUE: the holder deliberately RELEASED the cast. The holder's
 // untouched path (engine for P1, mod cast-fire for P2/P3) supplies normal
-// shot #1. Two raw SpawnSpell calls below create shots #2/#3; each launches
-// from one of the other two trio members' wand positions at a staggered
-// speed with its Instigator labelled to that companion (virtual trio), and
-// independent pending slots watch each delivery. No companion's controller,
+// shot #1. Two raw SpawnSpell calls below create shots #2/#3 at that same
+// holder origin and trajectory. Their Instigators are still labelled as the
+// other heroes (virtual trio), but those heroes' locations are never used.
+// Independent pending slots watch each delivery. No companion's controller,
 // cast state, or AI is touched - only the two newly spawned spell actors.
 //
 // fireTrio == FALSE: target change/deletion, another player cast, level
@@ -5279,31 +5328,31 @@ static void coopRestore(const char *why, BOOL fireTrio)
     if (coopTargetAlive(g_coopActive.target))
         tn = objName(g_coopActive.target.object, targetName, sizeof(targetName));
 
-    // A charged cooperative cast is a virtual trio: the holder's normal path
-    // supplies shot #1 untouched, while shots #2/#3 launch from the other
-    // two trio members' positions with staggered speeds and companion
-    // Instigator labels. No companion is borrowed - their controllers, cast
-    // state, and AI are never touched; only the two new spell actors are.
+    // A charged cooperative cast is a virtual trio only in identity. All
+    // projectile kinematics come from the holder, while shots #2/#3 retain
+    // companion Instigator labels so the stock trigger sees distinct casters.
     if (fireTrio && coopTargetAlive(g_coopActive.target)) {
         int holder = g_coopActive.holder;
         void *pawn = (holder >= 0 && holder < 8) ? getPawn(holder) : NULL;
         if (coopActorAlive(pawn) && g_fnSpawnSpell &&
             g_coopActive.spell && cgIsKnownClass(g_coopActive.spell)) {
-            logf_("[coopcast] P%d RELEASED charged cast on %s: one normal shot + virtual-trio bonus shots from the other trio members",
+            logf_("[coopcast] P%d RELEASED charged cast on %s: all three shots use the HOLDER origin and trajectory",
                   holder + 1, tn);
             CgCand *cand = coopActiveCandidate();
+            // P2/P3's normal shot was created immediately before this release
+            // callback, so clone it exactly. P1's stock shot is engine-owned;
+            // coopLaunchBonusProjectile uses its identical holder fallback.
+            void *sourceSpell = (holder > 0 && holder < 8)
+                              ? g_castActor[holder] : NULL;
             for (int shot = 2; shot <= 3; shot++) {
-                // The other two trio slots supply the apparent casters:
-                // shot #2 from the next member, shot #3 from the remaining
-                // one at 75% speed so the three hits arrive separately.
-                void *originPawn = NULL;
-                float speedScale = 1.0f;
+                // The other slots supply identity only. Never read their
+                // location, rotation, velocity, controller, or cast state.
+                void *apparentCaster = NULL;
                 if (holder >= 0 && holder <= 2) {
                     int compSlot = (shot == 2) ? (holder + 1) % 3
                                                : (holder + 2) % 3;
                     void *comp = getPawn(compSlot);
-                    if (coopActorAlive(comp)) originPawn = comp;
-                    if (shot == 3) speedScale = 0.75f;
+                    if (coopActorAlive(comp)) apparentCaster = comp;
                 }
                 BYTE parms[64]; memset(parms, 0, sizeof(parms));
                 *(void **)(parms + 0x00) = g_coopActive.spell;
@@ -5313,10 +5362,13 @@ static void coopRestore(const char *why, BOOL fireTrio)
                 void *spawned = *(void **)(parms + 0x08);
                 BOOL launched = coopLaunchBonusProjectile(holder, pawn, spawned,
                                                            cand, shot,
-                                                           originPawn,
-                                                           speedScale);
+                                                           apparentCaster,
+                                                           sourceSpell);
                 BOOL watched = cand && cgArmBonusHit(holder, shot, pawn, spawned,
                                                      cand, g_coopActive.spell);
+                // P1 has no exposed normal projectile. Once shot #2 has the
+                // holder fallback, use it as shot #3's exact launch template.
+                if (!sourceSpell && launched) sourceSpell = spawned;
                 // Never repeat v59's permanent caster glow. If reflection did
                 // not leave enough metadata either to launch or deliver this
                 // actor, destroy only the unusable bonus; shot #1 remains the

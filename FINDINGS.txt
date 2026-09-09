@@ -1014,3 +1014,24 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       following on unlock ("guard released ... (p1 unlock)"). No run/cast/run.
     * 10 s hold on a pumpkin/other object - NO trio, ordinary single cast.
     * Level travel mid-hold - no crash, no stuck pins (regression check).
+
+19. v62 holder-origin virtual-trio correction (2026-09-09)
+
+  Hardware testing confirmed that v61's distinct-Instigator triple cast works,
+  but exposed a trajectory flaw: shots launched from remote companion positions
+  can hit nearby walls and never reach the holder's target. The companion must
+  contribute identity to CompanionSpellTrigger, not projectile geometry.
+
+  v62 makes the player who held for 10+ seconds authoritative for the entire
+  volley. P2/P3 bonus actors copy the ordinary holder projectile's exact
+  Location, Velocity, Rotation, DesiredRotation, Acceleration, Speed, MaxSpeed
+  and Physics before the next engine tick. P1's ordinary projectile remains
+  engine-owned, so bonus #2 uses a holder-origin target-directed fallback and
+  bonus #3 clones #2. The other two heroes are used only as Instigator labels;
+  their positions and gameplay state are untouched. The same slot rotation
+  applies symmetrically when P1, P2, or P3 is the holder.
+
+  Hardware check: confirm hp3mod.log says build v62, spread all three heroes far
+  apart, then perform a >10-second release once with each player. Every log must
+  show both bonuses "at HOLDER origin" with matching location/velocity, and all
+  three visible spells must follow the holder's line rather than remote walls.

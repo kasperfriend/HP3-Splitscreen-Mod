@@ -14,10 +14,9 @@ WHAT IT DOES
   engine's own DrawPortal once per player.
 
 
-V60 SINGLE-CASTER CHARGED X3 CAST - ANY CHARACTER, RELEASE ONLY
-  This is a fallback for HP3 objects that normally expect three converging
-  spell deliveries. It does not complete a puzzle directly and does not cast
-  through Harry, Hermione, or Ron as substitutes for the initiating player.
+V62 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
+  This is a fallback for HP3 objects that expect three distinct casters. It
+  does not complete a puzzle directly and never fires from a remote hero.
 
   USE:
     Keep a cast held on the SAME cooperative target (the
@@ -27,24 +26,21 @@ V60 SINGLE-CASTER CHARGED X3 CAST - ANY CHARACTER, RELEASE ONLY
     split-screen players hold their cast key.
 
     NOTHING fires when the interval completes. The charge merely arms.
-    Release is the fire: the initiating player's ordinary release remains
-    shot 1, then that SAME pawn creates shots 2 and 3 with the target's own
-    spell class. v60 explicitly moves both bonus actors clear of the caster,
-    aims them at the target, gives them projectile velocity/physics, and
-    tracks both bonuses independently. P2's ordinary shot keeps its existing
-    delivery watch as well. A charged P1 cast therefore cannot leave v59's
-    permanent red light under Harry, and a P2 cast does not lose one of its
-    bonus deliveries.
+    Release is the fire: all three spells leave from the initiating player in
+    the same direction. For P2/P3, shots 2 and 3 copy shot 1's exact location,
+    velocity, rotation, desired rotation, acceleration, projectile speed and
+    physics. P1's normal projectile is engine-owned, so shot 2 receives a
+    holder-origin target-directed launch and shot 3 clones it exactly.
 
-    The mod never borrows a companion, swaps a controller, writes a companion
-    spell target/current spell, calls companion StartCasting/ReleasedFire,
-    or repositions another hero. The stock game itself may recruit an AI
-    Ron/Hermione soon after P1 locks a CompanionSpellTrigger. During that P1
-    cooperative lock only, v60 holds horizontal movement impulses at zero on
-    companions that are still AI-controlled. This stops Ron's run/cast/run
-    oscillation without taking over his controller or cast lifecycle. Human
-    split-screen characters are never movement-guarded, and ordinary AI
-    movement resumes as soon as P1 unlocks.
+    Shots 2 and 3 retain the other heroes as Instigator labels because the
+    stock CompanionSpellTrigger counts distinct casters. Those heroes provide
+    identity only: their positions, controllers, spell fields, cast state and
+    AI are not used or changed. This prevents a far-away companion's spell
+    from flying into a wall while preserving the three-caster trigger result.
+
+    During a P1 cooperative lock, only AI companions that are actually
+    casting have GroundSpeed/AccelRate pinned with save/restore. Companions
+    walking into range remain free to walk; all pins release on unlock.
 
     Ordinary targets such as pumpkins and spawners do not arm charged x3; a
     long hold on them remains a plain single cast. Cursor/aim flicker up to
@@ -55,14 +51,12 @@ V60 SINGLE-CASTER CHARGED X3 CAST - ANY CHARACTER, RELEASE ONLY
 
   WHAT TO LOOK FOR IN hp3mod.log:
     [coopcast] P2 started continuous >10-second hold on <target>
-    [coopcast] P2 held <target> for more than 10 seconds: same-caster
+    [coopcast] P2 held <target> for more than 10 seconds: virtual-trio
       charged x3 <spell> armed on <target>; fires only on release
-    [coopcast] P2 RELEASED charged cast on <target>: one normal shot + two
-      same-caster bonus shots
-    [coopcast] P2 bonus shot 2/3 launched ...
-    [coopcast] P2 bonus shot 3/3 launched ...
-    [coopcast] P1 stock companion-join guard: <Ron/Hermione> AI movement
-      held at zero while charging <target>
+    [coopcast] P2 RELEASED charged cast on <target>: all three shots use the
+      HOLDER origin and trajectory
+    [coopcast] P2 bonus shot 2/3 at HOLDER origin ... copied from holder shot
+    [coopcast] P2 bonus shot 3/3 at HOLDER origin ... copied from holder shot
     If either bonus says it could not be launched/tracked, or the in-game
     result differs, preserve hp3mod.log and report the complete test sequence.
 
@@ -125,7 +119,7 @@ USING IT
 
   >>> CHECK YOU ARE RUNNING THIS BUILD <<<
       Open system\hp3mod.log and read line 2. It must say:
-          === hp3mod build v55 ...
+          === hp3mod build v62 ...
       If it says anything earlier, or the file is missing, Windows is still
       loading an older d3d8.dll. Close the game completely before replacing
       d3d8.dll. Upgrading from v49/v50 can keep your custom hp3mod.ini; leave
