@@ -20,6 +20,7 @@ struct Target {
 struct Hold {
     Target target;
     std::uint32_t beganAt;
+    std::uint32_t lastSeenAt;   // v57: last tick the target was still valid
     bool active;
     bool fired;
 };
@@ -43,6 +44,7 @@ static inline void clear(Hold &hold)
     hold.target.clazz = nullptr;
     hold.target.slot = -1;
     hold.beganAt = 0;
+    hold.lastSeenAt = 0;
     hold.active = false;
     hold.fired = false;
 }
@@ -50,13 +52,26 @@ static inline void clear(Hold &hold)
 // The unsigned subtraction deliberately handles the normal GetTickCount()
 // wraparound. A different target, a missing target, or a released cast starts
 // a fresh uninterrupted interval; elapsed time is never carried across one.
+//
+// v57 graceMs: the holder's target can flicker for a frame or two between
+// controller/aim updates without the hold being deliberately released (the
+// v55/v56 hardware logs showed exactly this for the stock P1 cursor). While
+// the gap since the last valid sample is <= graceMs the dwell keeps running
+// against the last target; a longer gap clears as before. graceMs == 0 keeps
+// the original hard-reset behaviour.
 static inline Result update(Hold &hold, bool valid, const Target &target,
-                            std::uint32_t now, std::uint32_t holdMs)
+                            std::uint32_t now, std::uint32_t holdMs,
+                            std::uint32_t graceMs = 0)
 {
     if (!valid || !target.object || !target.clazz || target.slot < 0) {
+        // Brief target flicker inside the grace window: keep the dwell.
+        if (hold.active && !hold.fired && graceMs && hold.lastSeenAt &&
+            (std::uint32_t)(now - hold.lastSeenAt) <= graceMs)
+            return Waiting;
         clear(hold);
         return Reset;
     }
+    hold.lastSeenAt = now;
     if (!hold.active || !sameTarget(hold.target, target)) {
         hold.target = target;
         hold.beganAt = now;

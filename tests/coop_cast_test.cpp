@@ -56,5 +56,53 @@ int main()
     assert(hp3coop::update(hold, true, a, 9745u,
                             hp3coop::DefaultHoldMs) == hp3coop::Ready);
 
-    puts("co-op cast hold policy: continuous target, reset, identity and wrap assertions passed");
+    // v57 grace: a target that flickers away for <= graceMs keeps the dwell
+    // running against the last valid sample; a longer gap resets it. The
+    // pre-fire dwell only ever accumulates against ONE uninterrupted hold.
+    hp3coop::clear(hold);
+    const std::uint32_t grace = 250u;
+    assert(hp3coop::update(hold, true, a, 100000,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Started);
+    assert(hp3coop::update(hold, true, a, 105000,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Waiting);
+    // one-frame loss inside grace: dwell continues
+    assert(hp3coop::update(hold, false, invalid, 105200,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Waiting);
+    assert(hp3coop::update(hold, true, a, 105300,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Waiting);
+    // 251ms loss: real release, full reset
+    assert(hp3coop::update(hold, false, invalid, 108000,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Reset);
+    assert(!hold.active && !hold.fired);
+    // the grace must not carry credit across the reset
+    assert(hp3coop::update(hold, true, a, 108001,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Started);
+    assert(hp3coop::update(hold, true, a, 108001 + 9999,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Waiting);
+    // flicker right at the boundary then past 10s total: fires while held
+    assert(hp3coop::update(hold, false, invalid, 108001 + 10050,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Waiting);
+    assert(hp3coop::update(hold, true, a, 108001 + 10100,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Ready);
+    // after Ready the grace no longer applies: a loss is a loss
+    assert(hp3coop::update(hold, false, invalid, 108001 + 10400,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Reset);
+
+    // graceMs == 0 keeps the original hard reset on a single invalid sample.
+    hp3coop::clear(hold);
+    assert(hp3coop::update(hold, true, a, 200000,
+                            hp3coop::DefaultHoldMs, 0) == hp3coop::Started);
+    assert(hp3coop::update(hold, false, invalid, 200001,
+                            hp3coop::DefaultHoldMs, 0) == hp3coop::Reset);
+
+    // grace is capped by the hold still being unfired: a *different* valid
+    // target always starts a fresh interval, never inherits the dwell.
+    hp3coop::clear(hold);
+    assert(hp3coop::update(hold, true, a, 300000,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Started);
+    assert(hp3coop::update(hold, true, b, 300100,
+                            hp3coop::DefaultHoldMs, grace) == hp3coop::Started);
+
+    puts("co-op cast hold policy: continuous target, reset, identity, wrap and "
+         "flicker-grace assertions passed");
 }

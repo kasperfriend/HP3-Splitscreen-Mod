@@ -141,7 +141,7 @@ static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
 #define MOD_BUILD  "v56"
-#define MOD_STAMP "build v56 - 2026-09-09 - v55 P1-HOLD FIX: a single uninterrupted >10-second Player-1 cursor lock on an object ALSO fires the three-character cooperative hold (P1's own cast goes through the engine, the trio is borrowed alongside; cursor flicker up to 250 ms no longer resets the proof/hold dwell), so a deliberate P1 hold on a CompanionSpellTrigger class enters the shared hold without depending on a separate P2/P3 >10s attempt; P2/P3 >10s hold on a certified class still works unchanged. No generic Trigger bypass. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
+#define MOD_STAMP "build v57 - 2026-09-09 - v57 ANY-HOLD TRIO + LEVEL-TRAVEL GPF FIX: the three-character cooperative hold now arms after ANY single character - Player 1's engine cursor lock OR a Player-2/Player-3 held cast - has kept the SAME game-verified cast target (the game's own vulnerableToClass/spell-handler targeting metadata, or the stock cursor lock) for more than 10 seconds; the behaviour-certification gate that never fired on hardware is no longer required to enter the shared hold (it only enriches discovery of metadata-less cooperative actors). Heroes the game itself already recruited on that target are borrowed untouched; the stock P1 SpellCursor.LockOn bridge is best-effort (a missing or refused ABI no longer cancels the trio borrow). Target flicker up to 250 ms no longer resets any holder's dwell. CRASH FIX for entering Hogwarts / any level travel as any character (UObject::GetPathName <- UObject::GetFullName <- FPlayerSceneNode::Render GPF): every cached actor pointer (pawns, cursor, camera, aim FX, coop heroes) is validated against the live GObjObjects table before any name/field use - IsBadReadPtr cannot tell freed-but-readable UObject memory from a live actor - and the level-change cache drop now runs every frame instead of every 45th, so stale pointers from the destroyed level are never dereferenced. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -469,6 +469,35 @@ static const char *objShortName(void *o, char *out, int cch)
     return out;
 }
 
+// v57 crash fix: a cached actor pointer can outlive the level that owned it.
+// IsBadReadPtr only proves the page is still READABLE - UObject memory that
+// was freed by a level change very often still is, and every IsBadReadPtr-
+// guarded dereference (objName -> UObject::GetFullName walks the object's
+// Outer chain; field reads; Destroy on a cached FX) then runs on freed
+// memory that the new level's allocations have started to reuse. Hardware
+// crash entering Hogwarts as Harry, split off:
+//   UObject::GetPathName <- UObject::GetPathName <- UObject::GetFullName
+//   <- FPlayerSceneNode::Render <- UGameEngine::Draw
+// (the mod's PostRender detour frame has no frame pointer, so the walker
+// attributes the call to FPlayerSceneNode::Render, the engine function that
+// invokes UInteractionMaster::MasterProcessPostRender).
+// GObjObjects is the engine's own liveness record: only live UObjects appear
+// in it, and everything here runs on the game thread, so table membership is
+// an exact is-this-object-still-alive answer. Used on CACHED pointers and on
+// object references read out of live actors; freshly table-scanned objects
+// are live by construction and skip this check.
+static BOOL cgLiveObject(void *o)
+{
+    if (!o || !g_objArray) return FALSE;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000) return FALSE;
+    if (IsBadReadPtr(g_objArray->Data, 4 * (DWORD)n)) return FALSE;
+    void **data = g_objArray->Data;
+    for (int i = 0; i < n; i++)
+        if (data[i] == o) return TRUE;
+    return FALSE;
+}
+
 // True for UnrealScript reflection/metadata objects we never care about.
 static BOOL isReflection(const char *full)
 {
@@ -537,6 +566,18 @@ static BOOL cgDeleted(void *o);
 // can remain in GObjObjects after travel without bDeleteMe set.
 static BOOL actorInCurrentLevel(void *o) {
     if (!o || !g_camActor || IsBadReadPtr(o, 0x2C) || IsBadReadPtr(g_camActor, 0x2C)) return FALSE;
+    // v57 crash fix: g_camActor itself can be a stale pointer from the level
+    // that was just destroyed (frames without a fresh FPlayerSceneNode, or a
+    // mid-frame level change). Never hand a dead camera to GetFullName; the
+    // liveness result is memoised per camera pointer because this helper is
+    // on the candidate-scan hot path (thousands of calls per scan).
+    static void *sCam = NULL; static DWORD sCamAt = 0; static BOOL sCamOK = FALSE;
+    DWORD nowCam = GetTickCount();
+    if (g_camActor != sCam || !sCamOK || !sCamAt ||
+        (DWORD)(nowCam - sCamAt) > 250u) {
+        sCam = g_camActor; sCamAt = nowCam; sCamOK = cgLiveObject(g_camActor);
+    }
+    if (!sCamOK) return FALSE;
     char a[256], c[256]; objName(o,a,sizeof(a)); objName(g_camActor,c,sizeof(c));
     return hp3aim::samePackage(a,c);
 }
@@ -566,6 +607,10 @@ static void *findActorByClass(const char *cls)
 static void *getPawn(int i)
 {
     if (i < 0 || i > 7) return NULL;
+    // v57: g_pawn[] is cached across frames - a level change frees the old
+    // pawns while the cache still points at them. Never name or touch a pawn
+    // that is no longer a live UObject (see cgLiveObject).
+    if (g_pawn[i] && !cgLiveObject(g_pawn[i])) g_pawn[i] = NULL;
     if (g_pawn[i] && actorInCurrentLevel(g_pawn[i]) && !cgDeleted(g_pawn[i])) {
         char name[160]; objName(g_pawn[i],name,sizeof(name));
         size_t len=strlen(kCharClass[i]);
@@ -1682,6 +1727,10 @@ static DWORD g_p1CursorLockedAt    = 0;   // GetTickCount of first-seen-at
 static DWORD g_p1CursorLastSeen   = 0;   // last tick we saw any non-NULL t
 static int   g_p1CursorFired       = 0;   // 1 once coopStart was called here
 static const DWORD kP1CursorGrace = 250u;
+// v57: the same flicker tolerance for P2/P3 held-cast target samples (the
+// aim picker can lose the reticle target for a frame between updates without
+// the holder having released anything).
+static const DWORD kCoopFlickerGrace = 250u;
 // Some stock cooperative actors intentionally have no vulnerableToClass and
 // therefore never enter g_cgCand. Keep a small, current-level cache of only
 // behaviour-certified actors so they can still be selected with the same
@@ -2829,6 +2878,11 @@ static void cgWatchP1(void)
     static DWORD sLastWindowAt = 0, sLastLogAt = 0;
     static DWORD sResolveAt = 0;
     void *p1 = g_pawn[0];
+    // v57 crash fix: g_pawn[0] is cached across frames; the old level's Harry
+    // is freed UObjects memory the moment travel finishes. A stale pawn passed
+    // IsBadReadPtr and then crashed GetFullName inside actorInCurrentLevel on
+    // real hardware (entering Hogwarts). Drop the cache before naming it.
+    if (p1 && !cgLiveObject(p1)) { g_pawn[0] = NULL; p1 = NULL; sLastPawn = NULL; }
     if (!p1) {
         DWORD nowR = GetTickCount();
         if (nowR - sResolveAt < 3000) return;
@@ -2845,7 +2899,7 @@ static void cgWatchP1(void)
         if (t != sLastTarget && now - sLastLogAt >= 300) {
             sLastLogAt = now;
             sLastTarget = t;
-            if (t && !IsBadReadPtr(t, 0x100)) {
+            if (t && !IsBadReadPtr(t, 0x100) && cgLiveObject(t)) {
                 char tb[160];
                 logf_("[castgame] PLAYER 1 spellTarget -> %s", objName(t, tb, sizeof(tb)));
                 if (g_castGameplay) {
@@ -2869,7 +2923,8 @@ static void cgWatchP1(void)
             sLastSpell = s;
             char sb[160];
             logf_("[castgame] PLAYER 1 currentSpell -> %s",
-                  s && !IsBadReadPtr(s, 0x30) ? objName(s, sb, sizeof(sb)) : "None");
+                  s && !IsBadReadPtr(s, 0x30) && cgLiveObject(s)
+                      ? objName(s, sb, sizeof(sb)) : "None");
         }
     }
     // The game's own cursor: SelectCursor.aCurrentTarget / aPossibleTarget
@@ -2895,6 +2950,10 @@ static void cgWatchP1(void)
             cur = *(void **)((BYTE *)ctrl + sOffCtrlCursor);
     }
     if (!cur) cur = findOrigCursor();
+    // v57: cur can be a stale cursor that died with the previous level (the
+    // controller Cursor field is read from a live pawn, but the cursor it
+    // names may not be). Never name or dereference a dead cursor.
+    if (cur && !cgLiveObject(cur)) cur = NULL;
     if (cur && !IsBadReadPtr(cur, 0x200) && cgClassOf(cur)) {
         static void *sSaidCur = NULL;
         if (cur != sSaidCur) {
@@ -2906,7 +2965,7 @@ static void cgWatchP1(void)
             void *t = *(void **)((BYTE *)cur + sOffCur);
             if (t != sLastCur) {
                 sLastCur = t;
-                if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t)) {
+                if (t && !IsBadReadPtr(t, 0x100) && cgLiveObject(t) && cgClassOf(t)) {
                     char tb[160];
                     logf_("[castgame] PLAYER 1 cursor aCurrentTarget -> %s", objName(t, tb, sizeof(tb)));
                     if (g_castGameplay) { cgScanCandidates(p1, FALSE); cgDescribeActor(t, "cursor target"); }
@@ -2927,7 +2986,7 @@ static void cgWatchP1(void)
             // so a P2/P3 >10-second hold could never enter the shared path.
             // The stock P1 cursor does lock targets during a live split session
             // (coopObserveP1 below applies the mode-appropriate evidence test).
-            if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t))
+            if (t && !IsBadReadPtr(t, 0x100) && cgLiveObject(t) && cgClassOf(t))
                 coopObserveP1(p1, t);
             else
                 coopObserveP1(p1, NULL);  // unlock/invalid target resets proof dwell
@@ -2955,7 +3014,7 @@ static void cgWatchP1(void)
             void *t = *(void **)((BYTE *)cur + sOffPos);
             if (t != sLastPos) {
                 sLastPos = t;
-                if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t)) {
+                if (t && !IsBadReadPtr(t, 0x100) && cgLiveObject(t) && cgClassOf(t)) {
                     char tb[160];
                     logf_("[castgame] PLAYER 1 cursor aPossibleTarget -> %s", objName(t, tb, sizeof(tb)));
                     if (g_castGameplay) { cgScanCandidates(p1, FALSE); cgDescribeActor(t, "cursor possible target"); }
@@ -3726,10 +3785,15 @@ static float g_aimDSmooth[8] = { 0 };   // v20: aim-distance hysteresis per play
 // dormant FX to borrow. Its owned SpellGesture/particles do the drawing.
 static void *g_origCursor = NULL;
 static void *findOrigCursor(void) {
-    if (g_origCursor && actorInCurrentLevel(g_origCursor) && !cgDeleted(g_origCursor)) {
+    // v57: g_origCursor dies with its level; validate liveness (not just
+    // readability) before asking GetFullName to walk its Outer chain.
+    if (g_origCursor && cgLiveObject(g_origCursor) &&
+        actorInCurrentLevel(g_origCursor) && !cgDeleted(g_origCursor)) {
         char name[160]; objName(g_origCursor,name,sizeof(name));
         if(!strncmp(name,"SpellCursor ",12)) return g_origCursor;
+        // not a SpellCursor any more (slot recycled): fall through and rescan
     }
+    g_origCursor = NULL;
     g_origCursor=findActorByClass("SpellCursor");
     if (g_origCursor && cgDeleted(g_origCursor)) g_origCursor=NULL;
     return g_origCursor;
@@ -3748,7 +3812,10 @@ static void *findP1Cursor(void *p1)
         void *ctrl = *(void **)((BYTE *)p1 + F.PawnController);
         if (ctrl && !IsBadReadPtr((BYTE *)ctrl + sOffCtrlCursor, 4)) {
             void *cursor = *(void **)((BYTE *)ctrl + sOffCtrlCursor);
+            // v57: a live controller can still reference a cursor that died
+            // with the previous level; require a live UObject.
             if (cursor && !IsBadReadPtr(cursor, 0x100) &&
+                cgLiveObject(cursor) &&
                 actorInCurrentLevel(cursor) && !cgDeleted(cursor))
                 return cursor;
         }
@@ -3913,6 +3980,10 @@ static BOOL destroyAimFX(int i)
     g_aimFX[i] = NULL;
     nativeAimForget(i);
     if (IsBadReadPtr(fx, 0x10)) return FALSE;
+    // v57: a level change can free the emitter between the last frame and
+    // this cleanup. Destroying a dead actor would crash the engine; just
+    // forget it.
+    if (!cgLiveObject(fx)) return FALSE;
     return destroyActorFX(fx);
 }
 
@@ -4415,6 +4486,9 @@ struct CoopCastHero {
     BOOL spellWritten;
     BOOL firePressed;
     BOOL started;
+    BOOL alreadyHolding;   // v57: the game itself recruited this hero on this
+                           // target (stock companion join) - never restarted,
+                           // never force-stopped on restore
 };
 struct CoopCastActive {
     BOOL active;
@@ -4439,8 +4513,11 @@ static void           *g_coopFnCursorUnlock = NULL;
 
 static BOOL coopActorAlive(void *actor)
 {
-    return actor && !IsBadReadPtr(actor, 0x100) && actorInCurrentLevel(actor) &&
-           !cgDeleted(actor);
+    // v57: borrowed heroes and the cursor are cached for the whole hold;
+    // validate them as live UObjects (a level change frees them while the
+    // borrow record still names them) before any name/field access.
+    return actor && !IsBadReadPtr(actor, 0x100) && cgLiveObject(actor) &&
+           actorInCurrentLevel(actor) && !cgDeleted(actor);
 }
 
 static BOOL coopTargetAlive(const hp3coop::Target &target)
@@ -4458,16 +4535,31 @@ static BOOL coopTargetAlive(const hp3coop::Target &target)
 // Match a class FAMILY certified by the game's own P1/AI behaviour, not an
 // object name or a guessed script token. A generic SpellTrigger deliberately
 // remains ineligible unless its live stock cooperative hold was observed.
+// v57: this now only enriches DISCOVERY of cooperative actors without
+// targeting metadata (coopRefreshCertifiedCandidates). It is no longer an
+// admission requirement for the >10s hold itself - see coopCandidateTarget.
 static BOOL coopClassIsTarget(void *cls)
 {
     return g_cgChainOK && cls && cgIsKnownClass(cls) && coopClassMatchesProof(cls);
 }
 
+// v57: the hold admission is the game's own targeting plus a deliberate
+// >10-second hold by ANY single character. A CgCand is a genuine cast target
+// by construction (its class carries live vulnerableToClass metadata, a
+// spell handler, or it is a stock SpellTrigger-family actor - exactly what
+// the engine's own cursor accepts), so any living candidate may be held.
+// The v54-v56 behaviour-certification gate proved structurally unreachable
+// on hardware: split OFF required BOTH companions' pawn spellTarget to equal
+// P1's cursor target during a stock join (the game's own companion recruit -
+// StateCasting.BeginState in the pelog - does not set those fields that way,
+// and Ron regularly never joined within the window), and split ON required
+// P1's OWN cursor lock while the holder was Player 2 or 3. The proof table
+// still feeds coopRefreshCertifiedCandidates for metadata-less actors.
 static BOOL coopCandidateTarget(CgCand *candidate, hp3coop::Target *out)
 {
     if (!candidate || !out || !g_cgChainOK || !cgCandAlive(candidate)) return FALSE;
     void *cls = candidate->info ? candidate->info->cls : cgClassOf(candidate->obj);
-    if (!coopClassIsTarget(cls)) return FALSE;
+    if (!cls || !cgIsKnownClass(cls)) return FALSE;
     out->object = candidate->obj;
     out->clazz = cls;
     out->slot = candidate->slot;
@@ -4960,7 +5052,7 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
             hero->savedTarget != key.object) {
             g_coopBlocked[holder] = TRUE;
             char busy[150] = "<unreadable target>";
-            if (!IsBadReadPtr(hero->savedTarget, 0x20))
+            if (cgLiveObject(hero->savedTarget))
                 objName(hero->savedTarget, busy, sizeof(busy));
             logf_("[coopcast] P%d leaves %s unchanged: P%d is already casting at %s",
                   holder + 1, next.name, p + 1, busy);
@@ -4970,53 +5062,59 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
 
     // Commit only after every prerequisite has been checked. Keep a complete
     // restoration record before touching P1's previously avoided controller
-    // path. If that stock bridge cannot be reflected safely, do NOTHING to
-    // the trio rather than falling back to a guessed co-op implementation.
+    // path. v57: the stock P1 SpellCursor.LockOn bridge is best-effort. It is
+    // the game's own "P1 is hovering this object" signal (LockOn also runs
+    // ChooseSpell from the target's vulnerable class, exactly like the HP2
+    // family source), but a level whose cursor exposes no safely reflected
+    // LockOn/UnLock pair must no longer cancel the whole trio hold: the
+    // borrowed heroes' held casts are the same effect, and the target's own
+    // script still decides the result. The strict ABI checks inside
+    // coopCallCursorLock are unchanged - an unsafe call is still never made.
     g_coopActive = next;
     g_coopActive.active = TRUE;
     void *cursor = findP1Cursor(g_coopActive.hero[0].pawn);
-    if (!coopActorAlive(cursor) || !coopCallCursorLock(cursor, key.object)) {
-        g_coopBlocked[holder] = TRUE;
-        coopRestore("stock P1 SpellCursor.LockOn bridge unavailable");
-        logf_("[coopcast] P%d left %s unchanged: no safe stock P1 bridge",
-              holder + 1, next.name);
-        return FALSE;
-    }
-    g_coopActive.cursor = cursor;
-    g_coopActive.cursorLocked = TRUE;
-    if (!coopCursorAcceptedTarget(cursor, key.object)) {
-        g_coopBlocked[holder] = TRUE;
-        coopRestore("stock P1 cursor rejected the requested target");
-        logf_("[coopcast] P%d left %s unchanged: P1 LockOn did not retain target",
-              holder + 1, next.name);
-        return FALSE;
-    }
+    if (coopActorAlive(cursor) && coopCallCursorLock(cursor, key.object)) {
+        g_coopActive.cursor = cursor;
+        g_coopActive.cursorLocked = TRUE;
+        if (!coopCursorAcceptedTarget(cursor, key.object)) {
+            g_coopBlocked[holder] = TRUE;
+            coopRestore("stock P1 cursor rejected the requested target");
+            logf_("[coopcast] P%d left %s unchanged: P1 LockOn did not retain target",
+                  holder + 1, next.name);
+            return FALSE;
+        }
 
-    // LockOn can run arbitrary stock script, so validate both objects again
-    // before reading a field it may have invalidated (e.g. at a level change).
-    if (!coopActorAlive(g_coopActive.hero[0].pawn) || !coopTargetAlive(key) ||
-        IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget, 4) ||
-        IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell, 4)) {
-        g_coopBlocked[holder] = TRUE;
-        coopRestore("stock P1 bridge changed the active level/state");
-        return FALSE;
+        // LockOn can run arbitrary stock script, so validate both objects again
+        // before reading a field it may have invalidated (e.g. at a level change).
+        if (!coopActorAlive(g_coopActive.hero[0].pawn) || !coopTargetAlive(key) ||
+            IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget, 4) ||
+            IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell, 4)) {
+            g_coopBlocked[holder] = TRUE;
+            coopRestore("stock P1 bridge changed the active level/state");
+            return FALSE;
+        }
+        // LockOn owns P1's target/spell choice. Mark either field as borrowed if
+        // that stock call changed it, even when coopSetFields later finds it
+        // already equal to our desired value; otherwise cancellation would leave
+        // a LockOn-written P1 field behind.
+        void *stockTarget = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget);
+        if (stockTarget != g_coopActive.hero[0].savedTarget)
+            g_coopActive.hero[0].targetWritten = TRUE;
+        // LockOn is the game's own spell choice for this target. Prefer it over a
+        // generic P2/P3 fallback class when reflection can read a concrete class.
+        void *stockSpell = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell);
+        if (stockSpell && cgIsKnownClass(stockSpell) && !cgGenericSpellClass(stockSpell)) {
+            spell = stockSpell;
+            g_coopActive.spell = spell;
+        }
+        if (stockSpell != g_coopActive.hero[0].savedSpell)
+            g_coopActive.hero[0].spellWritten = TRUE;
+    } else {
+        logf_("[coopcast] P%d arming %s without the stock P1 cursor bridge "
+              "(LockOn unavailable or refused in this level); the trio hold "
+              "proceeds on the borrowed heroes alone",
+              holder + 1, next.name);
     }
-    // LockOn owns P1's target/spell choice. Mark either field as borrowed if
-    // that stock call changed it, even when coopSetFields later finds it
-    // already equal to our desired value; otherwise cancellation would leave
-    // a LockOn-written P1 field behind.
-    void *stockTarget = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget);
-    if (stockTarget != g_coopActive.hero[0].savedTarget)
-        g_coopActive.hero[0].targetWritten = TRUE;
-    // LockOn is the game's own spell choice for this target. Prefer it over a
-    // generic P2/P3 fallback class when reflection can read a concrete class.
-    void *stockSpell = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell);
-    if (stockSpell && cgIsKnownClass(stockSpell) && !cgGenericSpellClass(stockSpell)) {
-        spell = stockSpell;
-        g_coopActive.spell = spell;
-    }
-    if (stockSpell != g_coopActive.hero[0].savedSpell)
-        g_coopActive.hero[0].spellWritten = TRUE;
 
     for (int p = 0; p < 3; p++) {
         CoopCastHero *hero = &g_coopActive.hero[p];
@@ -5032,6 +5130,17 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
     for (int p = 0; p < 3; p++) {
         if (p == holder) continue;
         CoopCastHero *hero = &g_coopActive.hero[p];
+        // v57: a hero the game itself already put on this exact target (the
+        // stock companion join - its AI entered the held cast on its own, as
+        // the v56 pelog captured) is neither restarted nor force-stopped on
+        // restore; the engine owns that hero's hold.
+        if (hero->savedTarget == key.object &&
+            (!hero->savedSpell || !spell || hero->savedSpell == spell)) {
+            hero->alreadyHolding = TRUE;
+            logf_("  [coopcast] P%d is already holding this target "
+                  "(the game's own companion join); left untouched", p + 1);
+            continue;
+        }
         coopBeginBorrowedHero(hero, spell, p);
         if (!hero->started) {
             g_coopBlocked[holder] = TRUE;
@@ -5041,10 +5150,19 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
     }
 
     char spellName[160];
-    logf_("[coopcast] P%d held %s for %lu ms: Harry, Hermione and Ron now hold %s on %s",
+    int borrowed = 0, joined = 0;
+    for (int p = 0; p < 3; p++) {
+        if (p == holder) continue;
+        if (g_coopActive.hero[p].alreadyHolding) joined++;
+        else if (g_coopActive.hero[p].started) borrowed++;
+    }
+    logf_("[coopcast] P%d held %s for more than %lu seconds: the trio now holds %s on %s "
+          "(%d borrowed by the mod, %d already held by the game's own companion join, "
+          "cursor bridge %s)",
           holder + 1, (candidate->name[0] ? candidate->name : "co-op target"),
-          (unsigned long)g_coopCastHoldMs,
-          objName(spell, spellName, sizeof(spellName)), g_coopActive.name);
+          (unsigned long)g_coopCastHoldMs / 1000u,
+          objName(spell, spellName, sizeof(spellName)), g_coopActive.name,
+          borrowed, joined, g_coopActive.cursorLocked ? "locked" : "skipped");
     return TRUE;
 }
 
@@ -5052,6 +5170,22 @@ static void coopTick(int i, void *pawn, BOOL held)
 {
     if (i < 0 || i > 2) return;       // Players 1..3 (0 = P1, 1 = P2, 2 = P3)
     DWORD now = GetTickCount();
+
+    // v57: Player 1's hold is keyed by the ENGINE's own cursor lock
+    // (g_p1CursorLockedTarget), not by a camera-ray pick - the stock cursor
+    // is the authoritative "P1 is hovering cast on this object" signal, and
+    // a ray pick can legitimately disagree with it. coopP1HoldTry owns the
+    // >10s arming; this branch only maintains/restores an active P1 hold.
+    if (i == 0) {
+        if (!g_coopActive.active || g_coopActive.holder != 0) return;
+        if (!held || !g_p1CursorLockedTarget ||
+            g_p1CursorLockedTarget != g_coopActive.target.object)
+            coopRestore(!held ? "holder released cast" : "holder changed target");
+        else
+            coopMaintain();
+        return;
+    }
+
     hp3coop::Target key = {};
     key.slot = -1;
     CgCand *candidate = NULL;
@@ -5060,14 +5194,18 @@ static void coopTick(int i, void *pawn, BOOL held)
         candidate = coopPickTarget(i, pawn, &key);
     if (candidate && coopCandidateTarget(candidate, &key)) valid = TRUE;
 
+    // v57: the same 250ms flicker tolerance the P1 cursor lock gets - the
+    // aim pick can drop the reticle target for a frame between updates
+    // without the holder having released anything.
     hp3coop::Result state = hp3coop::update(g_coopHold[i], valid != FALSE,
-                                             key, now, g_coopCastHoldMs);
+                                             key, now, g_coopCastHoldMs,
+                                             kCoopFlickerGrace);
     if (state == hp3coop::Started && valid) {
         // A new target is a fresh deliberate attempt after any earlier safety
         // block; it still has to earn a whole new uninterrupted interval.
         g_coopBlocked[i] = FALSE;
-        logf_("[coopcast] P%d started continuous >10-second hold on %s",
-              i + 1, candidate->name);
+        logf_("[coopcast] P%d started continuous >%lu-second hold on %s",
+              i + 1, (unsigned long)g_coopCastHoldMs / 1000u, candidate->name);
     }
 
     if (g_coopActive.active && g_coopActive.holder == i) {
@@ -5117,31 +5255,38 @@ static void coopP1HoldTry(void *p1)
     // latch (handled in coopObserveP1 when the target changes/gone).
     g_p1CursorFired = 1;
     void *target = g_p1CursorLockedTarget;
-    if (!actorInCurrentLevel(target) || cgDeleted(target)) return;
+    if (!cgLiveObject(target) || !actorInCurrentLevel(target) || cgDeleted(target)) return;
     void *cls = cgClassOf(target);
     if (!cls || !cgIsKnownClass(cls)) return;
-    // Implicitly certify the class if a 1.2s cert was previously interrupted
-    // by cursor flicker. The 10s uninterrupted lock is the proof.
+    // v57: still RECORD the proof (a 10s lock is strong evidence, and the
+    // proof table feeds discovery of metadata-less cooperative actors), but
+    // the shared hold no longer depends on the table - a full table must not
+    // cancel the arm the way it did in v56.
     BOOL alreadyCertified = FALSE;
     for (int p = 0; p < g_nCoopProof; p++)
         if (g_coopProof[p].cls == cls) { alreadyCertified = TRUE; break; }
-    if (!alreadyCertified &&
-        g_nCoopProof < (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
-        CoopClassProof *proof = &g_coopProof[g_nCoopProof++];
-        proof->cls = cls; proof->observedAt = now;
-        char full[180];
-        objName(cls, full, sizeof(full));
-        const char *sp = strchr(full, ' ');
-        strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
-        proof->path[sizeof(proof->path) - 1] = 0;
-        char targetName[180];
-        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's "
-              "sustained >10s cursor lock on %s; firing shared hold now",
-              proof->path, objName(target, targetName, sizeof(targetName)));
-    } else if (!alreadyCertified) {
-        logf_("[coopcast] P1 10s hold on %s: proof table full; cannot certify class",
-              cls ? "object" : "?");
-        return;
+    if (!alreadyCertified) {
+        if (g_nCoopProof < (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
+            CoopClassProof *proof = &g_coopProof[g_nCoopProof++];
+            proof->cls = cls; proof->observedAt = now;
+            char full[180];
+            objName(cls, full, sizeof(full));
+            const char *sp = strchr(full, ' ');
+            strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
+            proof->path[sizeof(proof->path) - 1] = 0;
+            char targetName[180];
+            logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's "
+                  "sustained >%lu-second cursor lock on %s",
+                  proof->path, (unsigned long)g_coopCastHoldMs / 1000u,
+                  objName(target, targetName, sizeof(targetName)));
+        } else {
+            char targetName[180];
+            logf_("[coopcast] P1 >%lu-second hold on %s: proof table full - "
+                  "arming the shared hold anyway (v57: certification is no "
+                  "longer required to hold)",
+                  (unsigned long)g_coopCastHoldMs / 1000u,
+                  objName(target, targetName, sizeof(targetName)));
+        }
     }
     // Find a CgCand for the locked object (the normal list prefers, the
     // certified list as fallback). Whichever is found, build the hp3coop
@@ -5183,7 +5328,8 @@ static void coopP1HoldTry(void *p1)
     }
     hp3coop::Target key = { target, cls, slot };
     char tname[180];
-    logf_("[coopcast] P1 10s hold on %s (cursor lock, split=%s): arming shared hold",
+    logf_("[coopcast] P1 >%lu-second hold on %s (cursor lock, split=%s): arming shared hold",
+          (unsigned long)g_coopCastHoldMs / 1000u,
           objName(target, tname, sizeof(tname)), g_splitOn ? "ON" : "OFF");
     coopStart(0, cand, key);
 }
@@ -7473,7 +7619,9 @@ static void setAimFXPaneVisible(int panePlayer)
     for (int j = 1; j < 8; j++) {
         if (g_nativeAimOwned[j]) continue; // never park native particles between ticks
         void *fx = g_aimFX[j];
-        if (!fx || IsBadWritePtr((BYTE *)fx + F.Location, 12)) continue;
+        // v57: parking writes Location/bHidden through a cached pointer -
+        // never write into an emitter that died with its level.
+        if (!fx || !cgLiveObject(fx) || IsBadWritePtr((BYTE *)fx + F.Location, 12)) continue;
         float *al = (float *)((BYTE *)fx + F.Location);
         if (j == panePlayer && !g_aimSup[j]) {
             // owner's pane: draw it exactly where the aim math wants it
@@ -7546,6 +7694,41 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
                 handBackAllPlayers();   // split OFF: return P2..N to the AI
         }
         prevFile = f;
+    }
+
+    // Level changes free every actor we cached. Detect it cheaply from the
+    // camera actor's package name and drop all caches, or we dereference
+    // freed memory the moment the player walks through a door.
+    // v57: this used to run only on every 45th PostRender - at 80 fps that
+    // left more than half a second after travel in which every cached pawn,
+    // cursor and FX pointer pointed into the destroyed level. The hardware
+    // crash entering Hogwarts (GetPathName <- GetPathName <- GetFullName
+    // <- FPlayerSceneNode::Render) happened inside that window. The check is
+    // now every frame (before any early return) and validates the camera
+    // actor's liveness first, so a stale camera is dropped instead of named.
+    if (g_camActor) {
+        if (cgLiveObject(g_camActor)) {
+            static char lastPkg[96] = "";
+            char b[256], pkg[96] = "";
+            objName(g_camActor, b, sizeof(b));
+            const char *sp = strchr(b, ' ');
+            const char *dot = sp ? strchr(sp + 1, '.') : NULL;
+            if (sp && dot) {
+                int L = (int)(dot - (sp + 1));
+                if (L > 0 && L < 95) { memcpy(pkg, sp + 1, L); pkg[L] = 0; }
+            }
+            if (pkg[0] && strcmp(pkg, lastPkg)) {
+                if (lastPkg[0]) {
+                    char why[256];
+                    _snprintf(why, sizeof(why) - 1, "level change '%s' -> '%s'", lastPkg, pkg);
+                    why[sizeof(why) - 1] = 0;
+                    invalidateLevelCaches(why);
+                }
+                strcpy(lastPkg, pkg);
+            }
+        } else {
+            g_camActor = NULL;   // camera died with the old level: never name it
+        }
     }
 
     // If the split is meant to be on but nothing is drawn, say why. Silent
@@ -7650,30 +7833,6 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
                 }
             }
         }
-    // Level changes free every actor we cached. Detect it cheaply from the
-    // camera actor's package name and drop all caches, or we dereference
-    // freed memory the moment the player walks through a door.
-    if ((n % 45) == 0 && g_camActor) {
-        static char lastPkg[96] = "";
-        char b[256], pkg[96] = "";
-        objName(g_camActor, b, sizeof(b));
-        const char *sp = strchr(b, ' ');
-        const char *dot = sp ? strchr(sp + 1, '.') : NULL;
-        if (sp && dot) {
-            int L = (int)(dot - (sp + 1));
-            if (L > 0 && L < 95) { memcpy(pkg, sp + 1, L); pkg[L] = 0; }
-        }
-        if (pkg[0] && strcmp(pkg, lastPkg)) {
-            if (lastPkg[0]) {
-                char why[256];
-                _snprintf(why, sizeof(why) - 1, "level change '%s' -> '%s'", lastPkg, pkg);
-                why[sizeof(why) - 1] = 0;
-                invalidateLevelCaches(why);
-            }
-            strcpy(lastPkg, pkg);
-        }
-    }
-
     // v54/v55's class proof is deliberately learned from the unmodified game.
     // While split is OFF both companion AIs are free to demonstrate the stock
     // cooperative route, so the strict all-three certification runs here.
@@ -8027,7 +8186,8 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
                   i, x, w, H, i == 0 ? "<engine cam>" : g_pawnName[i],
                   loc[0], loc[1], loc[2], rot[1]);
 
-        if (i>0 && (!g_pawn[i] || g_letAI[i] || !actorInCurrentLevel(g_pawn[i]))) destroyAimFX(i);
+        if (i>0 && (!g_pawn[i] || g_letAI[i] || !cgLiveObject(g_pawn[i]) ||
+                    !actorInCurrentLevel(g_pawn[i]))) destroyAimFX(i);
         // v25: P2+'s aim glow renders only in its owner's pane
         setAimFXPaneVisible(i);
         drawPortalSized(canvas, x, 0, w, H, g_camActor, loc, rot, TRUE);

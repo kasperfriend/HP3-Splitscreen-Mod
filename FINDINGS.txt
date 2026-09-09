@@ -644,3 +644,130 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   (b) fire the cooperative path on P1's own 10s cursor lock without
   requiring a separate P2/P3 >10s attempt. P2/P3 >10s hold on a
   certified class is unchanged.
+
+16. V57: HOW THE GAME HOLDS THE HOVERING TRIO CAST + ANY-CHARACTER 10S HOLD
+    + LEVEL-TRAVEL GPF FIX (2026-09-09)
+-------------------------------------------------------------------------------
+- Hardware verdict on v56 (the user's log): still no triple cast. The v56
+  session held a cast on Save0.CompanionSpellTrigger10 for ~28 SECONDS as the
+  split-screen player (Hermione, pad) and no [coopcast] line ever appeared.
+  Root cause: the >10s hold state machine never accumulated a single
+  millisecond. coopTick(1, hermione, held) called coopPickTarget every frame;
+  cgPickTarget DID find the trigger as a normal [vulnerableTo] candidate (the
+  fire-time log proves it: "p1 target -> CompanionSpellTrigger10 ray=626
+  perp=16"), but coopCandidateTarget rejected it because the class was not in
+  g_coopProof - and certification is structurally unreachable on hardware:
+    * split OFF requires BOTH companions' PAWN spellTarget to equal P1's
+      cursor target for 350ms. The v56 pelog window 2 proves the stock
+      companion join does not satisfy this: while Harry held the trigger and
+      Hermione demonstrably entered hgame.HPCharacter.StateCasting.BeginState
+      (+1981ms) and Tick, no CERTIFIED line ever appeared - the native recruit
+      does not express itself as both pawn spellTarget fields simultaneously
+      (and Ron never joined inside the captured window at all), so the
+      all-three field test can never pass.
+    * split ON requires P1's OWN cursor lock for 1.2s - but during a split
+      session the holder is Player 2 or 3; P1's cursor (Harry's) is unlocked
+      the whole time. The 28-second hold was therefore rejected every frame
+      ("a normal visible lock belongs to an ordinary object" -> return NULL),
+  resetting the dwell to zero. The v56 P1-cursor-lock path never ran either,
+  because the pre-split Harry hold lasted only ~2s before the user switched
+  to split-screen.
+
+- HOW THE GAME ACTUALLY HOLDS THE HOVERING TRIO CAST (user question, answered
+  from the HP2 family source + the HP3 hardware pelog):
+    * HP2 decompile (HGame/Classes/SpellCursor.uc, same KnowWonder KWGame
+      family): SpellCursor.LockOn(Actor TargetActor) is the engine's own
+      "hovering this object" transaction. It runs
+      baseWand(PlayerHarry.Weapon).ChooseSpell(TargetActor.eVulnerableToSpell)
+      (the spell comes FROM the target), sets aCurrentTarget = TargetActor,
+      turns on the gesture wet-texture FX sized from the target's collision
+      dims, and starts the locked-on sound loop. UnLock() clears
+      aCurrentTarget/aPossibleTarget and hides the gesture. The cursor lock,
+      not a projectile, is the hold's anchor.
+    * HP3 hardware evidence (v56 pelog window 2, split OFF): the engine
+      player's held cast + that cursor lock is what recruits the companions.
+      ~700ms after Harry's StateCasting began with the cursor locked on
+      CompanionSpellTrigger10, Hermione's controller (HPCompanionController)
+      put her pawn into StateCasting on its own - no player action, no
+      pawn-spellTarget field write visible to the v54 test. The trio hold is
+      therefore: one character's hovering lock + the companions' controllers
+      joining + the trigger's own script deciding when the converged holds
+      complete it. Ron did not join inside the window (distance/state
+      dependent), which is why the stock game sometimes needs the player to
+      keep holding - exactly the case the user wants the mod to guarantee.
+    * The mod's equivalent of "the same effect" for ANY character is what
+      coopStart already drives: write the verified target/spell fields on the
+      real trio, then the engine's own StartCasting(class, 1.0) /
+      PressedFire / playCastAim state entry on the non-holders, plus the real
+      P1 SpellCursor.LockOn when its reflected ABI is safe. No Trigger/Touch/
+      impact/completion shortcut.
+
+- v57 hold admission (the user's directive: "apply the same effect if target
+  is getting held in cast for more than 10 seconds by any character"):
+    * coopCandidateTarget no longer requires a proof-table class. Any living
+      CgCand qualifies - candidates are genuine cast targets by construction
+      (live vulnerableToClass metadata, a spell handler, or a stock
+      SpellTrigger-family actor: exactly what the engine's own cursor
+      accepts). The deliberate >10s uninterrupted hold by any ONE character
+      (P1 cursor lock, or a P2/P3 held cast under the same reticle rules) is
+      now the only intent gate. g_coopProof is still collected and still
+      feeds coopRefreshCertifiedCandidates (discovery of cooperative actors
+      with no targeting metadata) - it just cannot block the hold anymore.
+    * coopP1HoldTry no longer aborts when the proof table is full.
+    * P1's active hold is maintained/restored keyed by the ENGINE's cursor
+      lock (g_p1CursorLockedTarget), not by a camera-ray pick that can
+      legitimately disagree with the stock cursor; coopTick(0, ...) is now
+      maintain/restore only, coopP1HoldTry is the single P1 arming path.
+    * Heroes the game itself already recruited on the exact target
+      (savedTarget == target and the spell matches) are marked alreadyHolding:
+      not restarted with StartCasting, not force-stopped on restore - the
+      engine owns their hold. Everything else is borrowed as before.
+    * The stock P1 SpellCursor.LockOn bridge is now best-effort: if the
+      cursor's LockOn/UnLock cannot be reflected safely (the strict ABI
+      checks are unchanged - an unsafe call is still never made), the trio
+      borrow proceeds without it and the log says so, instead of cancelling
+      the whole hold as v54-v56 did.
+    * The P2/P3 hold gets the same 250ms target-flicker grace the P1 cursor
+      lock got in v56 (hp3coop::update now takes graceMs; the host regression
+      test covers grace continuity, boundary, post-fire reset, wrap and the
+      graceMs=0 legacy behaviour).
+
+- V57 CRASH FIX - hard GPF entering Hogwarts as Harry, split off:
+    UObject::GetPathName <- UObject::GetPathName <- UObject::GetFullName
+    <- FPlayerSceneNode::Render <- UGameEngine::Draw <- UWindowsViewport::Repaint
+  Diagnosis: UObject::GetFullName is exactly what the mod's objName() calls,
+  and the crash dialog's stack walker skips the mod's detour frames (MinGW
+  -O2 omits frame pointers), attributing the call to FPlayerSceneNode::Render
+  - the engine function that invokes UInteractionMaster::MasterProcessPostRender,
+  which the mod hooks. objName was being handed CACHED actor pointers
+  (g_pawn[0] in cgWatchP1, g_origCursor, g_camActor, cursor/field targets)
+  whose level had just been destroyed. IsBadReadPtr passes on freed-but-
+  still-mapped UObject memory, and GetPathName then walks the freed Outer
+  chain into memory the new level's allocations had started to reuse.
+  The level-change invalidation was only sampled every 45th PostRender, so
+  every cached pointer stayed live-looking for over half a second (at 80fps)
+  right through the travel. Fixes:
+    * New cgLiveObject(): a pointer is only named/dereferenced if it is a
+      member of the live GObjObjects table (the engine's own liveness record;
+      everything runs on the game thread). Applied at every cached-pointer
+      site: getPawn, cgWatchP1 (pawn, spellTarget, currentSpell, cursor,
+      aCurrentTarget, aPossibleTarget), findOrigCursor, findP1Cursor,
+      coopActorAlive, coopP1HoldTry's locked target, the busy-target name in
+      coopStart, destroyAimFX (Destroy on a freed emitter would also crash),
+      setAimFXPaneVisible (parking writes), and the split pawn-FX teardown.
+      actorInCurrentLevel additionally refuses a stale g_camActor (memoised
+      250ms per camera pointer - it sits on the candidate-scan hot path).
+    * The level-change detector now runs EVERY PostRender frame (before any
+      early return) and drops g_camActor instead of naming it when it is no
+      longer live; the caches are therefore invalidated within one frame of
+      travel instead of 45.
+
+- Build note: this host cannot install mingw-w64 (sandbox blocks the apt
+  mirrors). v57 was cross-compiled and link-verified locally with
+  zig cc 0.16 (clang + the bundled mingw-w64 i686 sysroot, x86-windows-gnu)
+  producing the same Direct3DCreate8/Direct3DCreate8@4 export pair; the
+  canonical build.sh (i686-w64-mingw32-g++) and the MSYS2 GitHub Actions
+  workflow are unchanged. bin/d3d8.dll is refreshed from this build so the
+  checked-in binary finally matches the source banner (it had been stale
+  since v54). Host policy tests (cast_ground, aim_policy, coop_cast with the
+  new grace assertions, native_aim) all pass.
