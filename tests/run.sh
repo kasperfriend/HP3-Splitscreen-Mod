@@ -6,20 +6,33 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # v66.5: the MOD_STAMP banner is a single very long string literal that is
 # edited by script; an unescaped quote inside it silently terminates the
 # literal and the DLL build fails only in CI (caught the hard way on the
-# first v66.5 commit). Validate it here first.
-PY="$(command -v python3 || command -v python)"
-"$PY" - "$DIR/src/dllmain.cpp" <<'PYGUARD'
-import re, sys
-src = open(sys.argv[1], encoding='utf-8', errors='replace').read()
-for i, line in enumerate(src.split('\n'), 1):
-    if line.startswith('#define MOD_STAMP') or line.startswith('#define MOD_BUILD'):
-        body = line.split(None, 2)[2].strip()
-        name = line.split()[1]
-        if not re.fullmatch(r'"(?:[^"\\]|\\.)*"', body, re.S):
-            sys.exit("%s on line %d is not a single well-formed string literal "
-                     "(unescaped quote?)" % (name, i))
-print("banner check: MOD_BUILD/MOD_STAMP are well-formed string literals")
-PYGUARD
+# first v66.5 commit). Validate it here first - pure bash/grep, because the
+# CI's msys2 runner image has no Python.
+banner_guard() {
+    local file="$1" line name body rest
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        case "$line" in
+        '#define MOD_BUILD '*|'#define MOD_STAMP '*)
+            read -r _ name body <<< "$line"
+            case "$body" in
+                '"'*'"') ;;
+                *)
+                    printf 'ERROR: %s is not a single string literal line\n' "$name" >&2
+                    return 1
+                    ;;
+            esac
+            rest="${body#\"}"; rest="${rest%\"}"
+            if printf '%s' "$rest" | grep -qP '(?<!\\)"'; then
+                printf 'ERROR: %s has an unescaped quote inside the literal\n' "$name" >&2
+                return 1
+            fi
+            ;;
+        esac
+    done < "$file"
+    echo "banner check: MOD_BUILD/MOD_STAMP are well-formed string literals"
+}
+banner_guard "$DIR/src/dllmain.cpp"
 
 mkdir -p "$DIR/dist/tests"
 "${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
