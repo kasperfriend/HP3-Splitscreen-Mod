@@ -21,3 +21,6 @@ mkdir -p "$DIR/dist/tests"
 "${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
     "$DIR/tests/native_aim_test.cpp" -o "$DIR/dist/tests/native_aim_test.exe"
 "$DIR/dist/tests/native_aim_test.exe"
+"${HOST_CXX:-g++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
+    "$DIR/tests/lumos_sync_test.cpp" -o "$DIR/dist/tests/lumos_sync_test.exe"
+"$DIR/dist/tests/lumos_sync_test.exe"

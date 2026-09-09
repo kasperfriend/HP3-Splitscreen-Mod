@@ -39,6 +39,7 @@
 #include "coop_cast.h"
 #include "charged_cast.h"
 #include "coop_trio.h"
+#include "lumos_sync.h"
 
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
@@ -142,8 +143,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v65"
-#define MOD_STAMP "build v65 - 2026-09-09 - EXACT STOCK PER-HERO GESTURE PLACEMENT: each companion wet-shader spell now uses the original per-hero goal (target.Location + CentreOffset + Normal(heroLoc - targetLoc) * (1.1*CollisionRadius*SizeModifier + 2 + GestureDistance)), i.e. the point at the stock gesture distance on that hero's OWN line of sight, and faces that hero (target->hero yaw) - not the v64 holder-camera front point nudged by a fixed lateral spacing, which made the two companion icons overlap. The three heroes' lines fan out from the target, so the three icons sit apart on their own heroes' sides and each glides after its own hero with the stock SpellGesture MoveSmooth (goal-loc)*rate*dt (snapped once at lock like LockOn.SetLocation, rate 10 while the target is a possible target, 8 on the cached centre during the 250 ms flicker); a hero unavailable for a frame keeps gliding on its last goal. The holder's native-aim LOCK gesture is unchanged. Purely visual: it still owns only its gesture actors, never touches companion controllers, cast state, target/spell fields, or AI, and the 8-second arm + once-on-release x3 firing are unchanged. v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66"
+#define MOD_STAMP "build v66 - 2026-09-09 - SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -2742,6 +2743,15 @@ static void cgDeliverHit(CgPending *p, BOOL spellAlive)
             cgCall(i, spell, si->fnTouch, TRUE, spell, p->target, p->caster,
                    p->spellCls, p->aim, "spell Touch");
             did = TRUE;
+        }
+    }
+    if (did) {
+        char clsName[160] = "";
+        if (p->spellCls) objName(p->spellCls, clsName, sizeof(clsName));
+        if (ciHas(p->targetName, "gargoyle") || ciHas(clsName, "Lumos")) {
+            g_lumosState.activate(i, GetTickCount(), hp3lumos::DefaultLumosDurationMs);
+            logf_("    [lumos] p%d delivered Lumos hit to %s - Lumos activated for 25s",
+                  i, p->targetName);
         }
     }
     if (!did)
@@ -7299,6 +7309,7 @@ static void invalidateLevelCaches(const char *reason)
     g_nAimFXFr=0; memset(g_texAimFXFr,0,sizeof(g_texAimFXFr));
     g_fnResolved = FALSE;      // UFunctions live in packages too
     g_defaultSpell = NULL;
+    g_lumosState.deactivate();
     cgResetLevel();            // v51: class index / candidates / pending hits
     g_origCursor = NULL;   // v51: it dies with the level
     resetViewYaw();
@@ -7919,19 +7930,16 @@ static void driveePawn(int i, void *pawn)
         if (g_lookPitch[i] >  10000) g_lookPitch[i] =  10000;
     }
 
-    // Standing jump: keep actor yaw pinned for the whole airtime, not a timer.
-    // The mesh turn is the jump ANIM (PlayJump) - that call is skipped standing.
-    // v12: also pin DesiredRotation (any FaceRotation pull now converges on
-    // our yaw instead of the AI's) and zero RotationRate so nothing advances
-    // toward a stale desired rotation during the air.
+    // Standing jump / Spongify bounce: keep actor desired rotation aligned with view yaw,
+    // without locking the camera view yaw (allowing full 360-degree horizontal rotation
+    // and spell aiming in mid-air).
     {
         BYTE phNowLock = (F.Physics > 0) ? *((BYTE *)pawn + F.Physics) : 1;
         if (g_jumpStanding[i]) {
-            g_viewYaw[i] = g_jumpYawLock[i];
             rot[0] = 0; rot[2] = 0;
             if (F.DesiredRotation > 0) {
                 int *dr = (int *)((BYTE *)pawn + F.DesiredRotation);
-                dr[0] = 0; dr[1] = g_jumpYawLock[i]; dr[2] = 0;
+                dr[0] = 0; dr[1] = g_viewYaw[i]; dr[2] = 0;
             }
             if (F.RotationRate > 0) {
                 int *rr = (int *)((BYTE *)pawn + F.RotationRate);
@@ -8289,6 +8297,288 @@ static void drawPortalSized(void *canvas, int x, int y, int w, int h,
 }
 
 
+// ---------------------------------------------------------------------------
+// LUMOS REPLICATION & SECRET WALL PASSABILITY
+// ---------------------------------------------------------------------------
+static hp3lumos::State g_lumosState;
+static void *g_clsLumosLight           = NULL;
+static void *g_clsLumosSpell           = NULL;
+static void *g_clsGargoyle             = NULL;
+static void *g_clsLumosTrigger         = NULL;
+static void *g_clsLumosSparklesTrigger = NULL;
+static void *g_clsGenericColObj        = NULL;
+static void *g_clsKWBlockingVolume     = NULL;
+
+static int g_offWand             = -2;
+static int g_offTheLumosLight     = -2;
+static int g_offLightType         = -2;
+static int g_offLightEffect       = -2;
+static int g_offLightBrightness   = -2;
+static int g_offLightHue          = -2;
+static int g_offLightSaturation   = -2;
+static int g_offLightRadius       = -2;
+static int g_offbCollideActors    = -2;
+static DWORD g_maskbCollideActors = 0;
+static int g_offbBlockActors      = -2;
+static DWORD g_maskbBlockActors   = 0;
+static int g_offbBlockPlayers     = -2;
+static DWORD g_maskbBlockPlayers  = 0;
+static int g_offbHiddenLumos      = -2;
+static DWORD g_maskbHiddenLumos   = 0;
+static int g_offTag               = -2;
+static int g_offEvent             = -2;
+static int g_offColRadius         = -2;
+static int g_offColHeight         = -2;
+
+static void resolveLumosFields(void)
+{
+    static BOOL sResolved = FALSE;
+    if (sResolved) return;
+    sResolved = TRUE;
+
+    g_clsLumosLight           = findObjectByPath("hgame.LumosLight");
+    g_clsLumosSpell           = findObjectByPath("hgame.LumosSpell");
+    g_clsGargoyle             = findObjectByPath("hgame.gargoyle");
+    g_clsLumosTrigger         = findObjectByPath("hgame.LumosTrigger");
+    g_clsLumosSparklesTrigger = findObjectByPath("hgame.LumosSparklesTrigger");
+    g_clsGenericColObj        = findObjectByPath("KWGame.GenericColObj");
+    g_clsKWBlockingVolume     = findObjectByPath("KWGame.KWBlockingVolume");
+
+    g_offWand = propOffset("hgame.HPCharacter.Wand");
+    if (g_offWand < 0) g_offWand = propOffset("Engine.Pawn.Weapon");
+
+    g_offTheLumosLight = propOffset("hgame.baseWand.TheLumosLight");
+    if (g_offTheLumosLight < 0) g_offTheLumosLight = propOffset("hgame.HarryWand.TheLumosLight");
+
+    g_offLightType       = propOffset("Engine.Actor.LightType");
+    g_offLightEffect     = propOffset("Engine.Actor.LightEffect");
+    g_offLightBrightness = propOffset("Engine.Actor.LightBrightness");
+    g_offLightHue        = propOffset("Engine.Actor.LightHue");
+    g_offLightSaturation = propOffset("Engine.Actor.LightSaturation");
+    g_offLightRadius     = propOffset("Engine.Actor.LightRadius");
+
+    g_offbCollideActors  = propOffset("Engine.Actor.bCollideActors");
+    g_maskbCollideActors = nativeBoolBitMask("Engine.Actor.bCollideActors");
+    if (!g_maskbCollideActors) g_maskbCollideActors = boolBitMask("Engine.Actor.bCollideActors");
+
+    g_offbBlockActors    = propOffset("Engine.Actor.bBlockActors");
+    g_maskbBlockActors   = nativeBoolBitMask("Engine.Actor.bBlockActors");
+    if (!g_maskbBlockActors) g_maskbBlockActors = boolBitMask("Engine.Actor.bBlockActors");
+
+    g_offbBlockPlayers   = propOffset("Engine.Actor.bBlockPlayers");
+    g_maskbBlockPlayers  = nativeBoolBitMask("Engine.Actor.bBlockPlayers");
+    if (!g_maskbBlockPlayers) g_maskbBlockPlayers = boolBitMask("Engine.Actor.bBlockPlayers");
+
+    g_offbHiddenLumos    = propOffset("Engine.Actor.bHidden");
+    g_maskbHiddenLumos   = nativeBoolBitMask("Engine.Actor.bHidden");
+    if (!g_maskbHiddenLumos) g_maskbHiddenLumos = boolBitMask("Engine.Actor.bHidden");
+
+    g_offTag             = propOffset("Engine.Actor.Tag");
+    g_offEvent           = propOffset("Engine.Actor.Event");
+    g_offColRadius       = propOffset("Engine.Actor.CollisionRadius");
+    g_offColHeight       = propOffset("Engine.Actor.CollisionHeight");
+
+    logf_("[lumos] resolved: Wand=+0x%X TheLumosLight=+0x%X LightType=+0x%X "
+          "LightBrightness=+0x%X bCollideActors=+0x%X(0x%lX) bHidden=+0x%X(0x%lX)",
+          g_offWand, g_offTheLumosLight, g_offLightType, g_offLightBrightness,
+          g_offbCollideActors, (unsigned long)g_maskbCollideActors,
+          g_offbHiddenLumos, (unsigned long)g_maskbHiddenLumos);
+}
+
+static void *getPawnWand(void *pawn)
+{
+    if (!pawn || IsBadReadPtr(pawn, 0x100)) return NULL;
+    if (g_offWand > 0 && !IsBadReadPtr((BYTE *)pawn + g_offWand, 4)) {
+        void *w = *(void **)((BYTE *)pawn + g_offWand);
+        if (w && !IsBadReadPtr(w, 0x100)) return w;
+    }
+    if (g_objArray && g_objArray->Data) {
+        int n = g_objArray->Num;
+        for (int k = 0; k < n && n <= 400000; k++) {
+            void *o = g_objArray->Data[k];
+            if (!o || IsBadReadPtr(o, 0x100)) continue;
+            if (F.Base > 0 && *(void **)((BYTE *)o + F.Base) == pawn) {
+                char nb[128]; objName(o, nb, sizeof(nb));
+                if (strstr(nb, "Wand")) return o;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void *getWandLumosLight(void *wand, void *pawn)
+{
+    if (wand && g_offTheLumosLight > 0 && !IsBadReadPtr((BYTE *)wand + g_offTheLumosLight, 4)) {
+        void *l = *(void **)((BYTE *)wand + g_offTheLumosLight);
+        if (l && !IsBadReadPtr(l, 0x100)) return l;
+    }
+    if (g_objArray && g_objArray->Data) {
+        int n = g_objArray->Num;
+        for (int k = 0; k < n && n <= 400000; k++) {
+            void *o = g_objArray->Data[k];
+            if (!o || IsBadReadPtr(o, 0x100)) continue;
+            char nb[128]; objName(o, nb, sizeof(nb));
+            if (strstr(nb, "LumosLight")) {
+                if (wand && F.Base > 0 && *(void **)((BYTE *)o + F.Base) == wand) return o;
+                if (pawn && F.Base > 0 && *(void **)((BYTE *)o + F.Base) == pawn) return o;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void setLumosActorHidden(void *actor, BOOL hidden)
+{
+    if (!actor || g_offbHiddenLumos < 0 || !g_maskbHiddenLumos ||
+        IsBadWritePtr((BYTE *)actor + (g_offbHiddenLumos & ~3), 4)) return;
+    DWORD *p = (DWORD *)((BYTE *)actor + (g_offbHiddenLumos & ~3));
+    if (hidden) *p |= g_maskbHiddenLumos;
+    else        *p &= ~g_maskbHiddenLumos;
+}
+
+static BOOL isLumosActorHidden(void *actor)
+{
+    if (!actor || g_offbHiddenLumos < 0 || !g_maskbHiddenLumos ||
+        IsBadReadPtr((BYTE *)actor + (g_offbHiddenLumos & ~3), 4)) return FALSE;
+    return (*(DWORD *)((BYTE *)actor + (g_offbHiddenLumos & ~3)) & g_maskbHiddenLumos) != 0;
+}
+
+static void setLumosActorCollision(void *actor, BOOL collide)
+{
+    if (!actor) return;
+    if (g_offbCollideActors > 0 && g_maskbCollideActors &&
+        !IsBadWritePtr((BYTE *)actor + (g_offbCollideActors & ~3), 4)) {
+        DWORD *p = (DWORD *)((BYTE *)actor + (g_offbCollideActors & ~3));
+        if (collide) *p |= g_maskbCollideActors;
+        else         *p &= ~g_maskbCollideActors;
+    }
+    if (g_offbBlockActors > 0 && g_maskbBlockActors &&
+        !IsBadWritePtr((BYTE *)actor + (g_offbBlockActors & ~3), 4)) {
+        DWORD *p = (DWORD *)((BYTE *)actor + (g_offbBlockActors & ~3));
+        if (collide) *p |= g_maskbBlockActors;
+        else         *p &= ~g_maskbBlockActors;
+    }
+    if (g_offbBlockPlayers > 0 && g_maskbBlockPlayers &&
+        !IsBadWritePtr((BYTE *)actor + (g_offbBlockPlayers & ~3), 4)) {
+        DWORD *p = (DWORD *)((BYTE *)actor + (g_offbBlockPlayers & ~3));
+        if (collide) *p |= g_maskbBlockPlayers;
+        else         *p &= ~g_maskbBlockPlayers;
+    }
+}
+
+static void lumosTick(void)
+{
+    resolveLumosFields();
+    DWORD now = GetTickCount();
+
+    int numP = g_numPlayers;
+    if (numP < 1) numP = 1;
+    if (numP > 8) numP = 8;
+
+    // Scan for any active LumosLight
+    for (int p = 0; p < numP; p++) {
+        void *pawn = getPawn(p);
+        if (!pawn) continue;
+        void *wand = getPawnWand(pawn);
+        void *light = getWandLumosLight(wand, pawn);
+        if (light && !isLumosActorHidden(light)) {
+            BYTE lt = (g_offLightType > 0 && !IsBadReadPtr((BYTE *)light + g_offLightType, 1))
+                    ? *(BYTE *)((BYTE *)light + g_offLightType) : 1;
+            BYTE br = (g_offLightBrightness > 0 && !IsBadReadPtr((BYTE *)light + g_offLightBrightness, 1))
+                    ? *(BYTE *)((BYTE *)light + g_offLightBrightness) : 255;
+            if (hp3lumos::isLightActive(false, lt, br)) {
+                if (!g_lumosState.active) {
+                    g_lumosState.activate(p, now, hp3lumos::DefaultLumosDurationMs);
+                    logf_("  [lumos] active light found on P%d - state engaged (25s)", p);
+                }
+                break;
+            }
+        }
+    }
+
+    BOOL lumosActive = g_lumosState.update(now);
+
+    if (lumosActive) {
+        for (int p = 0; p < numP; p++) {
+            void *pawn = getPawn(p);
+            if (!pawn) continue;
+            void *wand = getPawnWand(pawn);
+            void *light = getWandLumosLight(wand, pawn);
+            if (light) {
+                setLumosActorHidden(light, FALSE);
+                if (g_offLightType > 0 && !IsBadWritePtr((BYTE *)light + g_offLightType, 1))
+                    *(BYTE *)((BYTE *)light + g_offLightType) = 1; // LT_Steady
+                if (g_offLightBrightness > 0 && !IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1))
+                    *(BYTE *)((BYTE *)light + g_offLightBrightness) = 255;
+                if (g_offLightRadius > 0 && !IsBadWritePtr((BYTE *)light + g_offLightRadius, 4))
+                    *(float *)((BYTE *)light + g_offLightRadius) = 24.0f;
+                setLumosActorCollision(light, TRUE);
+            }
+            if (g_fnShowWeapon) callFn(pawn, g_fnShowWeapon, "ShowWeapon [lumos]");
+        }
+    } else {
+        for (int p = 1; p < numP; p++) {
+            void *pawn = getPawn(p);
+            if (!pawn) continue;
+            void *wand = getPawnWand(pawn);
+            void *light = getWandLumosLight(wand, pawn);
+            if (light && !isLumosActorHidden(light)) {
+                setLumosActorHidden(light, TRUE);
+                if (g_offLightBrightness > 0 && !IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1))
+                    *(BYTE *)((BYTE *)light + g_offLightBrightness) = 0;
+            }
+        }
+    }
+
+    if (!g_objArray || !g_objArray->Data) return;
+    int n = g_objArray->Num;
+    float playerPos[8][3];
+    int validPlayers = 0;
+    for (int p = 0; p < numP; p++) {
+        void *pawn = getPawn(p);
+        if (pawn && F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
+            memcpy(playerPos[validPlayers], (BYTE *)pawn + F.Location, 12);
+            validPlayers++;
+        }
+    }
+    if (validPlayers == 0) return;
+
+    for (int k = 0; k < n && n <= 400000; k++) {
+        void *obj = g_objArray->Data[k];
+        if (!obj || IsBadReadPtr(obj, 0x100)) continue;
+        char name[128]; objName(obj, name, sizeof(name));
+        BOOL isLumosTrigger = strstr(name, "LumosSparklesTrigger") || strstr(name, "LumosTrigger") || strstr(name, "LumosSparkles");
+        BOOL isSecretWall   = strstr(name, "GenericColObj") || strstr(name, "KWBlockingVolume");
+
+        if (isLumosTrigger && F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
+            float *tloc = (float *)((BYTE *)obj + F.Location);
+            float rad = (g_offColRadius > 0 && !IsBadReadPtr((BYTE *)obj + g_offColRadius, 4))
+                      ? *(float *)((BYTE *)obj + g_offColRadius) : hp3lumos::DefaultTriggerRadius;
+            float hgt = (g_offColHeight > 0 && !IsBadReadPtr((BYTE *)obj + g_offColHeight, 4))
+                      ? *(float *)((BYTE *)obj + g_offColHeight) : hp3lumos::DefaultTriggerHeight;
+            if (rad < 200.0f) rad = hp3lumos::DefaultTriggerRadius;
+            if (hgt < 80.0f)  hgt = hp3lumos::DefaultTriggerHeight;
+
+            BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, tloc, rad, hgt);
+            if (lumosActive && nearPlayer) {
+                if (g_fnTrigger) {
+                    callFn(obj, g_fnTrigger, "LumosTrigger.Trigger");
+                }
+            }
+        }
+
+        if (isSecretWall && F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
+            float *wloc = (float *)((BYTE *)obj + F.Location);
+            BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, wloc, 300.0f, 150.0f);
+            if (lumosActive && nearPlayer) {
+                setLumosActorCollision(obj, FALSE);
+            } else if (!lumosActive) {
+                setLumosActorCollision(obj, TRUE);
+            }
+        }
+    }
+}
+
 // v52 native particles use bHidden masking only (hardware verification pending).
 // The following v26 rationale applies only to the LEGACY sprite path.
 // v26: per-pane visibility for the aim glow. The ORIGINAL game cursor is a
@@ -8548,6 +8838,7 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
                        // split-OFF return skipped delivery, so triple-cast
                        // extras flew visually but never hit.
         cgWatchP1();
+        lumosTick();
         return FALSE;
     }
 
@@ -8565,6 +8856,7 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
     finishPendingCasts();
     cgTick();                  // v51: deliver pending spell hits
     cgWatchP1();               // v51: log player 1's real target/spell choice
+    lumosTick();               // v66: replicate Lumos wand light & secret wall passability
     coopMonitor();             // v54: cancellation even if holder input vanished
 
     {   // K (diagnostic, 2-player configs only - K is P3's back key at N=3):
