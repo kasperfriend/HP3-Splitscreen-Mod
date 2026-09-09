@@ -540,3 +540,32 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
 - Native hardware/VM behavior remains unverified. The implementation logs each
   proof, hold start, reflected cursor call, borrowed hero state, activation and
   restore reason so a real HP3 log can confirm or reject the inferred route.
+
+14. V55: V54 CO-OP REGRESSION - SPLIT-ON CERTIFICATION DEAD GATE (2026-09-09)
+-----------------------------------------------------------------------------
+- Hardware capture showed a >10-second P2 hold on Save0.CompanionSpellTrigger10
+  never entering the shared state: it kept producing ordinary single casts and
+  no [coopcast] CERTIFIED line ever appeared, even though the same session's
+  log contained "[castgame] PLAYER 1 cursor aCurrentTarget ->
+  Save0.CompanionSpellTrigger10" (Player 1 demonstrably locked the object).
+- Root cause 1 (certification never ran while split was ON): coopObserveP1()
+  was called only from !g_splitOn branches in cgWatchP1, and inside the
+  function the all-three test required both companions' PAWN spellTarget to
+  equal P1's cursor target. During a live split session the companions are
+  AI/mod-driven and their pawn spellTarget never demonstrates a shared hold
+  (the mod's native-aim adapter only writes spellTarget on cast release), so
+  the whole certification path was structurally dead in the only mode where a
+  P2/P3 >10s hold can happen. v55 calls coopObserveP1() every frame in both
+  modes and, while split is ON, treats P1's sustained genuine stock cursor
+  lock (>=1200ms continuous) as the live class evidence. Split OFF keeps the
+  strict all-three demonstration (>=350ms) unchanged.
+- Root cause 2 (scan suppression, separate report): handler-only admission in
+  cgScanCandidates was gated on g_cgNVulnDecl == 0 for the whole level, so a
+  single unrelated vulnerable-typed class suppressed CGC_FN classification for
+  every otherwise-unnamed actor in the map. Admission is now per object: a
+  class with 1-2 own HandleSpell<Name> handlers below the shared bases is
+  admitted regardless of what other classes declare.
+- Certification remains behaviour-only (no guessed class names); the >10s
+  continuous-hold threshold, the real P1 SpellCursor.LockOn bridge and the
+  real trio StartCasting path are unchanged; no Trigger/Touch/impact/completion
+  shortcut was added. Hardware re-verification pending (v55 build).
