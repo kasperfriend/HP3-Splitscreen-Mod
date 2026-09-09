@@ -1584,3 +1584,177 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
     * Any surviving anomaly shows up as "[lumos] v66.4 BLOCKED Trigger()".
     * Secret walls still open for every player while a Lumos light is
       carried (the real trigger/wall actors are unchanged by this fix).
+
+==========================================================================
+2026-09-09 (late) - v66.5: LUMOS AS P2 - WALL STAYS SOLID + QUIT CRASH +
+                     P2's WAND VANISHES (one root cause + two satellites)
+==========================================================================
+
+- FIELD REPORT: with build v66.4 installed, casting Lumos as Player 2 at
+  the HP3_InsideHub gargoyle now SURVIVES (the v66.3/v66.4 crashes are
+  gone) and the spell itself works - the gargoyle lights, the mod's state
+  engages for its 25s window - but:
+
+    (a) P2's wand mesh disappears for the whole Lumos window ("the wand
+        disappears"), and returns afterwards;
+    (b) the revealed secret wall stays solid - "spell works, but I still
+        can't go through wall, it doesn't seem to apply correct state";
+    (c) quitting the game crashed with
+
+    Assertion failed: Actor->bCollideActors [File:UnOctree.cpp] [Line: 1598]
+    History: FCollisionOctree::RemoveActor <- FOctreeNode::RemoveAllActors
+             <- FCollisionOctree <- ULevel::Destroy <-
+             UObject::ConditionalDestroy <- DispatchDestroy <-
+             PurgeGarbage <- StaticExit <- appPreExit
+
+  The game log also shows TheLumosLight=+0xFFFFFFFF (the wand's light
+  property offset never resolved) and the family classes
+  LumosTrigger/LumosSparklesTrigger/KWBlockingVolume=NULL (only
+  GenericColObj resolved) - the chain-proof path was inert for 3 of the 4
+  families, exactly as v66.4 predicted it might be on this build.
+
+- ROOT CAUSE (b)+(c), one defect: the wall replication wrote the
+  bCollideActors/bBlockActors/bBlockPlayers BITS straight into the cached
+  wall actors (setLumosActorCollision). Collision in this engine is
+  resolved through the collision OCTREE, and only the native
+  Engine.Actor.SetCollision ever adds or removes an actor from it - a
+  poked bit changes the flag, not the collision. So (b): the "opened"
+  wall stayed in the octree and kept blocking every pawn that walked into
+  it (HP2-lineage ground truth: KWBlockingVolume/GenericColObj are just
+  actors; their empty Trigger()/Touch()/Bump() overrides prove no script
+  path re-syncs flags with the octree either). And (c): at quit, the
+  octree's destructor walked its still-present members and tripped
+  check(Actor->bCollideActors) on a member whose flag the mod had cleared
+  - the exact UnOctree.cpp:1598 assertion. Bit-poking was wrong in BOTH
+  directions at once: it could not open the wall, and it corrupted the
+  octree/flag invariant that engine teardown checks.
+
+  (a) was a satellite defect: while Lumos was active the [lumos] sync
+  called hgame.HPCharacter.ShowWeapon on EVERY pawn EVERY frame through
+  callFn's ZEROED parms block. In the HP2 lineage ShowWeapon/HideWeapon
+  are the cutscene commands "Weapon.bHidden = False/True" (harry.uc) - so
+  a ShowWeapon(bool) handed zeros is a HIDE. The mod was hiding P2's
+  freshly cast wand every frame. (The same call at cast-begin is harmless
+  because StartCasting/SwitchToFightStanceAnims re-show the wand right
+  after.)
+
+  A second satellite explains "doesn't seem to apply correct state": the
+  per-wand light replication never found any light. Stock
+  baseWand.PostBeginPlay spawns TheLumosLight as Spawn(Class'LumosLight',
+  self /* the wand */, Location) - the wand is the light's OWNER - and the
+  wand's Tick only SetLocation()s the light to the wand end point
+  (PHYS_None, never SetBase'd on anything). The v66.x fallback matched
+  Base == wand/pawn, which is always false for this actor; with
+  TheLumosLight=+0xFFFFFFFF the direct property read was gone too, so the
+  whole light sync (and the light-driven state machine feeding it) was a
+  silent no-op.
+
+- FIXES (all in this build):
+
+    * EVERY wall transition now goes through the engine's own native.
+      execSetCollision ("?execSetCollision@AActor@@QAEXAAUFFrame@@QAX@Z")
+      is resolved from Engine.dll exactly like execSpawn/execSetPhysics/
+      execSetLocation, and driven with synthesized OP_TRUE/OP_FALSE
+      bytecode tokens - the pattern the DrawPortal call already uses for
+      its bool parm (nativeSetCollision, src/dllmain.cpp). An opened wall
+      is genuinely REMOVED from the collision octree: passable for real,
+      for every player. The octree/flag pair stays consistent at every
+      instant - that consistency is what removes the quit crash even if
+      the game is closed mid-spell.
+
+    * Pristine per-wall collision bits are snapshotted ONCE per level at
+      scan time (readLumosCollisionBits -> hp3lumos::packWallBits), and a
+      close restores exactly those bits through the same native.
+      lumosInvalidate now calls lumosRestoreAllWalls BEFORE dropping the
+      caches, so level travel hands every still-open wall back its stock
+      collision state while the pointers are still valid.
+
+    * Only SECRET walls are ever opened: a wall is a candidate only when a
+      cached LumosTrigger/LumosSparklesTrigger sits within
+      SecretWallPairRadius (900 units) of it at scan time (pairing counted
+      and logged per scan). v66.x opened ANY GenericColObj/KWBlockingVolume
+      within 300 units of ANY player while Lumos was on - all 80 cached
+      proxies in HP3_InsideHub were in reach. The open policy itself is
+      hp3lumos::wallShouldBeOpen(lumosActive, secretCandidate, playerNear)
+      in src/lumos_sync.h, regression-tested.
+
+    * If execSetCollision is not exported, the wall feature disables
+      itself and logs ONCE ("secret-wall passability unavailable") - a
+      wall that cannot be opened properly stays solid. Collision bits are
+      never poked again, anywhere; setLumosActorCollision is deleted.
+
+    * The ShowWeapon spam is gone. While Lumos is active the mod writes
+      bHidden=false directly on each pawn's Wand actor - the stock
+      ShowWeapon command's exact effect, one dword write, idempotent,
+      signature-independent. No native call, no zeroed parms, and the
+      driven companion visibly carries the lit wand.
+
+    * The wand-light lookup actually finds lights now: exact-class
+      LumosLight (pointer compare against the resolved hgame.LumosLight
+      class object - no GetFullName) + Engine.Actor.Owner == wand. The
+      cached light is re-validated against the CURRENT wand by reading its
+      Owner back (one guarded dword read), so a wand swap is picked up
+      immediately and the 1 Hz owner-scan only runs when the cache misses.
+      While active the light gets the stock LumosLight.TurnDynamicLightOn
+      values (LT_Steady, brightness 255, radius 15, hue 32, saturation
+      72), and its own collision is deliberately NEVER touched (stock
+      spawns it SetCollision(False,False,False); LumosLight.Touch is an
+      empty no-op; the old setLumosActorCollision(light, TRUE) poke is
+      gone with the writer).
+
+    * The timer FOLLOWS a genuinely burning light: while any wand light
+      is on (isLightActive), the state refreshes in 1-second extend-only
+      ratchets (State::refresh, FollowLightRefreshMs). An infinite-Lumos
+      gargoyle keeps secret walls openable for exactly as long as its
+      light burns; the state dies within a second of the last light. The
+      ratchet comparison is tick-wrap safe (the same signed-difference
+      test isExpired uses - a plain > across the 32-bit wrap could move
+      the expiry BACKWARDS; caught by the new test section).
+
+    * The dead Trigger() fire loop is REMOVED. The v66.4 hardware log
+      proved the most-derived Trigger on the placed LumosTriggers is
+      Engine.Actor.Trigger - the empty base event (KWGame sources confirm
+      the same: KWBlockingVolume.Trigger() is empty; in the HP2 lineage
+      LumosTrigger/LumosSparkles are OnLumosOn()/OnLumosOff() state
+      machines that the stock LumosLight.TurnOn AllActors broadcast arms
+      when the gargoyle lights). Firing it was a verified no-op; the
+      stock chain stays untouched and the mod's any-player replication is
+      the octree-safe SetCollision loop. The trigger cache stays - it is
+      what marks walls as secret walls.
+
+- VERIFICATION: host policy suites pass (tests/run.sh). The lumos suite
+  (tests/lumos_sync_test.cpp) adds section 11: the wallShouldBeOpen truth
+  table (8 cases - the secretCandidate gate is the v66.5 delta), the
+  pack/unpack roundtrip over all 8 collision-bit combinations plus the
+  WallBitsUnknown sentinel (never equal to a legal pack result), and the
+  State::refresh extend-only ratchet (shortening proposals rejected,
+  chained 1s ratchets track a burning light for minutes and expire within
+  one FollowLightRefreshMs of the last refresh, wrap-crossing refresh
+  extends correctly). The Windows DLL could NOT be rebuilt in this
+  sandbox (no i686 MinGW toolchain; package installs blocked), so
+  dist/d3d8.dll and bin/d3d8.dll are NOT refreshed here - build via CI
+  (build-release.yml, workflow_dispatch) and confirm line 2 of hp3mod.log
+  says build v66.5. The v66.5-edited functions (nativeSetCollision,
+  readLumosCollisionBits, getWandLumosLight, lumosLightOf,
+  lumosRestoreAllWalls, lumosInvalidate, lumosScanActors, lumosTick) were
+  additionally compile-checked on the host against stubbed engine
+  surfaces (g++ -fsyntax-only -Wall: clean).
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v66.5 (else an old DLL is being tested).
+    * "execSetCollision = ........ (v66.5 lumos secret walls)" prints a
+      non-NULL pointer at startup. If it is NULL the build is unusable
+      for this feature - report the Engine.dll version.
+    * The scan line now ends "... (v66.4 exact-family rule); N walls
+      paired to a lumos trigger (v66.5 secret-wall candidates)". N >= 1
+      in a level with a Lumos secret wall.
+    * Cast Lumos as Player 2 at the HP3_InsideHub gargoyle: P2's wand
+      STAYS OUT and lit for the whole window; walking ANY player into the
+      revealed wall passes through it (expect "[lumos] v66.5 opened
+      secret wall #k (SetCollision off - removed from the collision
+      octree...)" in the log once per wall); backing away closes it
+      ("closed secret wall #k (pristine collision bits restored)").
+    * Let the Lumos window expire, or keep it burning and quit the game
+      mid-spell: NO UnOctree.cpp assertion, no crash dialog on exit.
+    * Level travel while a wall is open restores it (no assertion there
+      either).

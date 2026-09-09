@@ -163,8 +163,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v66.4"
-#define MOD_STAMP "build v66.4 - 2026-09-09 - LUMOS-AS-P2 SPARKLES-EMITTER TRIGGER CRASH FIXED. CRASH: with v66.3 running, casting Lumos as Player 2 (same HP3_InsideHub gargoyle) GPF'd inside UGameEngine::Draw, history: UObject::ProcessEvent <- (LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render, and the mod's own pelog shows '-> ProcessEvent LumosTrigger.Trigger' firing straight into the detach. Two defects cooperated: (a) the v66.3 class-token gate still substring-matched WITHIN the class token (strstr 'LumosSparkles'), so the placed secret-wall sparkles actor class 'LumosSparklesEmitter' still entered the trigger cache (21 'triggers' in the hub scan), and the fire-time chain re-verify reused the same substring behind an isActor gate that an Emitter trivially passes; (b) deeper: the fire site called ONE globally resolved function (g_fnTrigger = KWGame.KWPawn.Trigger) on whatever the cache held, so any admitted non-pawn executed pawn bytecode as 'this'. FIX, three layers: (1) name membership is now EXACT class-token equality (src/lumos_sync.h: triggers 'LumosTrigger'/'LumosSparklesTrigger', walls 'GenericColObj'/'KWBlockingVolume', no substring anywhere, regression-tested with the exact crash names in tests/lumos_sync_test.cpp); (2) a differently-named SUBCLASS of one of those classes - the only reason the old substring existed - is admitted exclusively by chain pointer proof: lumosChainProves walks the receiver's calibrated UObject::Class -> UStruct::SuperField chain and pointer-compares it with the family class objects resolved by path (guarded dword reads only, no GetFullName), at scan admission AND inside lumosClassVerified at every fire/write; (3) the Trigger() fire site never replays a function found on a DIFFERENT class again: with the chain verified it fires the most-derived Trigger declaration in the RECEIVER's own chain (CgClass::fnTrigger from the castgame index), falling back to Engine.Actor.Trigger (the event every actor owns), and skips + logs '[lumos] v66.4 BLOCKED Trigger()' when neither can be proven - even a future admission bug can no longer run foreign bytecode on a live object. The receiver-resolved fire also matches what the engine's own touch path dispatches, so stock LumosTrigger behaviour is unchanged. v66.3 LUMOS-AS-P2 TEXTURE TRIGGER CRASH FIXED. (1) CRASH: casting Lumos (reported as Player 2 on a gargoyle in HP3_InsideHub) GPF'd inside UGameEngine::Draw with the crash history naming the receiver: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger). The per-level Lumos scan admitted ANY object whose full GetFullName string contained the token - the placed trigger actors, but also the UClass entries (Class hgame.LumosTrigger) and the spell's HUD asset Texture hgame.LumosTriggerIcon that the engine loads alongside Lumos. A cached Texture is a live UObject (cgLiveObject passes) and the Location/CollisionRadius reads at actor offsets land in the shared UObject allocator arena (IsBadReadPtr passes), so garbage floats could pass the proximity test and the mod ran pawn Trigger() bytecode with a Texture as 'this'. Scan membership is now decided by the CLASS TOKEN only (hp3lumos class-token helpers in src/lumos_sync.h, regression-tested in tests/lumos_sync_test.cpp with the exact crash names), look-alike rejections are counted and logged per scan, and - defense in depth against a cached pointer being recycled into a different object mid-level - the Trigger() fire site and the secret-wall collision writes re-verify the receiver's class through the calibrated UObject::Class chain (guarded dword reads only, no GetFullName) before running or writing anything; a proven impostor is skipped and logged once. (2) The same class-token rule now guards the GenericColObj/KWBlockingVolume wall cache, which previously also cached the class objects themselves and wrote actor collision bits into them. v66.2 STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES: (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v66.5"
+#define MOD_STAMP "build v66.5 - 2026-09-09 - LUMOS-AS-P2 WALLS REALLY OPEN (OCTREE-SAFE SetCollision), QUIT-CRASH FIXED, P2 WAND STAYS OUT, WAND LIGHTS REALLY SYNC. FIELD REPORT (v66.4, HP3_InsideHub gargoyle): casting Lumos as Player 2 worked (gargoyle lit, spell delivered, mod state engaged for 25s) but (a) P2's wand mesh vanished for the whole window, (b) the revealed secret wall stayed solid ("it doesn't seem to apply correct state"), and (c) quitting the game crashed with 'Assertion failed: Actor->bCollideActors [File:UnOctree.cpp] [Line: 1598]' - FCollisionOctree::RemoveActor <- FOctreeNode::RemoveAllActors (recursive) <- FCollisionOctree::~FCollisionOctree <- ULevel::Destroy <- UObject::ConditionalDestroy <- DispatchDestroy <- PurgeGarbage <- StaticExit <- appPreExit: the collision octree's destructor found one of its members with bCollideActors cleared. ROOT CAUSE, one defect behind (b) and (c): the wall replication wrote the bCollideActors/bBlockActors/bBlockPlayers BITS straight into cached GenericColObj/KWBlockingVolume actors. Actor collision in this engine is resolved through the collision OCTREE, and only the native Engine.Actor.SetCollision ever adds/removes an actor from it - a poked bit changes the flag, not the collision. So (b) the "opened" wall stayed in the octree and kept blocking every pawn that walked into it, and (c) at level destroy the octree walked its still-present members and tripped check(Actor->bCollideActors) on a member whose flag the mod had cleared - the exact quit crash. (a) was separate: the [lumos] sync called hgame.HPCharacter.ShowWeapon on EVERY pawn EVERY frame through callFn's ZEROED parms block; in the HP2 lineage ShowWeapon/HideWeapon are the cutscene commands 'Weapon.bHidden = False/True' (harry.uc), so a ShowWeapon(bool) handed zeros is a HIDE - the mod was hiding P2's freshly cast wand every frame (the same call at cast-begin is harmless because StartCasting/SwitchToFightStanceAnims re-show the wand immediately after). FIXES: (1) every secret-wall open/close now goes through the ENGINE's own native: execSetCollision is resolved from Engine.dll exports exactly like execSpawn/execSetPhysics/execSetLocation and driven with synthesized OP_TRUE/OP_FALSE bytecode tokens (the pattern the DrawPortal call already uses for its bool parm); an opened wall is genuinely REMOVED from the collision octree - passable for real, for every player - and the octree/flag pair stays consistent at every instant, which is what removes the quit crash even if the game is closed mid-spell. Pristine per-wall collision bits are snapshotted once per level at scan time and restored EXACTLY on close (and on level travel through lumosInvalidate -> lumosRestoreAllWalls). (2) If execSetCollision is not exported the wall feature disables itself and logs once - a wall that cannot be opened properly stays solid; collision bits are never poked again, anywhere. (3) The ShowWeapon spam is gone: while Lumos is active the mod writes bHidden=false directly on each pawn's Wand actor (the stock ShowWeapon command's exact effect - one dword write, idempotent, signature-independent), so the driven companion visibly carries the lit wand. (4) The per-wand light replication actually finds lights now: stock baseWand.PostBeginPlay spawns TheLumosLight as Spawn(Class'LumosLight', self /*the wand*/, Location) - the wand is the light's OWNER - and the wand's Tick only SetLocation()s it to the wand end point (PHYS_None, never SetBase), so the v66.x fallback that matched Base==wand could NEVER match; with the TheLumosLight property offset unresolved on HP3 (log: TheLumosLight=+0xFFFFFFFF) the entire light sync was a silent no-op, which is why the state "didn't apply". The fallback now takes the exact-class LumosLight actor whose Engine.Actor.Owner equals the wand (pointer compare, no GetFullName), applies the stock TurnDynamicLightOn values (LT_Steady, brightness 255, radius 15, hue 32, saturation 72), and never touches the light's own collision (stock spawns it SetCollision(False,False,False) - LumosLight.PreBeginPlay - and its Touch is an empty singular no-op). (5) While any wand light is genuinely burning the mod's timer follows it in 1-second ratchets (State::refresh only ever extends), so an infinite-Lumos gargoyle keeps secret walls openable for as long as its light burns and the state expires within a second of the last light. (6) Only walls PAIRED to a cached LumosTrigger/LumosSparklesTrigger (within SecretWallPairRadius=900 units, counted and logged at scan time) are ever opened - v66.x opened ANY GenericColObj/KWBlockingVolume within 300 units of ANY player while Lumos was on (all 80 cached in the hub), which could unblock ordinary invisible collision proxies; ordinary walls are now untouchable by design. (7) The dead Trigger() fire loop on LumosTrigger actors is removed: the hardware pelog proved their most-derived Trigger is Engine.Actor.Trigger - the empty base event (in the HP2 lineage LumosTrigger/LumosSparkles are OnLumosOn()/OnLumosOff() state machines that the stock LumosLight.TurnOn AllActors broadcast already arms when the gargoyle lights) - so firing it was a verified no-op; the stock chain stays untouched and the mod's any-player replication is the octree-safe SetCollision. v66.4 CRASH: with v66.3 running, casting Lumos as Player 2 (same HP3_InsideHub gargoyle) GPF'd inside UGameEngine::Draw, history: UObject::ProcessEvent <- (LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render, and the mod's own pelog shows '-> ProcessEvent LumosTrigger.Trigger' firing straight into the detach. Two defects cooperated: (a) the v66.3 class-token gate still substring-matched WITHIN the class token (strstr 'LumosSparkles'), so the placed secret-wall sparkles actor class 'LumosSparklesEmitter' still entered the trigger cache (21 'triggers' in the hub scan), and the fire-time chain re-verify reused the same substring behind an isActor gate that an Emitter trivially passes; (b) deeper: the fire site called ONE globally resolved function (g_fnTrigger = KWGame.KWPawn.Trigger) on whatever the cache held, so any admitted non-pawn executed pawn bytecode as 'this'. FIX, three layers: (1) name membership is now EXACT class-token equality (src/lumos_sync.h: triggers 'LumosTrigger'/'LumosSparklesTrigger', walls 'GenericColObj'/'KWBlockingVolume', no substring anywhere, regression-tested with the exact crash names in tests/lumos_sync_test.cpp); (2) a differently-named SUBCLASS of one of those classes - the only reason the old substring existed - is admitted exclusively by chain pointer proof: lumosChainProves walks the receiver's calibrated UObject::Class -> UStruct::SuperField chain and pointer-compares it with the family class objects resolved by path (guarded dword reads only, no GetFullName), at scan admission AND inside lumosClassVerified at every fire/write; (3) the Trigger() fire site never replays a function found on a DIFFERENT class again: with the chain verified it fires the most-derived Trigger declaration in the RECEIVER's own chain (CgClass::fnTrigger from the castgame index), falling back to Engine.Actor.Trigger (the event every actor owns), and skips + logs '[lumos] v66.4 BLOCKED Trigger()' when neither can be proven - even a future admission bug can no longer run foreign bytecode on a live object. The receiver-resolved fire also matches what the engine's own touch path dispatches, so stock LumosTrigger behaviour is unchanged. v66.3 LUMOS-AS-P2 TEXTURE TRIGGER CRASH FIXED. (1) CRASH: casting Lumos (reported as Player 2 on a gargoyle in HP3_InsideHub) GPF'd inside UGameEngine::Draw with the crash history naming the receiver: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger). The per-level Lumos scan admitted ANY object whose full GetFullName string contained the token - the placed trigger actors, but also the UClass entries (Class hgame.LumosTrigger) and the spell's HUD asset Texture hgame.LumosTriggerIcon that the engine loads alongside Lumos. A cached Texture is a live UObject (cgLiveObject passes) and the Location/CollisionRadius reads at actor offsets land in the shared UObject allocator arena (IsBadReadPtr passes), so garbage floats could pass the proximity test and the mod ran pawn Trigger() bytecode with a Texture as 'this'. Scan membership is now decided by the CLASS TOKEN only (hp3lumos class-token helpers in src/lumos_sync.h, regression-tested in tests/lumos_sync_test.cpp with the exact crash names), look-alike rejections are counted and logged per scan, and - defense in depth against a cached pointer being recycled into a different object mid-level - the Trigger() fire site and the secret-wall collision writes re-verify the receiver's class through the calibrated UObject::Class chain (guarded dword reads only, no GetFullName) before running or writing anything; a proven impostor is skipped and logged once. (2) The same class-token rule now guards the GenericColObj/KWBlockingVolume wall cache, which previously also cached the class objects themselves and wrote actor collision bits into them. v66.2 STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES: (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -793,6 +793,38 @@ static BOOL nativeSetLocation(void *actor, const float at[3])
     return result != 0;
 }
 
+// v66.5: Engine.Actor.SetCollision is the ONLY correct way to change an
+// actor's collision. The engine resolves actor collision through the
+// collision octree, and only this native ever adds an actor to or removes
+// an actor from it (FCollisionOctree::AddActor/RemoveActor). Writing the
+// bCollideActors/bBlockActors/bBlockPlayers bits directly - what v66..v66.4
+// did to the secret walls - leaves the octree untouched: the wall keeps
+// blocking, and at level destroy the octree destructor's
+// check(Actor->bCollideActors) trips on a member whose flag was cleared
+// ("Assertion failed: Actor->bCollideActors [File:UnOctree.cpp] [Line
+// 1598]", FCollisionOctree::RemoveActor <- ... <- ULevel::Destroy at quit).
+// Like Spawn/SetPhysics/SetLocation this native consumes FFrame bytecode,
+// not a parms block: the three bools are OP_TRUE/OP_FALSE tokens, exactly
+// what the DrawPortal synthesis feeds its own bool parm.
+static PFN_execActorFn g_execSetCollision = NULL;
+
+static BOOL nativeSetCollision(void *actor, BOOL collide, BOOL blockActors,
+                               BOOL blockPlayers)
+{
+    if (!actor || !g_opsOK || !g_execSetCollision) return FALSE;
+    BYTE bc[8]; int p = 0;
+    bc[p++] = collide      ? (BYTE)g_ops[OP_TRUE].op  : (BYTE)g_ops[OP_FALSE].op;
+    bc[p++] = blockActors  ? (BYTE)g_ops[OP_TRUE].op  : (BYTE)g_ops[OP_FALSE].op;
+    bc[p++] = blockPlayers ? (BYTE)g_ops[OP_TRUE].op  : (BYTE)g_ops[OP_FALSE].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;   // guard
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = actor; st.Code = bc;
+    DWORD result = 0;
+    g_execSetCollision(actor, NULL, &st, &result);
+    return TRUE;
+}
+
 static void *spawnFX(void *actor, void *cls, void *owner,
                      const float loc[3], const int rot[3])
 {
@@ -1195,8 +1227,10 @@ static void *g_fnCast = NULL, *g_fnChoose = NULL, *g_fnStartCast = NULL;
 static void *g_fnStopCast = NULL, *g_fnCharFire = NULL, *g_fnCanCast = NULL;
 static void *g_fnTrigger = NULL, *g_fnPickup = NULL, *g_fnCanPickup = NULL;
 // v66.4: Engine.Actor.Trigger - the Trigger event EVERY actor's own chain
-// ends in. Universal fallback for the Lumos fire site when the receiver's
-// class chain is proven but declares no more-derived Trigger override.
+// ends in. Was the universal fallback of the Lumos trigger fire site; that
+// fire site is gone in v66.5 (the pelog proved the most-derived Trigger on
+// the placed LumosTriggers IS this empty base event, so firing it was a
+// no-op) - the resolution stays for diagnostics.
 static void *g_fnActorTrigger = NULL;
 static void *g_fnUnPossess = NULL, *g_fnUnPossessAI = NULL, *g_fnPossessAI = NULL;
 static void *g_fnStopTrail = NULL, *g_fnIdleWander = NULL, *g_fnRandIdle = NULL;
@@ -7421,7 +7455,11 @@ static void invalidateLevelCaches(const char *reason)
     g_defaultSpell = NULL;
     cgLiveInvalidate();        // v66.2: the object table itself is changing
     g_lumosState.deactivate();
-    lumosInvalidate();         // v66.1: drop cached lumos walls/triggers/lights
+    // v66.1: drop cached lumos walls/triggers/lights. v66.5: lumosInvalidate
+    // FIRST hands every wall the mod opened back its pristine collision
+    // bits through the SetCollision native (octree-consistent restore)
+    // while the cached pointers are still valid, then clears the caches.
+    lumosInvalidate();
     cgResetLevel();            // v51: class index / candidates / pending hits
     g_origCursor = NULL;   // v51: it dies with the level
     resetViewYaw();
@@ -8587,6 +8625,11 @@ static int g_offTag               = -2;
 static int g_offEvent             = -2;
 static int g_offColRadius         = -2;
 static int g_offColHeight         = -2;
+// v66.5: Engine.Actor.Owner - stock baseWand.PostBeginPlay spawns the wand's
+// LumosLight with Spawn(Class'LumosLight', self /*the wand*/, Location), so
+// the wand is the light's Owner. That is how a wand's light is found when
+// the TheLumosLight property offset does not resolve (HP3 log: +0xFFFFFFFF).
+static int g_offOwner             = -2;
 
 static void resolveLumosFields(void)
 {
@@ -8635,12 +8678,14 @@ static void resolveLumosFields(void)
     g_offEvent           = propOffset("Engine.Actor.Event");
     g_offColRadius       = propOffset("Engine.Actor.CollisionRadius");
     g_offColHeight       = propOffset("Engine.Actor.CollisionHeight");
+    g_offOwner           = propOffset("Engine.Actor.Owner");
 
     logf_("[lumos] resolved: Wand=+0x%X TheLumosLight=+0x%X LightType=+0x%X "
-          "LightBrightness=+0x%X bCollideActors=+0x%X(0x%lX) bHidden=+0x%X(0x%lX)",
+          "LightBrightness=+0x%X bCollideActors=+0x%X(0x%lX) bHidden=+0x%X(0x%lX) "
+          "Owner=+0x%X",
           g_offWand, g_offTheLumosLight, g_offLightType, g_offLightBrightness,
           g_offbCollideActors, (unsigned long)g_maskbCollideActors,
-          g_offbHiddenLumos, (unsigned long)g_maskbHiddenLumos);
+          g_offbHiddenLumos, (unsigned long)g_maskbHiddenLumos, g_offOwner);
     // v66.4: the family class anchor pointers the exact/chain membership
     // proofs compare against - visible in the log so a hardware dump shows
     // immediately whether subclass proofs were even possible this session.
@@ -8671,28 +8716,34 @@ static void *getPawnWand(void *pawn)
     return NULL;
 }
 
-static void *getWandLumosLight(void *wand, void *pawn)
+static void *getWandLumosLight(void *wand)
 {
     if (wand && g_offTheLumosLight > 0 && !IsBadReadPtr((BYTE *)wand + g_offTheLumosLight, 4)) {
         void *l = *(void **)((BYTE *)wand + g_offTheLumosLight);
-        if (l && !IsBadReadPtr(l, 0x100)) return l;
+        if (l && !IsBadReadPtr(l, 0x100) && cgLiveObject(l)) return l;
     }
-    if (g_objArray && g_objArray->Data) {
+    // v66.5: owner-based fallback. Stock baseWand.PostBeginPlay spawns
+    // TheLumosLight as Spawn(Class'LumosLight', self /* = the wand */,
+    // Location) - the wand is the light's OWNER - and the wand's Tick only
+    // SetLocation()s the light to the wand end point; it is PHYS_None and
+    // never SetBase()d on anything. The v66.x fallback matched
+    // Base == wand/pawn, which is always false for this actor, so with the
+    // TheLumosLight property offset unresolved on HP3 (field log:
+    // "+0xFFFFFFFF") the ENTIRE per-wand light sync silently did nothing -
+    // the "doesn't seem to apply correct state" field report. Exact class
+    // (pointer compare against the resolved hgame.LumosLight class object,
+    // no GetFullName) + Engine.Actor.Owner == wand now. The caller throttles
+    // this full-table walk to 1 Hz per player.
+    if (wand && g_objArray && g_objArray->Data && g_clsLumosLight &&
+        g_offOwner > 0) {
         int n = g_objArray->Num;
-        // v66.2 PERF: this ran UObject::GetFullName over EVERY object in the
-        // table. In HP3_InsideHub that is 8820 GetFullName calls, and because
-        // Wand.TheLumosLight never resolved (field log: +0xFFFFFFFF) the cheap
-        // read above never short-circuits it, so it re-ran every second, per
-        // player, for the whole level. "LumosLight" is the object's own name,
-        // so GetName is enough for the substring test and skips building the
-        // whole outer chain.
-        for (int k = 0; k < n && n <= 400000; k++) {
-            void *o = g_objArray->Data[k];
-            if (!o || IsBadReadPtr(o, 0x100)) continue;
-            char nb[128]; objShortName(o, nb, sizeof(nb));
-            if (strstr(nb, "LumosLight")) {
-                if (wand && F.Base > 0 && *(void **)((BYTE *)o + F.Base) == wand) return o;
-                if (pawn && F.Base > 0 && *(void **)((BYTE *)o + F.Base) == pawn) return o;
+        if (n > 0 && n <= 400000 && !IsBadReadPtr(g_objArray->Data, 4)) {
+            for (int k = 0; k < n; k++) {
+                void *o = g_objArray->Data[k];
+                if (!o || IsBadReadPtr(o, 0x100)) continue;
+                if (cgClassOf(o) != g_clsLumosLight) continue;
+                if (IsBadReadPtr((BYTE *)o + g_offOwner, 4)) continue;
+                if (*(void **)((BYTE *)o + g_offOwner) == wand) return o;
             }
         }
     }
@@ -8715,27 +8766,42 @@ static BOOL isLumosActorHidden(void *actor)
     return (*(DWORD *)((BYTE *)actor + (g_offbHiddenLumos & ~3)) & g_maskbHiddenLumos) != 0;
 }
 
-static void setLumosActorCollision(void *actor, BOOL collide)
+// v66.5: READ an actor's three collision bools through the calibrated
+// property offsets. Used to snapshot a secret wall's PRISTINE bits at scan
+// time so a later close restores exactly what the level loaded with.
+// WRITING these bits is no longer allowed anywhere in the mod: the engine
+// resolves collision through the octree and only the SetCollision native
+// updates both sides (see nativeSetCollision). The v66..v66.4 direct
+// writer is what kept the "opened" walls solid (the octree never noticed
+// the flag) and crashed the game at exit with
+// "Assertion failed: Actor->bCollideActors [File:UnOctree.cpp]" inside
+// FCollisionOctree::RemoveActor when the level's octree destructor walked
+// a member whose flag the mod had cleared.
+static BOOL readLumosCollisionBits(void *actor, BOOL *collide,
+                                   BOOL *blockActors, BOOL *blockPlayers)
 {
-    if (!actor) return;
+    if (!actor || !collide || !blockActors || !blockPlayers) return FALSE;
+    *collide = *blockActors = *blockPlayers = FALSE;
+    BOOL any = FALSE;
     if (g_offbCollideActors > 0 && g_maskbCollideActors &&
-        !IsBadWritePtr((BYTE *)actor + (g_offbCollideActors & ~3), 4)) {
-        DWORD *p = (DWORD *)((BYTE *)actor + (g_offbCollideActors & ~3));
-        if (collide) *p |= g_maskbCollideActors;
-        else         *p &= ~g_maskbCollideActors;
+        !IsBadReadPtr((BYTE *)actor + (g_offbCollideActors & ~3), 4)) {
+        *collide = (*(DWORD *)((BYTE *)actor + (g_offbCollideActors & ~3)) &
+                    g_maskbCollideActors) != 0;
+        any = TRUE;
     }
     if (g_offbBlockActors > 0 && g_maskbBlockActors &&
-        !IsBadWritePtr((BYTE *)actor + (g_offbBlockActors & ~3), 4)) {
-        DWORD *p = (DWORD *)((BYTE *)actor + (g_offbBlockActors & ~3));
-        if (collide) *p |= g_maskbBlockActors;
-        else         *p &= ~g_maskbBlockActors;
+        !IsBadReadPtr((BYTE *)actor + (g_offbBlockActors & ~3), 4)) {
+        *blockActors = (*(DWORD *)((BYTE *)actor + (g_offbBlockActors & ~3)) &
+                        g_maskbBlockActors) != 0;
+        any = TRUE;
     }
     if (g_offbBlockPlayers > 0 && g_maskbBlockPlayers &&
-        !IsBadWritePtr((BYTE *)actor + (g_offbBlockPlayers & ~3), 4)) {
-        DWORD *p = (DWORD *)((BYTE *)actor + (g_offbBlockPlayers & ~3));
-        if (collide) *p |= g_maskbBlockPlayers;
-        else         *p &= ~g_maskbBlockPlayers;
+        !IsBadReadPtr((BYTE *)actor + (g_offbBlockPlayers & ~3), 4)) {
+        *blockPlayers = (*(DWORD *)((BYTE *)actor + (g_offbBlockPlayers & ~3)) &
+                         g_maskbBlockPlayers) != 0;
+        any = TRUE;
     }
+    return any;
 }
 
 // ---------------------------------------------------------------------------
@@ -8764,21 +8830,58 @@ static BOOL  g_lumosRescanOnChain = FALSE;
 
 static void *g_lumosWand[8]  = {0};   // cached HPCharacter.Wand per player
 static void *g_lumosLight[8] = {0};   // cached LumosLight per player
-static BOOL  g_lumosTrigFired[LUMOS_MAX_ACTORS]; // edge-trigger guard per trigger
-// v66.2 PERF: what we last wrote to each secret wall's collision bits.
-// -1 = unknown (must write), 0 = passable, 1 = blocking. Without this the wall
-// loop rewrote both bitfields on every cached wall every frame, forever, even
-// while Lumos was off and the bits were already correct.
+// v66.2 PERF / v66.5 semantics: what we last APPLIED to each cached wall
+// through the SetCollision native. -1 = unknown/unmanaged (no native call
+// until something changes), 0 = WE opened it, 1 = closed (pristine bits).
+// Without this the wall loop would re-call the native on every cached wall
+// every frame, forever, even while Lumos was off.
 static signed char g_lumosWallColl[LUMOS_MAX_ACTORS];
+// v66.5: TRUE for walls paired to a cached LumosTrigger/LumosSparklesTrigger
+// at scan time - the only walls the mod may ever open. Every other
+// GenericColObj/KWBlockingVolume is an ordinary collision proxy.
+static BOOL  g_lumosWallSecret[LUMOS_MAX_ACTORS];
+// v66.5: each secret wall's PRISTINE collision bits (packed, see
+// hp3lumos::packWallBits), snapshotted once per level at scan time so a
+// close restores exactly what the level loaded with. WallBitsUnknown = not
+// a candidate / not readable -> the wall is never opened, never written.
+static BYTE  g_lumosWallOrig[LUMOS_MAX_ACTORS];
+
+// Defined further down; needed by lumosRestoreAllWalls.
+static BOOL lumosClassVerified(void *obj, BOOL wantWall);
+
+// v66.5: hand every wall the mod opened back its pristine collision state
+// through the engine's own SetCollision native. Called on level travel
+// (before the cached pointers are dropped). A wall we leave open is
+// CONSISTENT now - the native already removed it from the collision
+// octree, so no teardown assert can happen either way - but restoring is
+// what the stock game would expect of a wall whose Lumos window closed.
+static void lumosRestoreAllWalls(void)
+{
+    for (int k = 0; k < g_lumosWallsN; k++) {
+        if (g_lumosWallColl[k] != 0) continue;   // only walls WE opened
+        g_lumosWallColl[k] = 1;
+        if (g_lumosWallOrig[k] == hp3lumos::WallBitsUnknown) continue;
+        void *wall = g_lumosWalls[k];
+        if (!wall || !cgLiveObject(wall) || cgDeleted(wall)) continue;
+        if (!lumosClassVerified(wall, TRUE)) continue;
+        if (!g_execSetCollision) continue;
+        hp3lumos::WallCollisionBits b = hp3lumos::unpackWallBits(g_lumosWallOrig[k]);
+        nativeSetCollision(wall, b.collideActors ? TRUE : FALSE,
+                           b.blockActors ? TRUE : FALSE,
+                           b.blockPlayers ? TRUE : FALSE);
+    }
+}
 
 static void lumosInvalidate(void)
 {
+    lumosRestoreAllWalls();
     g_lumosTriggersN = 0;
     g_lumosWallsN = 0;
     g_lumosScanDone = FALSE;
     g_lumosRescanOnChain = FALSE;
-    memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));
     memset(g_lumosWallColl, -1, sizeof(g_lumosWallColl));
+    memset(g_lumosWallSecret, 0, sizeof(g_lumosWallSecret));
+    memset(g_lumosWallOrig, hp3lumos::WallBitsUnknown, sizeof(g_lumosWallOrig));
     for (int p = 0; p < 8; p++) {
         g_lumosWand[p] = NULL;
         g_lumosLight[p] = NULL;
@@ -8860,10 +8963,51 @@ static void lumosScanActors(void)
     g_lumosRescanOnChain =
         (!g_cgChainOK && (impostorTrig + chainTrig + impostorWall + chainWall) > 0)
         ? TRUE : FALSE;
+    // v66.5: which cached walls are actually SECRET walls? The stock game
+    // places a LumosTrigger / LumosSparklesTrigger at every wall Lumos
+    // reveals (in the HP2 lineage that trigger's own InLumosRadius check
+    // measures the LEAD character's distance from IT, which is exactly why
+    // P2 walking up to the wall alone never opened it in stock). A wall
+    // with no lumos trigger within SecretWallPairRadius is an ordinary
+    // collision proxy and is never opened by the mod - the v66.x rule
+    // "any wall within 300 units of any player" reached all 80 cached
+    // GenericColObj/KWBlockingVolume actors in HP3_InsideHub. Snapshot each
+    // candidate's PRISTINE collision bits now, at level load, so a close
+    // restores exactly what the level started with.
+    int paired = 0;
+    for (int w = 0; w < g_lumosWallsN; w++) {
+        g_lumosWallSecret[w] = FALSE;
+        g_lumosWallOrig[w] = hp3lumos::WallBitsUnknown;
+        g_lumosWallColl[w] = 1;          // bits are pristine right after scan
+        void *wall = g_lumosWalls[w];
+        if (!wall || !cgLiveObject(wall) || F.Location <= 0 ||
+            IsBadReadPtr((BYTE *)wall + F.Location, 12)) continue;
+        float *wl = (float *)((BYTE *)wall + F.Location);
+        for (int t = 0; t < g_lumosTriggersN; t++) {
+            void *tr = g_lumosTriggers[t];
+            if (!tr || !cgLiveObject(tr) || F.Location <= 0 ||
+                IsBadReadPtr((BYTE *)tr + F.Location, 12)) continue;
+            float *tl = (float *)((BYTE *)tr + F.Location);
+            if (hp3lumos::isWithinCylinder(wl, tl,
+                    hp3lumos::SecretWallPairRadius, 100000.0f)) {
+                g_lumosWallSecret[w] = TRUE;
+                paired++;
+                break;
+            }
+        }
+        BOOL c = FALSE, ba = FALSE, bp = FALSE;
+        if (g_lumosWallSecret[w] &&
+            readLumosCollisionBits(wall, &c, &ba, &bp)) {
+            g_lumosWallOrig[w] = hp3lumos::packWallBits(
+                c != FALSE, ba != FALSE, bp != FALSE);
+        }
+    }
     logf_("[lumos] scan: %d triggers, %d walls cached; %d+%d name look-alikes "
-          "rejected, %d+%d subclasses chain-admitted (v66.4 exact-family rule)",
+          "rejected, %d+%d subclasses chain-admitted (v66.4 exact-family "
+          "rule); %d walls paired to a lumos trigger (v66.5 secret-wall "
+          "candidates)",
           g_lumosTriggersN, g_lumosWallsN, impostorTrig, impostorWall,
-          chainTrig, chainWall);
+          chainTrig, chainWall, paired);
 }
 
 // v66.3/v66.4 crash fix: re-verify a cached object's class at the moment the
@@ -8927,17 +9071,32 @@ static void *lumosLightOf(int p, void *pawn)
     if (p < 0 || p >= 8 || !pawn) return NULL;
     void *wand = lumosWandOf(p, pawn);
     if (!wand) { g_lumosLight[p] = NULL; return NULL; }
-    if (g_offTheLumosLight > 0) {
-        if (IsBadReadPtr((BYTE *)wand + g_offTheLumosLight, 4)) return NULL;
+    // v66.5: fast path - validate the cached light against the CURRENT wand
+    // by reading its Owner back (one guarded dword read, no table walk). A
+    // wand swap (cutscene, level script handing out a different weapon) is
+    // picked up immediately.
+    if (g_lumosLight[p] && cgLiveObject(g_lumosLight[p]) && g_offOwner > 0 &&
+        !IsBadReadPtr((BYTE *)g_lumosLight[p] + g_offOwner, 4) &&
+        *(void **)((BYTE *)g_lumosLight[p] + g_offOwner) == wand)
+        return g_lumosLight[p];
+    if (g_lumosLight[p] && !cgLiveObject(g_lumosLight[p])) g_lumosLight[p] = NULL;
+    // Direct TheLumosLight property read when that offset ever resolves.
+    if (g_offTheLumosLight > 0 &&
+        !IsBadReadPtr((BYTE *)wand + g_offTheLumosLight, 4)) {
         void *l = *(void **)((BYTE *)wand + g_offTheLumosLight);
-        if (l && !IsBadReadPtr(l, 0x100)) return l;
+        if (l && !IsBadReadPtr(l, 0x100) && cgLiveObject(l)) {
+            g_lumosLight[p] = l;
+            return l;
+        }
     }
+    // v66.5 owner-scan fallback (exact class + Owner == wand), throttled to
+    // 1 Hz per player whether or not it finds anything.
     static DWORD sLightAt[8] = {0};
     DWORD now = GetTickCount();
-    if (g_lumosLight[p] && !cgLiveObject(g_lumosLight[p])) g_lumosLight[p] = NULL;
-    if (g_lumosLight[p] && now - sLightAt[p] < 1000) return g_lumosLight[p];
-    sLightAt[p] = now;
-    g_lumosLight[p] = getWandLumosLight(wand, pawn);   // full-table fallback
+    if ((DWORD)(now - sLightAt[p]) >= 1000) {
+        sLightAt[p] = now;
+        g_lumosLight[p] = getWandLumosLight(wand);
+    }
     return g_lumosLight[p];
 }
 
@@ -8976,23 +9135,29 @@ static void lumosTick(void)
     void *pw[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     for (int p = 0; p < numP; p++) pw[p] = getPawn(p);
 
-    // Scan for any active LumosLight (wand/light pointers are cached now).
+    // Scan for any actively burning wand light (wand/light pointers are
+    // cached now). v66.5: while a light is genuinely burning, the state
+    // FOLLOWS it in 1-second ratchets - State::refresh only ever EXTENDS
+    // the expiry, so an infinite-Lumos gargoyle keeps secret walls openable
+    // for exactly as long as its light burns, and the state dies within a
+    // second of the last light instead of DefaultLumosDurationMs after it.
     for (int p = 0; p < numP; p++) {
         void *pawn = pw[p];
         if (!pawn) continue;
         void *light = lumosLightOf(p, pawn);
-        if (light && !isLumosActorHidden(light)) {
-            BYTE lt = (g_offLightType > 0 && !IsBadReadPtr((BYTE *)light + g_offLightType, 1))
-                    ? *(BYTE *)((BYTE *)light + g_offLightType) : 1;
-            BYTE br = (g_offLightBrightness > 0 && !IsBadReadPtr((BYTE *)light + g_offLightBrightness, 1))
-                    ? *(BYTE *)((BYTE *)light + g_offLightBrightness) : 255;
-            if (hp3lumos::isLightActive(false, lt, br)) {
-                if (!g_lumosState.active) {
-                    g_lumosState.activate(p, now, hp3lumos::DefaultLumosDurationMs);
-                    logf_("  [lumos] active light found on P%d - state engaged (25s)", p);
-                }
-                break;
+        if (!light) continue;
+        BYTE lt = (g_offLightType > 0 && !IsBadReadPtr((BYTE *)light + g_offLightType, 1))
+                ? *(BYTE *)((BYTE *)light + g_offLightType) : 1;
+        BYTE br = (g_offLightBrightness > 0 && !IsBadReadPtr((BYTE *)light + g_offLightBrightness, 1))
+                ? *(BYTE *)((BYTE *)light + g_offLightBrightness) : 255;
+        if (hp3lumos::isLightActive(false, lt, br)) {
+            if (!g_lumosState.active) {
+                g_lumosState.activate(p, now, hp3lumos::DefaultLumosDurationMs);
+                logf_("  [lumos] active light found on P%d - state engaged (25s)", p);
+            } else {
+                g_lumosState.refresh(now, hp3lumos::FollowLightRefreshMs);
             }
+            break;
         }
     }
 
@@ -9002,18 +9167,42 @@ static void lumosTick(void)
         for (int p = 0; p < numP; p++) {
             void *pawn = pw[p];
             if (!pawn) continue;
+            // v66.5: keep the wand itself in hand for every player. The
+            // stock game's ShowWeapon is the cutscene command
+            // "Weapon.bHidden = False" (HP2 harry.uc lineage; HideWeapon is
+            // the same line with True). v66.x instead called
+            // hgame.HPCharacter.ShowWeapon through callFn's ZEROED parms
+            // block every frame - if that function takes a show/hide bool,
+            // zeros mean HIDE, which is exactly the "P2's wand disappears
+            // the moment the Lumos sync starts" field report. Write the
+            // stock command's effect directly on the Wand actor instead:
+            // one dword write, idempotent, signature-independent.
+            void *wand = lumosWandOf(p, pawn);
+            if (wand) setLumosActorHidden(wand, FALSE);
             void *light = lumosLightOf(p, pawn);
             if (light) {
                 setLumosActorHidden(light, FALSE);
+                // Stock LumosLight.TurnDynamicLightOn() values (HP2
+                // LumosLight.uc): LT_Steady, radius 15, hue 32, saturation
+                // 72, full brightness.
                 if (g_offLightType > 0 && !IsBadWritePtr((BYTE *)light + g_offLightType, 1))
                     *(BYTE *)((BYTE *)light + g_offLightType) = 1; // LT_Steady
                 if (g_offLightBrightness > 0 && !IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1))
                     *(BYTE *)((BYTE *)light + g_offLightBrightness) = 255;
                 if (g_offLightRadius > 0 && !IsBadWritePtr((BYTE *)light + g_offLightRadius, 4))
-                    *(float *)((BYTE *)light + g_offLightRadius) = 24.0f;
-                setLumosActorCollision(light, TRUE);
+                    *(float *)((BYTE *)light + g_offLightRadius) = 15.0f;
+                if (g_offLightHue > 0 && !IsBadWritePtr((BYTE *)light + g_offLightHue, 1))
+                    *(BYTE *)((BYTE *)light + g_offLightHue) = 32;
+                if (g_offLightSaturation > 0 && !IsBadWritePtr((BYTE *)light + g_offLightSaturation, 1))
+                    *(BYTE *)((BYTE *)light + g_offLightSaturation) = 72;
+                // v66.5: the light's collision is deliberately NOT touched.
+                // Stock spawns it SetCollision(False,False,False)
+                // (LumosLight.PreBeginPlay) - its Touch is an empty singular
+                // no-op and it must never block anything. The v66.x
+                // setLumosActorCollision(light, TRUE) poke set
+                // bCollideActors/bBlockActors/bBlockPlayers on an actor that
+                // is not even in the collision octree.
             }
-            if (g_fnShowWeapon) callFn(pawn, g_fnShowWeapon, "ShowWeapon [lumos]");
         }
     } else {
         for (int p = 1; p < numP; p++) {
@@ -9028,18 +9217,15 @@ static void lumosTick(void)
         }
     }
 
-    // v66.2 PERF: with Lumos off, the only reason to look at the trigger and
-    // wall caches at all is to undo something we did while it was on. Both
-    // caches are edge-managed below, so "nothing left to undo" is knowable and
-    // the whole section - including a per-trigger and per-wall liveness probe
-    // and proximity test - is skipped for the rest of the level.
+    // v66.2 PERF: with Lumos off, the only reason to look at the wall cache
+    // at all is to undo something we did while it was on. The cache is
+    // edge-managed below, so "nothing left to undo" is knowable and the
+    // whole section - including a per-wall liveness probe and proximity
+    // test - is skipped for the rest of the level.
     BOOL wallsDirty = FALSE;
     for (int k = 0; k < g_lumosWallsN; k++)
         if (g_lumosWallColl[k] == 0) { wallsDirty = TRUE; break; }
-    BOOL triggersDirty = FALSE;
-    for (int k = 0; k < g_lumosTriggersN; k++)
-        if (g_lumosTrigFired[k]) { triggersDirty = TRUE; break; }
-    if (!lumosActive && !wallsDirty && !triggersDirty) return;
+    if (!lumosActive && !wallsDirty) return;
 
     float playerPos[8][3];
     int validPlayers = 0;
@@ -9052,93 +9238,102 @@ static void lumosTick(void)
     }
     if (validPlayers == 0) return;
 
-    // Triggers / secret walls come from the per-level cache. Each cached
-    // pointer is liveness-checked before any dereference (v57: a level change
-    // can free these objects while the cache still points at them), and the
-    // trigger fire is edge-triggered so a held Lumos never spams Trigger()
-    // every frame.
-    for (int k = 0; k < g_lumosTriggersN; k++) {
-        void *obj = g_lumosTriggers[k];
-        if (!cgLiveObject(obj) || F.Location <= 0 ||
-            IsBadReadPtr((BYTE *)obj + F.Location, 12)) continue;
-        float *tloc = (float *)((BYTE *)obj + F.Location);
-        float rad = (g_offColRadius > 0 && !IsBadReadPtr((BYTE *)obj + g_offColRadius, 4))
-                  ? *(float *)((BYTE *)obj + g_offColRadius) : hp3lumos::DefaultTriggerRadius;
-        float hgt = (g_offColHeight > 0 && !IsBadReadPtr((BYTE *)obj + g_offColHeight, 4))
-                  ? *(float *)((BYTE *)obj + g_offColHeight) : hp3lumos::DefaultTriggerHeight;
-        if (rad < 200.0f) rad = hp3lumos::DefaultTriggerRadius;
-        if (hgt < 80.0f)  hgt = hp3lumos::DefaultTriggerHeight;
+    // v66.5: the per-trigger fire loop is GONE. The hardware pelog of the
+    // v66.4 field report shows the most-derived Trigger on a placed
+    // LumosTrigger is Engine.Actor.Trigger - the empty base event (in the
+    // HP2 lineage LumosTrigger and LumosSparkles are OnLumosOn()/OnLumosOff()
+    // state machines, armed by the stock LumosLight.TurnOn AllActors
+    // broadcast that already ran when the gargoyle lit) - so firing
+    // Trigger() on them was a verified no-op. The stock chain stays
+    // untouched; the mod's "any player may pass" replication is the
+    // octree-safe SetCollision loop below. The trigger cache itself stays:
+    // it marks which walls are secret walls (pairing done at scan time).
 
-        BOOL nearPlayer = hp3lumos::anyPlayerNearTrigger(playerPos, validPlayers, tloc, rad, hgt);
-        if (lumosActive && nearPlayer && !g_lumosTrigFired[k]) {
-            g_lumosTrigFired[k] = TRUE;
-            // v66.3 crash fix: never hand Trigger() to an object that is not
-            // provably a Lumos trigger actor RIGHT NOW (the first P2 Lumos
-            // GPF ran it on "Texture hgame.LumosTriggerIcon").
-            // v66.4 crash fix: and never hand it a FUNCTION the receiver's
-            // own class chain does not declare. v66.x fired one globally
-            // resolved KWGame.KWPawn.Trigger on every cached entry - the
-            // second P2 Lumos GPF ran that pawn bytecode on the emitter
-            // "LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0"
-            // (receiver AND function are both named in the crash history).
-            // With the class chain verified we fire the most-derived Trigger
-            // declaration found in the RECEIVER's chain (CgClass::fnTrigger,
-            // already mapped by the castgame index), falling back to
-            // Engine.Actor.Trigger - the base event every actor owns. Only
-            // the small window before the chain verifies keeps the v66.3
-            // trust level (exact-name scan + g_fnTrigger); every other gate
-            // has already proven this object by then.
-            const char *why = NULL;
-            void *fireFn = NULL;
-            if (!lumosClassVerified(obj, FALSE)) {
-                why = "cached entry is not a live Lumos trigger actor";
-            } else if (g_cgChainOK) {
-                CgClass *ci = cgClassInfo(cgClassOf(obj));
-                fireFn = (ci && ci->fnTrigger) ? ci->fnTrigger : g_fnActorTrigger;
-                if (!fireFn) why = "receiver's class chain declares no Trigger";
-            } else {
-                fireFn = g_fnTrigger;
-                if (!fireFn) why = "no Trigger function resolved";
-            }
-            if (fireFn)
-                callFn(obj, fireFn, "LumosTrigger.Trigger");
-            else
-                logf_("  [lumos] v66.4 BLOCKED Trigger() on %p - %s", obj, why);
-        }
-        if (!lumosActive) g_lumosTrigFired[k] = FALSE;
-    }
-
-    // v66.2: write the collision bits only when the wanted state differs from
-    // what we last applied, and re-assert on a 250ms cadence while Lumos is
-    // on so the game cannot quietly hand a secret wall back to us mid-spell.
+    // v66.2: only touch a wall when the wanted state differs from what we
+    // last applied, and re-assert on a 250ms cadence while Lumos is on so
+    // the game cannot quietly hand a secret wall back to us mid-spell.
     // (v66.1 re-asserted every frame for every wall, in both states.)
+    // v66.5: every transition goes through the engine's own SetCollision
+    // native (nativeSetCollision) - the collision octree is the authority
+    // and only that native updates both sides. v66..v66.4 poked the bits
+    // directly: the "opened" wall stayed in the octree and kept blocking,
+    // and the cleared flag on an octree member crashed the game at exit
+    // ("Assertion failed: Actor->bCollideActors [File:UnOctree.cpp]").
     static DWORD sWallAssertAt = 0;
+    static BOOL  sWallNativeLogged = FALSE;
     BOOL reassert = lumosActive && (DWORD)(now - sWallAssertAt) >= 250u;
     if (reassert) sWallAssertAt = now;
     for (int k = 0; k < g_lumosWallsN; k++) {
         void *obj = g_lumosWalls[k];
-        if (!cgLiveObject(obj) || F.Location <= 0 ||
+        if (!cgLiveObject(obj) || cgDeleted(obj) || F.Location <= 0 ||
             IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
-            g_lumosWallColl[k] = -1;   // unverifiable: force a rewrite next time
+            // Dying or unreadable. A wall we opened is CONSISTENT where it
+            // is (the native already removed it from the collision octree),
+            // so nothing must be forced before we stop tracking it.
+            g_lumosWallColl[k] = -1;   // unverifiable: re-manage if it returns
             continue;
         }
-        BOOL wantCollide = TRUE;
-        if (lumosActive) {
+        // v66.5: only SECRET walls (paired to a lumos trigger at scan time)
+        // may ever open, and only while a player is actually at the wall.
+        // Ordinary GenericColObj/KWBlockingVolume proxies are untouchable.
+        // Policy is hp3lumos::wallShouldBeOpen (regression-tested).
+        BOOL wantOpen = FALSE;
+        if (lumosActive && g_lumosWallSecret[k]) {
             float *wloc = (float *)((BYTE *)obj + F.Location);
-            wantCollide = !hp3lumos::anyPlayerNearTrigger(
-                playerPos, validPlayers, wloc, 300.0f, 150.0f);
+            wantOpen = hp3lumos::wallShouldBeOpen(
+                lumosActive != FALSE, g_lumosWallSecret[k] != FALSE,
+                hp3lumos::anyPlayerNearTrigger(
+                    playerPos, validPlayers, wloc, 300.0f, 150.0f))
+                ? TRUE : FALSE;
         }
-        signed char want = wantCollide ? 1 : 0;
-        if (g_lumosWallColl[k] == want && !(reassert && want == 0)) continue;
-        // v66.3/v66.4 crash fix: same verification as the Trigger() fire site
-        // (exact family token OR chain proof) - do not write actor collision
-        // bits into a recycled-pointer impostor.
+        signed char want = wantOpen ? 0 : 1;   // 0 = open, 1 = closed
+        if (g_lumosWallColl[k] == want && !(reassert && wantOpen)) continue;
+        // v66.3/v66.4 crash fix retained: same verification the old
+        // collision-write site used - never hand a recycled-pointer
+        // impostor to an engine native.
         if (!lumosClassVerified(obj, TRUE)) {
             g_lumosWallColl[k] = -1;         // retry only if it ever re-verifies
             continue;
         }
-        setLumosActorCollision(obj, wantCollide);
-        g_lumosWallColl[k] = want;
+        if (wantOpen) {
+            if (!g_execSetCollision) {
+                // v66.5: no native, no poke. A wall that cannot be opened
+                // properly stays solid; collision bits are never written.
+                if (!sWallNativeLogged) {
+                    logf_("  [lumos] v66.5 secret-wall passability "
+                          "unavailable: Engine.Actor.SetCollision native "
+                          "not exported - walls stay solid");
+                    sWallNativeLogged = TRUE;
+                }
+                g_lumosWallColl[k] = -1;
+                continue;
+            }
+            if (nativeSetCollision(obj, FALSE, FALSE, FALSE)) {
+                if (g_lumosWallColl[k] != 0)
+                    logf_("  [lumos] v66.5 opened secret wall #%d "
+                          "(SetCollision off - removed from the collision "
+                          "octree, passable for every player)", k);
+                g_lumosWallColl[k] = 0;
+            }
+        } else {
+            // Close: restore the level's PRISTINE bits exactly as
+            // snapshotted at scan time.
+            if (!g_execSetCollision) { g_lumosWallColl[k] = 1; continue; }
+            if (g_lumosWallOrig[k] == hp3lumos::WallBitsUnknown) {
+                g_lumosWallColl[k] = 1;
+                continue;
+            }
+            hp3lumos::WallCollisionBits b =
+                hp3lumos::unpackWallBits(g_lumosWallOrig[k]);
+            if (nativeSetCollision(obj, b.collideActors ? TRUE : FALSE,
+                                   b.blockActors ? TRUE : FALSE,
+                                   b.blockPlayers ? TRUE : FALSE)) {
+                if (g_lumosWallColl[k] == 0)
+                    logf_("  [lumos] v66.5 closed secret wall #%d "
+                          "(pristine collision bits restored)", k);
+                g_lumosWallColl[k] = 1;
+            }
+        }
     }
 }
 
@@ -9853,6 +10048,14 @@ static DWORD WINAPI initThread(LPVOID)
         g_engine, "?execSetLocation@AActor@@QAEXAAUFFrame@@QAX@Z"));
     logf_("execSetLocation = %p (v66.2 unstick ladder)",
           (void *)g_execSetLocation);
+    // v66.5: the Lumos secret walls open/close through the engine's own
+    // SetCollision so the collision octree stays consistent (see
+    // nativeSetCollision). If this export is missing the wall feature
+    // disables itself - collision bits are never poked.
+    g_execSetCollision = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+        g_engine, "?execSetCollision@AActor@@QAEXAAUFFrame@@QAX@Z"));
+    logf_("execSetCollision = %p (v66.5 lumos secret walls)",
+          (void *)g_execSetCollision);
     g_execDrawPortal = (PFN_execDrawPortal)
         resolveThunk((BYTE *)GetProcAddress(g_engine, SYM_DRAWPORT));
     logf_("execDrawPortal = %p", (void *)g_execDrawPortal);

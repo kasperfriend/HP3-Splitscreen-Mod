@@ -196,8 +196,116 @@ int main()
         assert(!chainContainsAny(nullChain, 3, trigRefs, 2));
     }
 
+    // 11. v66.5 regressions: octree-safe wall lifecycle + follow-light timer.
+    //     Field report (v66.4, HP3_InsideHub gargoyle, Player 2 casts Lumos):
+    //     the revealed secret wall stayed solid ("doesn't seem to apply
+    //     correct state") and quitting the game crashed with
+    //     "Assertion failed: Actor->bCollideActors [File:UnOctree.cpp
+    //     [Line: 1598]]" - FCollisionOctree::RemoveActor <- ... <- ULevel::
+    //     Destroy. Both had one root cause: the wall replication wrote the
+    //     collision BITS directly into wall actors while the engine resolves
+    //     collision through the collision octree, which only the
+    //     Engine.Actor.SetCollision native updates.
+    // 11a. wallShouldBeOpen truth table: the v66.5 open policy adds the
+    //     secretCandidate gate to v66.1's shouldSecretWallBePassable - a
+    //     wall is only ever opened while Lumos is active, the wall is a
+    //     PROVEN secret wall (paired to a lumos trigger at scan time), and a
+    //     player is actually at it. Ordinary GenericColObj/KWBlockingVolume
+    //     proxies within 300 units of a player must stay solid.
+    assert(wallShouldBeOpen(true, true, true));    // the only open case
+    assert(!wallShouldBeOpen(true, true, false));  // nobody at the wall
+    assert(!wallShouldBeOpen(true, false, true));  // ordinary wall (v66.5 gate)
+    assert(!wallShouldBeOpen(true, false, false));
+    assert(!wallShouldBeOpen(false, true, true));  // Lumos expired
+    assert(!wallShouldBeOpen(false, true, false));
+    assert(!wallShouldBeOpen(false, false, true));
+    assert(!wallShouldBeOpen(false, false, false));
+    // 11b. pack/unpack roundtrip: every one of the 8 bit combinations a
+    //     level can load a wall with survives the snapshot -> restore trip
+    //     EXACTLY (a close must hand the SetCollision native the very bits
+    //     the level started with, e.g. bCollideActors+bBlockPlayers only).
+    for (unsigned bits = 0; bits < 8; ++bits) {
+        WallCollisionBits in;
+        in.collideActors = (bits & 1) != 0;
+        in.blockActors   = (bits & 2) != 0;
+        in.blockPlayers  = (bits & 4) != 0;
+        WallCollisionBits out = unpackWallBits(packWallBits(
+            in.collideActors, in.blockActors, in.blockPlayers));
+        assert(out.collideActors == in.collideActors);
+        assert(out.blockActors   == in.blockActors);
+        assert(out.blockPlayers  == in.blockPlayers);
+    }
+    // The hub's stock secret-wall shape: collide+block actors+block players.
+    assert(packWallBits(true, true, true) == 7);
+    assert(packWallBits(false, false, false) == 0);
+    // WallBitsUnknown never decodes as a real combination: unpacking it is
+    // never a valid restore, and the wall loop treats it as "untouchable".
+    assert(WallBitsUnknown == 0xFF);
+    {
+        WallCollisionBits bad = unpackWallBits(WallBitsUnknown);
+        (void)bad;   // 0xFF decodes to all-true, but the loop guards on the
+                     // SENTINEL before ever unpacking - assert the sentinel
+                     // differs from every legal pack result instead:
+        for (unsigned bits = 0; bits < 8; ++bits) {
+            WallCollisionBits b;
+            b.collideActors = (bits & 1) != 0;
+            b.blockActors   = (bits & 2) != 0;
+            b.blockPlayers  = (bits & 4) != 0;
+            assert(packWallBits(b.collideActors, b.blockActors,
+                                b.blockPlayers) != WallBitsUnknown);
+        }
+    }
+    // 11c. State::refresh is an extend-only ratchet: while a wand light
+    //     genuinely burns (isLightActive), the state follows it in
+    //     FollowLightRefreshMs=1000ms steps; refresh can NEVER shorten a
+    //     still-running window, and the state dies within a second of the
+    //     last light instead of DefaultLumosDurationMs after it.
+    assert(FollowLightRefreshMs == 1000);
+    {
+        State follow;
+        follow.activate(1, 1000, 10000);            // expires at 11000
+        follow.refresh(11000 - 1000, FollowLightRefreshMs);  // extend to 11000
+        assert(!follow.isExpired(10999));
+        assert(follow.isExpired(11000));
+        // A SHORTER proposed window never pulls the expiry back in.
+        follow.activate(1, 5000, 5000);             // expires at 10000...
+        follow.refresh(5001, 1);                    // ...proposes 5002 < 10000
+        assert(!follow.isExpired(9999));            // still the longer window
+        assert(follow.isExpired(10001));
+        // Chained 1s ratchets track a burning light indefinitely...
+        State burning;
+        burning.activate(0, 0, FollowLightRefreshMs);
+        std::uint32_t t = 0;
+        for (int i = 0; i < 120; ++i) {             // two minutes of light
+            t += 1000;
+            burning.refresh(t, FollowLightRefreshMs);
+            assert(burning.update(t));
+        }
+        assert(burning.active);                     // never expired mid-burn
+        // ...and once the light goes out the last ratchet is all that is
+        // left: expiry within FollowLightRefreshMs of the final refresh.
+        std::uint32_t lastT = t;
+        assert(burning.isExpired(lastT + FollowLightRefreshMs));
+        assert(!burning.isExpired(lastT + FollowLightRefreshMs - 1));
+        // Tick-wrap ratchet: refresh across the 32-bit boundary extends.
+        // start 0xFFFFFF00 + 1000ms -> expiry wraps to 0x2E8 (744).
+        State wrap;
+        wrap.activate(2, 0xFFFFFF00u, 1000);
+        // refresh at now = 0xFFFFFF00+500 (wraps to 0xF4=244) proposes
+        // 244+1000 = 0x4DC (1244) - strictly later than 744, so it extends.
+        wrap.refresh(0xFFFFFF00u + 500u, 1000);
+        assert(!wrap.isExpired(0xFFFFFF00u + 600u));   // 344: still burning
+        assert(!wrap.isExpired(0x4DBu));
+        assert(wrap.isExpired(0x4DCu));                // new expiry
+        // A refresh whose proposal lands BEFORE the current expiry never
+        // shortens the window (extend-only ratchet).
+        wrap.refresh(0x10u, 1000);                     // proposes 0x410 < 0x4DC
+        assert(wrap.isExpired(0x4DCu));                // expiry unchanged
+        assert(!wrap.isExpired(0x40Fu));
+    }
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
-              "v66.3 class-token and v66.4 exact-family/chain-proof scan "
-              "assertions passed");
+              "v66.3 class-token, v66.4 exact-family/chain-proof scan and "
+              "v66.5 wall-bits/follow-light assertions passed");
     return 0;
 }
