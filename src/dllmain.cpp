@@ -41,6 +41,12 @@
 #include "coop_trio.h"
 #include "lumos_sync.h"
 
+// v66 Lumos replication state. Defined here, next to the header that declares
+// its type, because it is used by cgDeliverHit (the cast-game Lumos hit hook)
+// and invalidateLevelCaches (level-travel reset), both of which appear in this
+// file BEFORE the LUMOS REPLICATION & SECRET WALL PASSABILITY section below.
+static hp3lumos::State g_lumosState;
+
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
 static int g_numPlayers = 2;
@@ -8299,8 +8305,9 @@ static void drawPortalSized(void *canvas, int x, int y, int w, int h,
 
 // ---------------------------------------------------------------------------
 // LUMOS REPLICATION & SECRET WALL PASSABILITY
+// (g_lumosState is defined near the top of the file: cgDeliverHit and
+//  invalidateLevelCaches, which run earlier in this file, also use it.)
 // ---------------------------------------------------------------------------
-static hp3lumos::State g_lumosState;
 static void *g_clsLumosLight           = NULL;
 static void *g_clsLumosSpell           = NULL;
 static void *g_clsGargoyle             = NULL;
