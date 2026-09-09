@@ -47,8 +47,9 @@ static BOOL  g_camCollide = TRUE;
 static BOOL  g_aimedCast  = FALSE;
 static BOOL  g_nativeAim = TRUE;      // v52: original HP3 emitter + SpellGesture
 static BOOL  g_castGameplay = TRUE;   // v50: make P2+ casts activate spell/gameplay targets, not only animate
-// v54: after a deliberate continuous hold on a class proven by the game's
-// own P1-plus-companions route, mirror the normal three-character hold state.
+// v54/v55: after a deliberate continuous hold on a class proven live by the
+// game's own behavior (split-ON: P1's stock cursor lock; split-OFF: the stock
+// P1-plus-companions route), mirror the normal three-character hold state.
 // This is intentionally opt-in by time rather than a generic trigger bypass.
 static BOOL  g_coopCastFallback = TRUE;
 static DWORD g_coopCastHoldMs = hp3coop::DefaultHoldMs;
@@ -139,8 +140,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v54"
-#define MOD_STAMP "build v54 - 2026-09-08 - CO-OP CAST FALLBACK: after a continuous over-10-second P2/P3 hold on a class verified live by the stock P1-plus-companions route, enter the normal three-character hold path with the real trio (no generic Trigger bypass); release/retarget restores borrowed states. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
+#define MOD_BUILD  "v55"
+#define MOD_STAMP "build v55 - 2026-09-09 - v54 REGRESSION FIX: class certification now runs during a live split session (stock P1 cursor lock admits the class; split-OFF keeps the strict all-three demonstration), so a continuous over-10-second P2/P3 hold on that class enters the normal three-character hold path with the real trio; castable-scan handler admission is per object, not suppressed by one level-wide vulnerable class. No generic Trigger bypass. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1654,11 +1655,14 @@ static int   g_cgPelogExtra = 0;         // spell/handler events per window
 static int   g_cgP1Windows = 0;          // telemetry windows opened for P1 casts (per level)
 static BOOL  g_pelogOn    = FALSE;       // ProcessEvent capture window (see pelog)
 
-// v54 does not guess a class name for a three-person interaction. It learns a
-// class only after the unmodified P1 cursor is locked on an object AND both
-// genuine companions report that exact object as their spell target. The
-// resulting class proof is kept only for this level and is the sole admission
-// token for P2/P3's delayed fallback.
+// v54/v55 does not guess a class name for a three-person interaction. It learns
+// a class from live game behaviour, and the resulting class proof is kept only
+// for this level and is the sole admission token for P2/P3's delayed fallback.
+//   * split OFF: the stock demonstration - P1's cursor locked on the object AND
+//     both genuine companions reporting that exact object as their spell target;
+//   * split ON : P1's genuine stock cursor lock on the object (companions are
+//     AI-driven in-session and cannot show a shared pawn spellTarget, so the
+//     all-three field test is not required there).
 struct CoopClassProof {
     void *cls;
     char path[96];
@@ -2183,7 +2187,18 @@ static void cgScanCandidates(void *self, BOOL force)
             // shared bases react to that spell even when their vulnerable
             // property is unset (a statue's own Lapifors handler, a pad's
             // Spongify). The generic OnSpellHit stubs do not count.
-            if (!kind && g_cgNVulnDecl == 0) {
+            //
+            // Handler-only admission is judged per object, not per level.
+            // The v54 gate required the whole level to contain zero
+            // vulnerable-typed classes, so one unrelated statue/pad with a
+            // live vulnerableTo class silently suppressed this classification
+            // for EVERY otherwise-unnamed object in the same map - including
+            // cooperative triggers that only carry their own spell handler.
+            // Whether some *other* class declares a vulnerable property says
+            // nothing about this object's own dispatch, so only the class
+            // chain of the object itself (own spec handlers below the shared
+            // bases) decides here.
+            if (!kind) {
                 int own = cgOwnSpecHandlers(info);
                 if (own > 0 && own <= 2) kind = CGC_FN;
             }
@@ -2890,15 +2905,18 @@ static void cgWatchP1(void)
             }
             // Sample every frame while the stock cursor stays locked. The two
             // companions can take a few ticks to enter their own held state.
-            if (!g_splitOn) {
-                if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t))
-                    coopObserveP1(p1, t);
-                else
-                    coopObserveP1(p1, NULL);  // unlock/invalid target resets proof dwell
-            }
+            // v54 observed only while split-screen was OFF; a split-ON session
+            // therefore never certified anything (no [coopcast] CERTIFIED),
+            // so a P2/P3 >10-second hold could never enter the shared path.
+            // The stock P1 cursor does lock targets during a live split session
+            // (coopObserveP1 below applies the mode-appropriate evidence test).
+            if (t && !IsBadReadPtr(t, 0x100) && cgClassOf(t))
+                coopObserveP1(p1, t);
+            else
+                coopObserveP1(p1, NULL);  // unlock/invalid target resets proof dwell
         }
         if (sOffCur <= 0 || IsBadReadPtr((BYTE *)cur + sOffCur, 4)) {
-            if (!g_splitOn) coopObserveP1(p1, NULL);
+            coopObserveP1(p1, NULL);
         }
         if (sOffPos > 0 && !IsBadReadPtr((BYTE *)cur + sOffPos, 4)) {
             void *t = *(void **)((BYTE *)cur + sOffPos);
@@ -2911,8 +2929,8 @@ static void cgWatchP1(void)
                 }
             }
         }
-    } else if (!g_splitOn) {
-        coopObserveP1(p1, NULL);
+    } else {
+        coopObserveP1(p1, NULL);   // no live P1 cursor: reset any pending dwell
     }
 }
 
@@ -2943,19 +2961,35 @@ static void coopObserveP1(void *p1, void *cursorTarget)
     }
     void *cls = cgClassOf(cursorTarget);
     if (!cls || !cgIsKnownClass(cls)) return;
-    void *hermione = getPawn(1), *ron = getPawn(2);
-    if (!hermione || !ron || IsBadReadPtr(hermione, 0x100) || IsBadReadPtr(ron, 0x100) ||
-        !actorInCurrentLevel(hermione) || !actorInCurrentLevel(ron) ||
-        cgDeleted(hermione) || cgDeleted(ron) ||
-        IsBadReadPtr((BYTE *)hermione + g_offSpellTarget, 4) ||
-        IsBadReadPtr((BYTE *)ron + g_offSpellTarget, 4)) {
-        g_coopProofPendingTarget = g_coopProofPendingClass = NULL; g_coopProofPendingSince = 0;
-        return;
-    }
-    if (*(void **)((BYTE *)hermione + g_offSpellTarget) != cursorTarget ||
-        *(void **)((BYTE *)ron + g_offSpellTarget) != cursorTarget) {
-        g_coopProofPendingTarget = g_coopProofPendingClass = NULL; g_coopProofPendingSince = 0;
-        return;
+
+    // v54 certified a class only while split-screen was OFF: P1's cursor had
+    // to be on the object AND both AI companions' pawn spellTarget had to
+    // point at it too. During a live split session the companions are under
+    // mod/AI control and their pawn spellTarget never demonstrates a shared
+    // hold, so that gate could never fire - a split-ON session never emitted
+    // [coopcast] CERTIFIED and a >10-second P2/P3 hold stayed a plain cast.
+    // The mode-appropriate evidence:
+    //   * split OFF  - the strict all-three demonstration (unchanged), and
+    //   * split ON   - P1's genuine stock cursor lock on the object is the
+    //     live verification (this function is fed only by that cursor). The
+    //     lock alone admits the class; the three-character CAST is still
+    //     entered by any real P2/P3 holder's uninterrupted >10-second hold,
+    //     so no player-1-only ceremony is required mid-session.
+    if (!g_splitOn) {
+        void *hermione = getPawn(1), *ron = getPawn(2);
+        if (!hermione || !ron || IsBadReadPtr(hermione, 0x100) || IsBadReadPtr(ron, 0x100) ||
+            !actorInCurrentLevel(hermione) || !actorInCurrentLevel(ron) ||
+            cgDeleted(hermione) || cgDeleted(ron) ||
+            IsBadReadPtr((BYTE *)hermione + g_offSpellTarget, 4) ||
+            IsBadReadPtr((BYTE *)ron + g_offSpellTarget, 4)) {
+            g_coopProofPendingTarget = g_coopProofPendingClass = NULL; g_coopProofPendingSince = 0;
+            return;
+        }
+        if (*(void **)((BYTE *)hermione + g_offSpellTarget) != cursorTarget ||
+            *(void **)((BYTE *)ron + g_offSpellTarget) != cursorTarget) {
+            g_coopProofPendingTarget = g_coopProofPendingClass = NULL; g_coopProofPendingSince = 0;
+            return;
+        }
     }
     DWORD now = GetTickCount();
     if (g_coopProofPendingTarget != cursorTarget || g_coopProofPendingClass != cls) {
@@ -2964,7 +2998,11 @@ static void coopObserveP1(void *p1, void *cursorTarget)
     }
     // Let one full controller update settle before recording proof; a single
     // stale target pointer must not certify a class for the rest of the map.
-    if ((DWORD)(now - g_coopProofPendingSince) < 350u) return;
+    // A split-ON lock is weaker evidence than the all-three split-OFF test
+    // (no companions confirming the shared hold), so it must be a deliberate,
+    // sustained lock rather than a cursor that merely brushed the object.
+    DWORD minDwell = g_splitOn ? 1200u : 350u;
+    if ((DWORD)(now - g_coopProofPendingSince) < minDwell) return;
     for (int p = 0; p < g_nCoopProof; p++)
         if (g_coopProof[p].cls == cls) return;
     if (g_nCoopProof >= (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
@@ -2979,8 +3017,12 @@ static void coopObserveP1(void *p1, void *cursorTarget)
     strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
     proof->path[sizeof(proof->path) - 1] = 0;
     char targetName[180];
-    logf_("[coopcast] CERTIFIED P1 cooperative class %s after Harry, Hermione and Ron held %s; P2/P3 fallback may now use this class in this level",
-          proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
+    if (g_splitOn)
+        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's live cursor lock on %s (split-screen ON); a >10-second P2/P3 hold on this class may now enter the shared hold in this level",
+              proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
+    else
+        logf_("[coopcast] CERTIFIED P1 cooperative class %s after Harry, Hermione and Ron held %s; P2/P3 fallback may now use this class in this level",
+              proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
 }
 
 // Pick something worth casting at. A companion's natural targets in this game
@@ -4246,14 +4288,18 @@ static void aimFXVisuals(int i, BOOL init)
 #include "native_aim.h"
 
 // ===========================================================================
-// v54: CO-OPERATIVE CAST HOLD FALLBACK.
+// v54/v55: CO-OPERATIVE CAST HOLD FALLBACK.
 //
 // Some HP3 objects are not ordinary one-projectile spell targets. Their
 // stock P1 route starts a shared hold: Harry's real cursor/casting state is
 // visible to the companion controllers and all three heroes keep their spells
 // on the object. The package class name is deliberately NOT guessed here: a
 // class becomes eligible only after coopObserveP1() has observed that stock
-// route with both companions on the exact P1 cursor target.
+// route - while split is OFF, P1's cursor plus both companions on the exact
+// P1 cursor target; while split is ON, P1's genuine stock cursor lock (the
+// v54 code never observed P1 in a live split session, so a split-ON session
+// could never certify a class and a >10-second P2/P3 hold stayed a plain
+// cast).
 //
 // A P2/P3 cast has its own camera and a mod-driven aim path, so it does not
 // naturally enter that PLAYER-1-only branch. Do NOT compensate by calling
@@ -7433,10 +7479,12 @@ static BOOL renderSplitPortals(void *, void *, void *canvas)
         }
     }
 
-    // v54's class proof is deliberately learned from the unmodified game.
-    // Keep observing P1 while split-screen is OFF, where both companion AIs
-    // are free to demonstrate the stock cooperative route before P2/P3 need
-    // the fallback.
+    // v54/v55's class proof is deliberately learned from the unmodified game.
+    // While split is OFF both companion AIs are free to demonstrate the stock
+    // cooperative route, so the strict all-three certification runs here.
+    // (cgWatchP1 runs every live split frame too, certifying from P1's own
+    // stock cursor lock, so a split-ON session no longer dead-ends before a
+    // P2/P3 >10-second hold can ever enter the shared path.)
     if (!g_splitOn) {
         // These are normally resolved by the first P2/P3 portal. Resolve them
         // here too so a fresh install can certify the stock P1 interaction
