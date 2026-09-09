@@ -122,6 +122,74 @@ inline bool shouldSecretWallBePassable(bool lumosActive, bool playerNear)
     return lumosActive && playerNear;
 }
 
+// ---------------------------------------------------------------------------
+// v66.3 crash fix: the per-level Lumos trigger/secret-wall scan classified
+// objects by substring-matching the WHOLE GetFullName string
+// ("ClassName Package.Object"). That also collects non-actor objects that
+// merely carry the token in their own name: the UClass itself
+// ("Class hgame.LumosTrigger") and - fatally - the spell's HUD texture
+// ("Texture hgame.LumosTriggerIcon"), which the engine loads alongside Lumos.
+// A cached Texture passes every fire-time guard in lumosTick (it IS a live
+// UObject, and the Location/CollisionRadius reads at actor offsets land in
+// the shared UObject allocator arena, so they return garbage that can pass
+// the proximity test) and is then handed to ProcessEvent as the receiver of
+// KWGame.KWPawn.Trigger - pawn bytecode running on a texture-sized object.
+// That is the exact 2026-09-09 general protection fault, reproduced by
+// casting Lumos as Player 2:
+//   UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon,
+//      Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render
+// Only the object's CLASS - the token before the first space - may decide
+// cache membership now, so an asset or reflection object can never enter the
+// trigger/wall caches again.
+// ---------------------------------------------------------------------------
+
+// Copy the class token (the word before the first space) out of a GetFullName
+// string. A string with no space yields the whole string, which simply never
+// matches the wanted class families below.
+inline void classTokenOf(const char* fullName, char* out, unsigned cap)
+{
+    unsigned k = 0;
+    if (!out || !cap) return;
+    out[0] = 0;
+    if (!fullName) return;
+    while (fullName[k] && fullName[k] != ' ' && k + 1 < cap) {
+        out[k] = fullName[k];
+        k++;
+    }
+    out[k] = 0;
+}
+
+inline bool isLumosTriggerClassToken(const char* clsTok)
+{
+    return clsTok && (std::strstr(clsTok, "LumosSparklesTrigger") != 0 ||
+                      std::strstr(clsTok, "LumosTrigger") != 0 ||
+                      std::strstr(clsTok, "LumosSparkles") != 0);
+}
+
+inline bool isSecretWallClassToken(const char* clsTok)
+{
+    return clsTok && (std::strstr(clsTok, "GenericColObj") != 0 ||
+                      std::strstr(clsTok, "KWBlockingVolume") != 0);
+}
+
+// Membership tests for the scan caches. fullName must be the mod's GetFullName
+// rendering ("ClassToken Package.Object"). "Texture hgame.LumosTriggerIcon"
+// and "Class hgame.LumosTrigger" reject; the placed actor
+// "LumosTrigger HP3_InsideHub.LumosTrigger3" accepts.
+inline bool isLumosTriggerObject(const char* fullName)
+{
+    char tok[64];
+    classTokenOf(fullName, tok, sizeof(tok));
+    return isLumosTriggerClassToken(tok);
+}
+
+inline bool isSecretWallObject(const char* fullName)
+{
+    char tok[64];
+    classTokenOf(fullName, tok, sizeof(tok));
+    return isSecretWallClassToken(tok);
+}
+
 } // namespace hp3lumos
 
 #endif // HP3_LUMOS_SYNC_H
