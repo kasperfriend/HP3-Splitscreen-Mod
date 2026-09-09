@@ -13,7 +13,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 - **Distinct characters per view** (Harry / Hermione / Ron), each with their own camera, floor and collision
 - Real spellcasting through the game's own script VM (Rictusempra, Depulso, Lumos, ... ) with hold-to-aim, vertical aim, and (v51) player-1-faithful gameplay activation: statues, jump pads, doors and lesson objects react to player 2's spells
 - **Native HP3 aim effects (v52/v53)**: original seeking particles and target-sized hovered spell icons; hardware verification pending.
-- **Single-caster cooperative charge (v60, fires on release)**: hold a cast on a cooperative-family target for 10 seconds to arm x3 power. The interval never auto-fires. On release, the holder casts normally and the mod launches and independently tracks two additional game-native spell shots from that same pawn to the same target. The mod never borrows or casts through another hero. When P1’s stock cursor makes the unmodified game recruit an AI companion during the hold, only that AI pawn’s movement impulses are held at zero until release, preventing Ron’s run/cast/run oscillation.
+- **Virtual-trio cooperative charge (v61, fires on release)**: hold a cast on a cooperative-family target for 10 seconds to arm x3 power. The interval never auto-fires. On release, the holder casts normally and the mod launches two additional game-native spell shots from the other two trio members’ positions at staggered speeds, labelled with their casters, so the trigger observes three distinct casters. The mod never borrows companions’ controllers, cast state, or AI. While P1 charges, AI companions that are actually casting are held still (movement stats pinned with save/restore) so Ron stops his run/cast/run oscillation yet keeps walking to range; everything restores on unlock.
 - Camera that slides against walls instead of clipping, gamepad camera-follow + orbit (v13+)
 - Works on free-roam levels; survives level changes
 
@@ -24,7 +24,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v60`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v61`.
 
 ## Player 2 controls
 
@@ -49,6 +49,12 @@ sudo apt install g++-mingw-w64-i686
 Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, the cooperative hold lifecycle is in `src/coop_cast.h`, charged-projectile planning is in `src/charged_cast.h`, and the native visual adapter is in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
 
 Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aim geometry, continuous cooperative-hold identity/timing, charged-projectile trajectories, and native-effect lifecycle using engine-independent policy code—not HP3's actual VM, collision, animation, or rendering.
+
+### v61 virtual-trio charged x3 cast
+
+v60 hardware proved the trigger counts distinct casters, not same-pawn hits: P2’s fully delivered same-caster x3 still did not complete a `CompanionSpellTrigger`, and P1’s solo bonuses never delivered at all (the split-OFF frame returned before the delivery tick ran). v61 fires a virtual trio instead: the holder’s normal cast stays shot 1, while shots 2 and 3 launch from the other two trio members’ wand positions at staggered speeds (100% / 75%) with their `Instigator` fields labelled to those companions. No companion is borrowed — controllers, cast state, target/spell fields, and AI are untouched; only the two new spell actors are written. The delivery tick now also runs with split OFF.
+
+The stock-join guard is state-aware: only companions that are actually casting (`IsAimingOrCasting`, else a held `currentSpell`) have `GroundSpeed`/`AccelRate` pinned with save/restore, so the hold survives the engine AI tick that overwrote v60’s impulse-only zeroes; companions still walking to range are left alone. Pins release per slot on unlock, reset, or level travel.
 
 ### v60 single-caster charged x3 cast
 
@@ -172,6 +178,7 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v58** fixes both hardware-test findings on v57's trio: (1) the hold no longer auto-launches at 10 s — borrowed heroes are never fed `PressedFire` (that event put the engine pawn through the real fire pipeline), and when the holder *releases*, each borrowed hero fires exactly one natural `ReleasedFire` shot from the genuine held-cast state (three converging spells counting as the cooperative cast) — with no `StopCasting`-first and no same-frame `currentSpell` restore, fixing the repeat "shouts but doesn't shoot" desync; (2) Ron's AI keeps behaving: arming is re-gated to the genuine cooperative class family (`CompanionSpellTrigger`-chain objects or session-certified classes — casual 10 s holds on pumpkins/spawners no longer borrow the AI heroes), split-ON proof certification from a plain P1 cursor lock is family-restricted, and borrowed AI heroes get their movement push pinned for the duration of the hold. Post-arm target flicker (≤250 ms) no longer tears down an armed hold. The v57 level-travel crash fix is retained unchanged.
 - **v59** replaces companion borrowing with a same-caster x3 release. The 10-second threshold only arms the charge; release produces the holder’s normal projectile plus two `SpawnSpell` projectiles from the same pawn. No companion fields, controllers, cast states, movement, or P1 cursor are touched.
 - **v60** completes v59’s raw `SpawnSpell` bonuses: each is moved clear of the holder, aimed, given velocity/projectile physics, and watched in its own delivery slot for every holder (including P1). P2/P3’s original target watch is retained as well, so x3 means three effective deliveries rather than one normal shot plus stationary red actors. If P1’s stock cursor recruits an AI Ron/Hermione during the cooperative lock, only that AI pawn’s horizontal movement impulses are suppressed until unlock, stopping the stock run/cast/run oscillation without borrowing the companion or changing controller/cast/release state.
+- **v61** fires a virtual trio instead of same-caster x3 (hardware showed the trigger counts distinct casters): bonus shots launch from the other trio members’ positions at staggered speeds with companion `Instigator` labels, the delivery tick runs with split OFF so P1’s solo bonuses land, and the Ron guard pins only actually-casting companions’ `GroundSpeed`/`AccelRate` with save/restore so the hold survives the AI tick while walkers keep walking.
 
 ## Disclaimer
 
