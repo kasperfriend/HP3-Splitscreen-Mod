@@ -140,8 +140,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v58"
-#define MOD_STAMP "build v58 - 2026-09-09 - v58 TRIO FIRES ON RELEASE + RON AI FIX: the >10-second shared hold NO LONGER auto-launches when the interval completes. Borrowed heroes are no longer force-fed PressedFire (on the engine pawn Harry that entered the real fire pipeline - StateCast, finalizeSpell, SpawnSpell - 150-250 ms after arming with no release input; the mod's own P2 hold path proves StartCasting+playCastAim alone enter and hold the cast). When the holder RELEASES, the borrowed heroes fire exactly ONCE via a natural ReleasedFire while genuinely inside the game's held cast state (the stock companion release) - three near-same-frame real spells converge on the shared target, which its own script counts as the cooperative cast. No StopCasting-before-release and no same-frame currentSpell/spellTarget restore on fired heroes any more (those two produced the observed 'shouts, plays the animation, doesn't shoot' on every trio after the first). Cancellations (target changed/deleted, another player cast, level travel, split off) silently StopCasting the borrowed heroes with no ReleasedFire noise. RON AI: the trio re-gates to the genuine cooperative class family (CompanionSpellTrigger-type objects, or classes certified by the strict all-three observation this session) - v57's any-castable admission let every casual 10-second hold on a pumpkin/spawner force-borrow the AI heroes; split-ON proof certification from P1's plain cursor lock is likewise family-restricted. Borrowed AI heroes get their XY velocity and acceleration pinned each frame during the hold so their controller cannot run them back and forth. Post-arm reticle/cursor flicker (<=250 ms) no longer tears down the armed hold. The v57 level-travel GPF fix (live-object validation of every cached pointer + every-frame level-change detector) and the stock P1 SpellCursor.LockOn bridge are retained. Native SpellGesture icon-chain/wet-shader fix, 770-unit aim, and v51 cast gameplay retained."
+#define MOD_BUILD  "v59"
+#define MOD_STAMP "build v59 - 2026-09-09 - v59 SINGLE-CASTER CHARGED X3: after a 10-second hold on a cooperative target, only the initiating player remains involved. Harry/Hermione/Ron and their AI/controllers are never borrowed, moved, retargeted, StartCasting-called, ReleasedFire-called, or cursor-bridged. Release keeps the player’s normal shot and creates two additional game-native SpawnSpell shots from that same pawn at the same target, giving the target three ordinary spell deliveries without teleporting or coordinating pawns. Nothing auto-fires at 10 seconds; cancellation remains silent. v58 level-travel safety, cooperative-family gate, native wet SpellGesture icon, 770-unit aim, and cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -4905,70 +4905,48 @@ static void coopRestore(const char *why, BOOL fireTrio)
 {
     if (!g_coopActive.active) return;
     char targetName[180] = "<gone>";
-    // This path is intentionally used for deletion/map travel too; never ask
-    // GetFullName to dereference the formerly valid target in that case.
     const char *tn = targetName;
     if (coopTargetAlive(g_coopActive.target))
         tn = objName(g_coopActive.target.object, targetName, sizeof(targetName));
 
-    // No fire against a vanished or dead target - degrade to a plain cancel.
-    if (fireTrio && !coopTargetAlive(g_coopActive.target)) fireTrio = FALSE;
-
-    if (fireTrio) {
-        logf_("[coopcast] P%d RELEASED the shared hold on %s: the trio fires "
-              "once (the holder's own release plus one natural companion "
-              "release each - the target's own script counts this as the "
-              "cooperative spell)",
-              g_coopActive.holder + 1, tn);
-        for (int p = 0; p < 3; p++) {
-            if (p == g_coopActive.holder) continue;  // holder released on its own path
-            CoopCastHero *hero = &g_coopActive.hero[p];
-            // The game's own joiners are left to the game's own release.
-            if (hero->alreadyHolding || !hero->started || hero->firedTrio) continue;
-            if (!coopActorAlive(hero->pawn)) continue;
-            hero->firedTrio = TRUE;
-            if (g_fnCharRelFire)
-                callFn(hero->pawn, g_fnCharRelFire,
-                       "HPCharacter.ReleasedFire [coopcast trio fire]");
-            logf_("  [coopcast] P%d releases its one cooperative shot at %s",
-                  p + 1, tn);
+    // v59: a charged cooperative cast belongs solely to its holder.  Do not
+    // touch Harry/Hermione/Ron, their controllers, their cast state, or P1's
+    // cursor.  On release the holder's normal path supplies shot #1; two
+    // additional SpawnSpell calls from that SAME pawn supply the remaining
+    // two game-native spell actors.  The target therefore receives three
+    // ordinary spell touches, which is the useful gameplay contract of the
+    // stock joined cast, without moving or borrowing companion pawns.
+    if (fireTrio && coopTargetAlive(g_coopActive.target)) {
+        int holder = g_coopActive.holder;
+        void *pawn = (holder >= 0 && holder < 8) ? getPawn(holder) : NULL;
+        if (coopActorAlive(pawn) && g_fnSpawnSpell &&
+            g_coopActive.spell && cgIsKnownClass(g_coopActive.spell)) {
+            logf_("[coopcast] P%d RELEASED charged cast on %s: one normal shot + two same-caster bonus shots",
+                  holder + 1, tn);
+            for (int shot = 2; shot <= 3; shot++) {
+                BYTE parms[64]; memset(parms, 0, sizeof(parms));
+                *(void **)(parms + 0x00) = g_coopActive.spell;
+                *(void **)(parms + 0x04) = g_coopActive.target.object;
+                callFnP(pawn, g_fnSpawnSpell, parms, 12,
+                        "SpawnSpell(cls,target) [charged x3]");
+                void *spawned = *(void **)(parms + 0x08);
+                // Use the same native pending-hit path as an ordinary cast so
+                // stationary projectiles still deliver ProcessTouch.  Only
+                // one slot exists per player, so arm the last bonus; both
+                // actors retain TargetActor and normally collide themselves.
+                if (shot == 3 && spawned) {
+                    CgCand *cand = cgFindCand(g_coopActive.target.object);
+                    if (cand) cgArmHit(holder, pawn, spawned, cand, g_coopActive.spell);
+                }
+                logf_("  [coopcast] same-caster bonus shot %d/3 -> %p", shot, spawned);
+            }
+        } else {
+            logf_("[coopcast] P%d charged release on %s could not create bonus shots; leaving normal cast untouched",
+                  holder + 1, tn);
         }
     } else {
-        logf_("[coopcast] P%d ending shared hold on %s: %s",
+        logf_("[coopcast] P%d ending charged hold on %s: %s",
               g_coopActive.holder + 1, tn, why ? why : "reset");
-        for (int p = 0; p < 3; p++) {
-            CoopCastHero *hero = &g_coopActive.hero[p];
-            if (!coopActorAlive(hero->pawn)) continue;
-            if (hero->started && !hero->firedTrio && g_fnStopCast)
-                callFn(hero->pawn, g_fnStopCast, "StopCasting [coopcast cancel]");
-        }
-    }
-    if (g_coopActive.cursorLocked && coopActorAlive(g_coopActive.cursor))
-        coopCallCursorUnlock(g_coopActive.cursor);
-
-    // Do not overwrite a state that a real controller changed while the
-    // temporary bridge was active. We only put back a field while it still
-    // contains the value we borrowed for this cooperative target. On the
-    // RELEASE-fire ending nothing is restored at all: the fired heroes'
-    // engine finalize still reads currentSpell for another few hundred ms,
-    // and the holder's engine-driven cast owns its fields from release on.
-    if (fireTrio) {
-        memset(&g_coopActive, 0, sizeof(g_coopActive));
-        return;
-    }
-    for (int p = 0; p < 3; p++) {
-        CoopCastHero *hero = &g_coopActive.hero[p];
-        if (!coopActorAlive(hero->pawn)) continue;
-        if (hero->targetWritten && g_offSpellTarget > 0 &&
-            !IsBadReadPtr((BYTE *)hero->pawn + g_offSpellTarget, 4) &&
-            !IsBadWritePtr((BYTE *)hero->pawn + g_offSpellTarget, 4) &&
-            *(void **)((BYTE *)hero->pawn + g_offSpellTarget) == g_coopActive.target.object)
-            *(void **)((BYTE *)hero->pawn + g_offSpellTarget) = hero->savedTarget;
-        if (hero->spellWritten && g_offCurrentSpell > 0 &&
-            !IsBadReadPtr((BYTE *)hero->pawn + g_offCurrentSpell, 4) &&
-            !IsBadWritePtr((BYTE *)hero->pawn + g_offCurrentSpell, 4) &&
-            *(void **)((BYTE *)hero->pawn + g_offCurrentSpell) == g_coopActive.spell)
-            *(void **)((BYTE *)hero->pawn + g_offCurrentSpell) = hero->savedSpell;
     }
     memset(&g_coopActive, 0, sizeof(g_coopActive));
 }
@@ -5064,84 +5042,27 @@ static void coopMaintain(void)
         coopRestore("target was deleted, replaced, or left this level", FALSE);
         return;
     }
-    for (int p = 0; p < 3; p++) {
-        CoopCastHero *hero = &g_coopActive.hero[p];
-        if (!coopActorAlive(hero->pawn)) {
-            g_coopBlocked[g_coopActive.holder] = TRUE;
-            coopRestore("one of the trio is unavailable", FALSE);
-            return;
-        }
-        if (hero->targetWritten && g_offSpellTarget > 0 &&
-            !IsBadReadPtr((BYTE *)hero->pawn + g_offSpellTarget, 4) &&
-            !IsBadWritePtr((BYTE *)hero->pawn + g_offSpellTarget, 4)) {
-            void *liveTarget = *(void **)((BYTE *)hero->pawn + g_offSpellTarget);
-            // A player who starts a genuine different action wins over the
-            // fallback; do not keep pinning their field to our old target.
-            if (p != g_coopActive.holder && p < g_numPlayers && liveTarget &&
-                liveTarget != g_coopActive.target.object) {
-                g_coopBlocked[g_coopActive.holder] = TRUE;
-                coopRestore("another player selected a different target", FALSE);
-                return;
-            }
-            *(void **)((BYTE *)hero->pawn + g_offSpellTarget) = g_coopActive.target.object;
-        }
-        if (hero->spellWritten && g_offCurrentSpell > 0 &&
-            !IsBadReadPtr((BYTE *)hero->pawn + g_offCurrentSpell, 4) &&
-            !IsBadWritePtr((BYTE *)hero->pawn + g_offCurrentSpell, 4)) {
-            void *liveSpell = *(void **)((BYTE *)hero->pawn + g_offCurrentSpell);
-            if (p != g_coopActive.holder && p < g_numPlayers && liveSpell &&
-                liveSpell != g_coopActive.spell) {
-                g_coopBlocked[g_coopActive.holder] = TRUE;
-                coopRestore("another player selected a different spell", FALSE);
-                return;
-            }
-            *(void **)((BYTE *)hero->pawn + g_offCurrentSpell) = g_coopActive.spell;
-        }
-        // v58: while a hero is borrowed by the mod and still driven by its
-        // own AI controller, the controller keeps pushing movement each tick
-        // while the pawn is supposed to stand and hold the cast - the
-        // user-visible "Ron runs back and forth to cast together". Pin the
-        // borrowed AI hero's horizontal motion for the duration of the hold
-        // (human-driven heroes are left to their human, and the holder - the
-        // initiating player - keeps full control).
-        if (p != g_coopActive.holder && p >= g_numPlayers && hero->started &&
-            !hero->alreadyHolding && F.Velocity > 0 &&
-            !IsBadReadPtr((BYTE *)hero->pawn + F.Velocity, 12) &&
-            !IsBadWritePtr((BYTE *)hero->pawn + F.Velocity, 12)) {
-            float *vv = (float *)((BYTE *)hero->pawn + F.Velocity);
-            if (vv[0] != 0.0f || vv[1] != 0.0f) { vv[0] = 0.0f; vv[1] = 0.0f; }
-            if (F.Acceleration > 0 &&
-                !IsBadReadPtr((BYTE *)hero->pawn + F.Acceleration, 12) &&
-                !IsBadWritePtr((BYTE *)hero->pawn + F.Acceleration, 12)) {
-                float *aa = (float *)((BYTE *)hero->pawn + F.Acceleration);
-                if (aa[0] != 0.0f || aa[1] != 0.0f || aa[2] != 0.0f) {
-                    aa[0] = 0.0f; aa[1] = 0.0f; aa[2] = 0.0f;
-                }
-            }
-        }
+    void *holder = getPawn(g_coopActive.holder);
+    if (!coopActorAlive(holder)) {
+        g_coopBlocked[g_coopActive.holder] = TRUE;
+        coopRestore("holder is unavailable", FALSE);
     }
 }
 
 static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
 {
-    // v56: holder is the zero-based split slot (0 = P1, 1 = P2, 2 = P3).
-    // P1 is accepted as a holder: the engine already drives their cast
-    // state, the mod only borrows the other two heroes alongside.
     if (g_coopActive.active || holder < 0 || holder > 2 || !candidate ||
         !coopTargetAlive(key)) return FALSE;
-    // v58: StartCasting enters the borrowed hold, StopCasting cancels it,
-    // HPCharacter.ReleasedFire is what a borrowed hero fires with when the
-    // holder releases - PressedFire is deliberately NOT used any more.
-    if (!g_fnCharRelFire || !g_fnStartCast || !g_fnStopCast ||
-        g_offSpellTarget <= 0 || g_offCurrentSpell <= 0) {
+
+    void *pawn = getPawn(holder);
+    if (!coopActorAlive(pawn) || !g_fnSpawnSpell) {
         g_coopBlocked[holder] = TRUE;
-        logf_("[coopcast] P%d cannot arm %s: casting reflection is incomplete",
+        logf_("[coopcast] P%d cannot arm %s: holder/SpawnSpell unavailable",
               holder + 1, candidate->name);
         return FALSE;
     }
-
     void *fallbackSpell = g_cgBeginCls[holder];
-    if (!fallbackSpell) fallbackSpell = spellClassFor(getPawn(holder));
+    if (!fallbackSpell) fallbackSpell = spellClassFor(pawn);
     void *spell = cgSpellClassFor(candidate, fallbackSpell);
     if (!spell || !cgIsKnownClass(spell)) {
         g_coopBlocked[holder] = TRUE;
@@ -5150,147 +5071,21 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
         return FALSE;
     }
 
-    CoopCastActive next = {};
-    next.holder = holder;
-    next.target = key;
-    next.spell = spell;
-    next.beganAt = GetTickCount();
-    next.lastSeenAt = next.beganAt;   // v58 post-arm flicker grace anchor
-    strncpy(next.name, candidate->name, sizeof(next.name) - 1);
-    next.name[sizeof(next.name) - 1] = 0;
-
-    // Snapshot first. If another real human is already aimed at a different
-    // object, leave everything alone and block this held attempt. The holder
-    // must release/loss the target or begin a fresh hold before retrying; AI
-    // companions may be recruited normally.
-    for (int p = 0; p < 3; p++) {
-        CoopCastHero *hero = &next.hero[p];
-        hero->pawn = getPawn(p);
-        if (!coopActorAlive(hero->pawn) ||
-            IsBadReadPtr((BYTE *)hero->pawn + g_offSpellTarget, 4) ||
-            IsBadReadPtr((BYTE *)hero->pawn + g_offCurrentSpell, 4)) {
-            g_coopBlocked[holder] = TRUE;
-            logf_("[coopcast] P%d cannot arm %s: P%d is unavailable",
-                  holder + 1, next.name, p + 1);
-            return FALSE;
-        }
-        hero->savedTarget = *(void **)((BYTE *)hero->pawn + g_offSpellTarget);
-        hero->savedSpell = *(void **)((BYTE *)hero->pawn + g_offCurrentSpell);
-        if (p != holder && p < g_numPlayers && hero->savedTarget &&
-            hero->savedTarget != key.object) {
-            g_coopBlocked[holder] = TRUE;
-            char busy[150] = "<unreadable target>";
-            if (cgLiveObject(hero->savedTarget))
-                objName(hero->savedTarget, busy, sizeof(busy));
-            logf_("[coopcast] P%d leaves %s unchanged: P%d is already casting at %s",
-                  holder + 1, next.name, p + 1, busy);
-            return FALSE;
-        }
-    }
-
-    // Commit only after every prerequisite has been checked. Keep a complete
-    // restoration record before touching P1's previously avoided controller
-    // path. v57: the stock P1 SpellCursor.LockOn bridge is best-effort. It is
-    // the game's own "P1 is hovering this object" signal (LockOn also runs
-    // ChooseSpell from the target's vulnerable class, exactly like the HP2
-    // family source), but a level whose cursor exposes no safely reflected
-    // LockOn/UnLock pair must no longer cancel the whole trio hold: the
-    // borrowed heroes' held casts are the same effect, and the target's own
-    // script still decides the result. The strict ABI checks inside
-    // coopCallCursorLock are unchanged - an unsafe call is still never made.
-    g_coopActive = next;
+    memset(&g_coopActive, 0, sizeof(g_coopActive));
     g_coopActive.active = TRUE;
-    void *cursor = findP1Cursor(g_coopActive.hero[0].pawn);
-    if (coopActorAlive(cursor) && coopCallCursorLock(cursor, key.object)) {
-        g_coopActive.cursor = cursor;
-        g_coopActive.cursorLocked = TRUE;
-        if (!coopCursorAcceptedTarget(cursor, key.object)) {
-            g_coopBlocked[holder] = TRUE;
-            coopRestore("stock P1 cursor rejected the requested target", FALSE);
-            logf_("[coopcast] P%d left %s unchanged: P1 LockOn did not retain target",
-                  holder + 1, next.name);
-            return FALSE;
-        }
-
-        // LockOn can run arbitrary stock script, so validate both objects again
-        // before reading a field it may have invalidated (e.g. at a level change).
-        if (!coopActorAlive(g_coopActive.hero[0].pawn) || !coopTargetAlive(key) ||
-            IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget, 4) ||
-            IsBadReadPtr((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell, 4)) {
-            g_coopBlocked[holder] = TRUE;
-            coopRestore("stock P1 bridge changed the active level/state", FALSE);
-            return FALSE;
-        }
-        // LockOn owns P1's target/spell choice. Mark either field as borrowed if
-        // that stock call changed it, even when coopSetFields later finds it
-        // already equal to our desired value; otherwise cancellation would leave
-        // a LockOn-written P1 field behind.
-        void *stockTarget = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offSpellTarget);
-        if (stockTarget != g_coopActive.hero[0].savedTarget)
-            g_coopActive.hero[0].targetWritten = TRUE;
-        // LockOn is the game's own spell choice for this target. Prefer it over a
-        // generic P2/P3 fallback class when reflection can read a concrete class.
-        void *stockSpell = *(void **)((BYTE *)g_coopActive.hero[0].pawn + g_offCurrentSpell);
-        if (stockSpell && cgIsKnownClass(stockSpell) && !cgGenericSpellClass(stockSpell)) {
-            spell = stockSpell;
-            g_coopActive.spell = spell;
-        }
-        if (stockSpell != g_coopActive.hero[0].savedSpell)
-            g_coopActive.hero[0].spellWritten = TRUE;
-    } else {
-        logf_("[coopcast] P%d arming %s without the stock P1 cursor bridge "
-              "(LockOn unavailable or refused in this level); the trio hold "
-              "proceeds on the borrowed heroes alone",
-              holder + 1, next.name);
-    }
-
-    for (int p = 0; p < 3; p++) {
-        CoopCastHero *hero = &g_coopActive.hero[p];
-        // The holder gets target identity too, but is not restarted: their
-        // real P2/P3 hold remains authoritative.
-        if (!coopSetFields(hero, key.object, spell)) {
-            g_coopBlocked[holder] = TRUE;
-            coopRestore("could not write a borrowed cast field", FALSE);
-            return FALSE;
-        }
-    }
-
-    for (int p = 0; p < 3; p++) {
-        if (p == holder) continue;
-        CoopCastHero *hero = &g_coopActive.hero[p];
-        // v57: a hero the game itself already put on this exact target (the
-        // stock companion join - its AI entered the held cast on its own, as
-        // the v56 pelog captured) is neither restarted nor force-stopped on
-        // restore; the engine owns that hero's hold.
-        if (hero->savedTarget == key.object &&
-            (!hero->savedSpell || !spell || hero->savedSpell == spell)) {
-            hero->alreadyHolding = TRUE;
-            logf_("  [coopcast] P%d is already holding this target "
-                  "(the game's own companion join); left untouched", p + 1);
-            continue;
-        }
-        coopBeginBorrowedHero(hero, spell, p);
-        if (!hero->started) {
-            g_coopBlocked[holder] = TRUE;
-            coopRestore("a borrowed hero could not enter the held cast state", FALSE);
-            return FALSE;
-        }
-    }
+    g_coopActive.holder = holder;
+    g_coopActive.target = key;
+    g_coopActive.spell = spell;
+    g_coopActive.beganAt = GetTickCount();
+    g_coopActive.lastSeenAt = g_coopActive.beganAt;
+    g_coopActive.hero[holder].pawn = pawn; // identity only; never borrowed
+    strncpy(g_coopActive.name, candidate->name, sizeof(g_coopActive.name) - 1);
 
     char spellName[160];
-    int borrowed = 0, joined = 0;
-    for (int p = 0; p < 3; p++) {
-        if (p == holder) continue;
-        if (g_coopActive.hero[p].alreadyHolding) joined++;
-        else if (g_coopActive.hero[p].started) borrowed++;
-    }
-    logf_("[coopcast] P%d held %s for more than %lu seconds: the trio now holds %s on %s "
-          "(%d borrowed by the mod, %d already held by the game's own companion join, "
-          "cursor bridge %s)",
-          holder + 1, (candidate->name[0] ? candidate->name : "co-op target"),
+    logf_("[coopcast] P%d held %s for more than %lu seconds: charged x3 %s armed on %s; companions and AI untouched; fires only on release",
+          holder + 1, candidate->name[0] ? candidate->name : "co-op target",
           (unsigned long)g_coopCastHoldMs / 1000u,
-          objName(spell, spellName, sizeof(spellName)), g_coopActive.name,
-          borrowed, joined, g_coopActive.cursorLocked ? "locked" : "skipped");
+          objName(spell, spellName, sizeof(spellName)), g_coopActive.name);
     return TRUE;
 }
 
