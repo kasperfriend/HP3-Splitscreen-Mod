@@ -24,6 +24,20 @@ resolution" below.
 **not** restore unsafe borrowing of P1's cursor. `GlowStyle=6` is the recommended
 legacy fallback. `GlowSize` only sizes that fallback, not the original particles.
 
+### v63 cooperative "three floating spells" overlay
+
+v63 reuses the same `SpellGesture` adapter for the charged-x3 hold. When a
+P2/P3 holder has armed the cooperative charge (a continuous hold past
+`CoopCastHoldMs`, default 8 seconds), two companion `SpellGesture` actors are
+driven next to the cooperative target with the same reflected
+`ChangeGesture`/`SetReadyToCast` path as the LOCK gesture, so the holder's one
+floating wet spell becomes three - matching stock P1's held cast plus its AI
+companions joining. P1 is excluded (the stock cursor/companion-join already
+shows it). The overlay is visual only and shares every availability gate and
+liveness rule described below: no resolvable wet `SpellIcon`, failed spawn/
+placement, missing private particles, or a recycled object-table slot skips or
+drops the overlay without touching what fires on release.
+
 ## What the actual game packages establish
 
 The supplied `Core.u`, `Engine.u`, `kwGame.u`, and `HGame.u` are uncompressed
