@@ -13,6 +13,11 @@ on:
         description: "Optional release title. Leave blank to use the tag."
         required: false
         default: ""
+  # Build (but never publish) on PRs so a commit that does not compile is
+  # caught BEFORE it reaches main - v66 was merged having never been built,
+  # and the next manual dispatch on main was the first to fail.
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
@@ -49,6 +54,7 @@ jobs:
           bash build.sh
 
       - name: Assemble release package
+        if: github.event_name == 'workflow_dispatch'
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
           REQUESTED_TITLE: ${{ inputs.title }}
@@ -99,6 +105,7 @@ jobs:
           sha256sum "${ZIP_NAME}" release/d3d8.dll release/hp3mod.ini
 
       - name: Upload workflow artifacts
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: HP3-Splitscreen-${{ env.SAFE_TAG }}
@@ -107,10 +114,21 @@ jobs:
             release/d3d8.dll
             release/hp3mod.ini
 
+      # PR runs: no release, just the freshly built DLL + INI for testing.
+      - name: Upload pull-request build artifacts
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: HP3-Splitscreen-pr-${{ github.event.pull_request.number }}-build${{ github.run_id }}
+          path: |
+            dist/d3d8.dll
+            src/hp3mod.ini
+
       - name: Create GitHub release
         # The MSYS2 shell (job default) uses `path-type: minimal`, which does
         # not expose the GitHub CLI on PATH. Git Bash inherits the full Windows
         # PATH, so run this step with `bash` instead of `msys2`.
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
