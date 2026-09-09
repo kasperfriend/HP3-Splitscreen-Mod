@@ -43,14 +43,18 @@ V63 HOLDER-ORIGIN VIRTUAL-TRIO X3 CAST - ANY CHARACTER, RELEASE ONLY
     walking into range remain free to walk; all pins release on unlock.
 
     While the charge is armed on P2 or P3, the holder's single floating
-    wet-shader spell is joined by two companion wet-spell gestures. All three
-    hover at the stock gesture distance in FRONT of the target, each companion
-    icon sits on its own hero's side, and every icon glides in the air after
-    the aim and its hero (MoveSmooth chase, snapped once at lock) - the same
-    "one floating spell becomes three, moving a bit in the air" look as stock
-    P1's held cast plus its AI companions joining. P1 already shows that look
-    through the stock cursor/companion-join path. The companion gestures are
-    purely visual and do not change what fires.
+    wet-shader spell is joined by two companion wet-spell gestures, exactly as
+    the original cooperative join does it: each icon sits at the stock gesture
+    distance (1.1*CollisionRadius*SizeModifier + 2 + GestureDistance) on ITS
+    OWN hero's line of sight (target.Location + CentreOffset +
+    Normal(heroLoc - targetLoc) * dist) and faces that hero, so the three
+    icons fan out on their own heroes' sides; each glides in the air after
+    its own hero (MoveSmooth chase, snapped once at lock, rate 10 while
+    locked / 8 during a target flicker) - the same "one floating spell
+    becomes three, moving a bit in the air" look as stock P1's held cast plus
+    its AI companions joining. P1 already shows that look through the stock
+    cursor/companion-join path. The companion gestures are purely visual and
+    do not change what fires.
 
     Ordinary targets such as pumpkins and spawners do not arm charged x3; a
     long hold on them remains a plain single cast. Cursor/aim flicker up to

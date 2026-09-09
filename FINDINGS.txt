@@ -1176,3 +1176,81 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       smoothly; the two companion icons drift with their heroes' sides.
     * Release: v62 holder-origin volley fires once; icons vanish.
     * A pumpkins/spawner hold still produces no trio and no gestures.
+
+22. V65 EXACT STOCK PER-HERO GESTURE PLACEMENT (2026-09-09)
+-------------------------------------------------------------------------------
+- User report on v64: the central locked spell icon is correct, but the two
+  companion icons that should flank it are "flying broken, overlapping one on
+  another". Wanted: find the original coop cast spell-shader behaviour and
+  replicate it exactly for P2/P3 - three wet shader spells floating together.
+
+- ROOT CAUSE (what v64 did wrong): coopTrioUpdate anchored BOTH companion
+  gestures at the HOLDER's camera front point (centre - viewDir * dist) and
+  then pushed each sideways by a small fixed spacing (radius*0.9+25, clamped
+  50..120) along the hero's direction PROJECTED perpendicular to the holder's
+  view (clusterGoal). The two companion heroes trail together, so their
+  target->hero directions are nearly parallel; their projections collapse onto
+  nearly the same perpendicular axis (or to zero when a hero sits on the view
+  axis), and both icons chase nearly the same goal - hence the overlap. The
+  v63 lateral fallback (lateralGoal) was the same idea anchored to the front
+  point.
+
+- WHAT THE ORIGINAL ACTUALLY DOES (HP2 KWGame SpellCursor source, same family;
+  HP3 package gesture-placement rules in docs/NATIVE_AIM.md): every joined
+  hero owns ONE SpellGesture, driven by that hero's own cursor lock. Its goal
+  is that hero's OWN vLOS_End:
+      target.Location + CentreOffset +
+        Normal(heroLoc - targetLoc) *
+          (1.1 * CollisionRadius * SizeModifier + 2 + GestureDistance)
+  i.e. the point at the stock gesture distance on the hero's own line of sight.
+  SpellCursor.LockOn snaps it there once (SetLocation), then stateLockedOn.Tick
+  chases every frame with SpellGesture.MoveSmooth((goal-loc)*rate*dt) - rate
+  10 while the target is still the current possible target, rate 8 on the
+  centre-offset goal during a target flicker. The gesture faces opposite its
+  owner's line of sight (target -> hero). Because the three heroes' lines fan
+  out from the target, the three icons naturally sit apart on their own
+  heroes' sides - no artificial spacing is needed or used.
+
+- V65 FIX (src/coop_trio.h + dllmain coopTrioUpdate):
+    * coop_trio.h now contains ONLY the stock policy: direction(), heroGoal()
+      (the per-hero vLOS_End above), facingYaw(), and moveSmooth(). The
+      non-stock frontPoint()/clusterGoal()/lateralGoal() helpers are removed.
+    * Each companion gesture's goal is hp3trio::heroGoal(centre, heroLoc, dist)
+      with the LIVE hero location read every frame (getPawn(hero slot)); its
+      facing is hp3trio::facingYaw(Normal(heroLoc - centre)) (target -> hero),
+      its own yaw, not the shared pane-viewer yaw.
+    * MoveSmooth chase is unchanged but now uses the stock rate selection:
+      kSmoothRate (10) while coopActiveCandidate() is live, kSmoothRateFlicker
+      (8) while the target candidate flickers (cached centre) - matching the
+      stock "rate 10 locked / rate 8 flicker" rule. Snapped once at lock.
+    * A companion hero unavailable (or exactly at the aim centre) for a frame
+      keeps gliding toward its last goal (t.goal/t.facing cached per
+      companion); the previous "lateral fallback" fabrication is gone. No
+      cached goal at all disarms the overlay (nothing stock-consistent to
+      draw).
+    * The holder's native-aim LOCK gesture is untouched (the user confirmed
+      the central icon is correct).
+
+- VERIFICATION: tests/coop_trio_test.cpp now asserts the stock per-hero goals
+  (two companions on opposite sides -> distinct goals; same-side companions ->
+  still fanned apart), the facing-yaw convention, and MoveSmooth snap/chase at
+  both rates 10 and 8. Host policy suites pass. No Windows cross toolchain
+  exists in this sandbox, so dist/d3d8.dll and bin/d3d8.dll could NOT be
+  rebuilt here - build via CI (build-release.yml, workflow_dispatch) and
+  confirm line 2 of hp3mod.log says build v65.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v65 (else an old DLL is being tested).
+    * Hold a CompanionSpellTrigger as P2/P3 past 8 s: the holder's central wet
+      icon is unchanged, and the two companion icons now sit apart on their
+      OWN heroes' sides of the target (the heroes' real positions fan the
+      icons out), never overlapping one another.
+    * Move a hero (or let the AI reposition them) during the hold: each
+      companion icon glides after its own hero; the icons re-fan as the
+      heroes move apart and only come together if the heroes themselves
+      stand together (the exact original behaviour).
+    * Quick aim wiggle: the holder's icon trails the aim smoothly; the
+      companions keep following their heroes, rate 8 only during a target
+      flicker.
+    * Release: v62 holder-origin volley fires once; icons vanish.
+    * A pumpkins/spawner hold still produces no trio and no gestures.
