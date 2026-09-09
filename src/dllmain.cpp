@@ -37,6 +37,7 @@
 #include "cast_ground.h"
 #include "aim_policy.h"
 #include "coop_cast.h"
+#include "charged_cast.h"
 
 // ------------------------------- config ------------------------------------
 // Number of split-screen views. Nothing below assumes 2.
@@ -140,8 +141,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v59"
-#define MOD_STAMP "build v59 - 2026-09-09 - v59 SINGLE-CASTER CHARGED X3: after a 10-second hold on a cooperative target, only the initiating player remains involved. Harry/Hermione/Ron and their AI/controllers are never borrowed, moved, retargeted, StartCasting-called, ReleasedFire-called, or cursor-bridged. Release keeps the player’s normal shot and creates two additional game-native SpawnSpell shots from that same pawn at the same target, giving the target three ordinary spell deliveries without teleporting or coordinating pawns. Nothing auto-fires at 10 seconds; cancellation remains silent. v58 level-travel safety, cooperative-family gate, native wet SpellGesture icon, 770-unit aim, and cast gameplay retained."
+#define MOD_BUILD  "v60"
+#define MOD_STAMP "build v60 - 2026-09-09 - v60 CHARGED X3 DELIVERY + RON STOCK-JOIN GUARD: the v59 red light was a zero-velocity bonus SpawnSpell left at the caster; P1's bonus delivery watcher also never ticked, P2 tracked only bonus 3/3, and the charged-target override discarded P2's normal-shot candidate. Every 10-second charged release now keeps the holder's normal shot, launches BOTH same-caster bonus projectiles out of the pawn toward the captured cooperative target, and independently tracks both bonuses for every holder (including P1) while retaining the P2/P3 normal-shot watch, so the target receives true x3 spell power and no bonus remains stuck under Harry/Hermione/Ron. P1's stock cursor recruits AI companions before the 10-second mod threshold; while P1 charges a cooperative-family target, the mod now zeros only stock AI-companion movement impulses to stop Ron's run/cast/run oscillation, without borrowing him or changing controller links, follow fields, target/spell fields, cast functions, or release events. Nothing auto-fires at 10 seconds; x3 still fires once on release. v58 level-travel safety, cooperative-family gate, native wet SpellGesture icon, 770-unit aim, and cast gameplay retained."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -1686,6 +1687,11 @@ static CgClass  g_cgCls[CG_MAX_CLS];  static int g_cgNCls = 0;
 static CgCand   g_cgCand[CG_MAX_CAND]; static int g_cgNCand = 0;
 static void    *g_cgKCls[CG_MAX_KCLS]; static int g_cgNKCls = 0;
 static CgPending g_cgPend[8];
+// v60: the two charged projectiles need independent delivery watches. v59
+// reused the holder's single ordinary-cast slot for only the last bonus (and
+// cgTick did not tick slot 0 at all), leaving Harry's two bonus actors and one
+// of P2's actors stationary at the caster as a permanent red glow.
+static CgPending g_coopBonusPend[4];
 static CgFnLayout g_cgLay[24]; static int g_cgNLay = 0;
 static BOOL  g_cgReady = FALSE, g_cgChainOK = FALSE, g_cgScanLogged = FALSE;
 static DWORD g_cgScanAt = 0;
@@ -1740,6 +1746,8 @@ static CgCand g_coopDiscovered[COOP_DISCOVERED_MAX];
 static int g_nCoopDiscovered = 0;
 static DWORD g_coopDiscoveredAt = 0;
 static BOOL coopClassMatchesProof(void *cls);
+static BOOL coopClassIsCooperative(void *cls);
+static BOOL isCompanionCtrl(const char *name);
 static void coopObserveP1(void *p1, void *cursorTarget);
 static void coopP1HoldTry(void *p1);
 // v56: cgWatchP1 also drives the coop hold for P1; coopTick itself is
@@ -1754,6 +1762,7 @@ static void cgResetLevel(void)
     g_clsActor = g_clsPawn = g_clsHPChar = g_clsTrigger = g_clsProjectile = NULL;
     g_cgNVulnDecl = g_cgNHandlerDecl = 0;
     memset(g_cgPend, 0, sizeof(g_cgPend));
+    memset(g_coopBonusPend, 0, sizeof(g_coopBonusPend));
     memset(g_cgBeginCls, 0, sizeof(g_cgBeginCls));
     memset(g_cgLockName, 0, sizeof(g_cgLockName));
     memset(g_coopProof, 0, sizeof(g_coopProof));
@@ -2716,16 +2725,16 @@ static void cgDeliverHit(CgPending *p, BOOL spellAlive)
               si && si->fnTouch ? 1 : 0, ti ? ti->nSpec : 0, ti ? ti->nGen : 0);
 }
 
-static void cgArmHit(int i, void *caster, void *spawned, CgCand *c, void *spellCls)
+static BOOL cgInitPending(CgPending *p, int i, void *caster, void *spawned,
+                          CgCand *c, void *spellCls, const char *kind)
 {
-    CgPending *p = &g_cgPend[i];
-    if (p->active)
-        logf_("    [castgame] p%d previous pending hit on %s dropped (new cast)", i, p->targetName);
+    if (!p) return FALSE;
     memset(p, 0, sizeof(*p));
     p->spellSlot = -1;
     if (!c || !cgCandAlive(c)) {
-        logf_("    [castgame] p%d target gone before the fire completed - no pending hit", i);
-        return;
+        logf_("    [castgame] p%d %s target gone before the fire completed - no pending hit",
+              i, kind ? kind : "cast");
+        return FALSE;
     }
     p->active = TRUE; p->player = i; p->caster = caster; p->spellCls = spellCls;
     p->target = c->obj; p->targetSlot = c->slot; p->tinfo = c->info;
@@ -2760,21 +2769,57 @@ static void cgArmHit(int i, void *caster, void *spawned, CgCand *c, void *spellC
     if (p->spell && p->spellSlot < 0) {
         // Not in the object table under that pointer: cannot watch it fly,
         // so deliver right now (autohit) while the pointer is known-good.
-        logf_("    [castgame] p%d spell actor not indexed - immediate hit on %s", i, p->targetName);
+        logf_("    [castgame] p%d %s spell actor not indexed - immediate hit on %s",
+              i, kind ? kind : "cast", p->targetName);
         cgDeliverHit(p, TRUE);
         p->active = FALSE;
-        return;
+        return TRUE;
     }
     if (!p->spell) {
         // Nothing to fly: the game could not spawn the projectile, so run the
         // handler directly (with spell=None, as the optional params allow).
-        logf_("    [castgame] p%d no spell actor - direct handler on %s", i, p->targetName);
+        logf_("    [castgame] p%d %s no spell actor - direct handler on %s",
+              i, kind ? kind : "cast", p->targetName);
         cgDeliverHit(p, FALSE);
         p->active = FALSE;
-        return;
+        return TRUE;
     }
-    logf_("    [castgame] p%d pending hit on %s: dist=%.0f speed=%.0f window=%lums hitR=%.0f",
-          i, p->targetName, d, speed, (unsigned long)flight, p->hitR);
+    logf_("    [castgame] p%d %s pending hit on %s: dist=%.0f speed=%.0f window=%lums hitR=%.0f",
+          i, kind ? kind : "cast", p->targetName, d, speed,
+          (unsigned long)flight, p->hitR);
+    return TRUE;
+}
+
+static void cgArmHit(int i, void *caster, void *spawned, CgCand *c, void *spellCls)
+{
+    CgPending *p = &g_cgPend[i];
+    if (p->active)
+        logf_("    [castgame] p%d previous pending hit on %s dropped (new cast)",
+              i, p->targetName);
+    cgInitPending(p, i, caster, spawned, c, spellCls, "cast");
+}
+
+static BOOL cgArmBonusHit(int i, int shot, void *caster, void *spawned,
+                          CgCand *c, void *spellCls)
+{
+    CgPending *p = NULL;
+    for (int k = 0; k < (int)(sizeof(g_coopBonusPend) /
+                              sizeof(g_coopBonusPend[0])); k++) {
+        if (!g_coopBonusPend[k].active) { p = &g_coopBonusPend[k]; break; }
+    }
+    // A new charge takes at least ten seconds, while a pending flight is
+    // capped at 3.5 seconds, so this can only indicate corrupted/stale state.
+    // Refuse to overwrite another live delivery: the projectile itself can
+    // still collide naturally.
+    if (!p) {
+        logf_("    [coopcast] P%d bonus shot %d/3 has no free delivery watcher; "
+              "leaving its game-native collision active", i + 1, shot);
+        return FALSE;
+    }
+    char kind[40];
+    _snprintf(kind, sizeof(kind) - 1, "charged bonus %d/3", shot);
+    kind[sizeof(kind) - 1] = 0;
+    return cgInitPending(p, i, caster, spawned, c, spellCls, kind);
 }
 
 static BOOL cgSpellAlive(CgPending *p)
@@ -2786,46 +2831,57 @@ static BOOL cgSpellAlive(CgPending *p)
     return !cgDeleted(p->spell);
 }
 
-// Per frame: watch each pending projectile; deliver when it reaches the
-// target or the flight window closes with it still alive. A projectile that
-// died on its own hit something naturally - the game already handled it.
+// Per frame: watch one pending projectile; deliver when it reaches the target
+// or the flight window closes with it still alive. A projectile that died on
+// its own hit something naturally - the game already handled it.
+static void cgTickPending(CgPending *p, DWORD now)
+{
+    if (!p || !p->active) return;
+    int i = p->player;
+    BOOL alive = cgSpellAlive(p);
+    DWORD age = now - p->fireAt;
+    if (!alive) {
+        logf_("    [castgame] p%d spell %s ended on its own at +%lums (natural touch "
+              "or expiry) - target %s", i, p->spellName, (unsigned long)age,
+              p->targetName);
+        p->active = FALSE;
+        return;
+    }
+    float *sl = (float *)((BYTE *)p->spell + F.Location);
+    float dx = p->aim[0] - sl[0], dy = p->aim[1] - sl[1], dz = p->aim[2] - sl[2];
+    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    BOOL targetOk = (g_objArray && p->targetSlot >= 0 &&
+                     p->targetSlot < g_objArray->Num &&
+                     g_objArray->Data[p->targetSlot] == p->target &&
+                     !IsBadReadPtr(p->target, F.Location + 12) &&
+                     (!p->tinfo || cgClassOf(p->target) == p->tinfo->cls));
+    if (!targetOk) {
+        logf_("    [castgame] p%d target %s vanished - pending hit dropped",
+              i, p->targetName);
+        p->active = FALSE;
+        return;
+    }
+    if (age < 50) return;               // natural collision gets first go
+    if (d <= p->hitR || now >= p->deadline) {
+        logf_("    [castgame] p%d spell reached %s: dist=%.0f (start %.0f) at +%lums%s",
+              i, p->targetName, d, p->d0, (unsigned long)age,
+              d <= p->hitR ? "" : " [flight window closed - forcing the hit]");
+        if (g_castAutoHit) cgDeliverHit(p, TRUE);
+        else logf_("    [castgame] p%d CastAutoHit=0 - leaving it to the game's collision", i);
+        p->active = FALSE;
+    }
+}
+
 static void cgTick(void)
 {
     if (!g_castGameplay) return;
     DWORD now = GetTickCount();
-    for (int i = 1; i < 8; i++) {
-        CgPending *p = &g_cgPend[i];
-        if (!p->active) continue;
-        BOOL alive = cgSpellAlive(p);
-        DWORD age = now - p->fireAt;
-        if (!alive) {
-            logf_("    [castgame] p%d spell %s ended on its own at +%lums (natural touch "
-                  "or expiry) - target %s", i, p->spellName, (unsigned long)age, p->targetName);
-            p->active = FALSE;
-            continue;
-        }
-        float *sl = (float *)((BYTE *)p->spell + F.Location);
-        float dx = p->aim[0] - sl[0], dy = p->aim[1] - sl[1], dz = p->aim[2] - sl[2];
-        float d = sqrtf(dx * dx + dy * dy + dz * dz);
-        BOOL targetOk = (g_objArray && p->targetSlot >= 0 && p->targetSlot < g_objArray->Num &&
-                         g_objArray->Data[p->targetSlot] == p->target &&
-                         !IsBadReadPtr(p->target, F.Location + 12) &&
-                         (!p->tinfo || cgClassOf(p->target) == p->tinfo->cls));
-        if (!targetOk) {
-            logf_("    [castgame] p%d target %s vanished - pending hit dropped", i, p->targetName);
-            p->active = FALSE;
-            continue;
-        }
-        if (age < 50) continue;          // natural collision gets first go
-        if (d <= p->hitR || now >= p->deadline) {
-            logf_("    [castgame] p%d spell reached %s: dist=%.0f (start %.0f) at +%lums%s",
-                  i, p->targetName, d, p->d0, (unsigned long)age,
-                  d <= p->hitR ? "" : " [flight window closed - forcing the hit]");
-            if (g_castAutoHit) cgDeliverHit(p, TRUE);
-            else logf_("    [castgame] p%d CastAutoHit=0 - leaving it to the game's collision", i);
-            p->active = FALSE;
-        }
-    }
+    // P1's ordinary cast is engine-owned, hence ordinary slots begin at 1.
+    for (int i = 1; i < 8; i++) cgTickPending(&g_cgPend[i], now);
+    // Charged bonus shots are mod-owned for every holder, including P1.
+    for (int k = 0; k < (int)(sizeof(g_coopBonusPend) /
+                              sizeof(g_coopBonusPend[0])); k++)
+        cgTickPending(&g_coopBonusPend[k], now);
 }
 
 // The spell class the target asks for (the vulnerableToClass value), or the
@@ -2994,18 +3050,12 @@ static void cgWatchP1(void)
         if (sOffCur <= 0 || IsBadReadPtr((BYTE *)cur + sOffCur, 4)) {
             coopObserveP1(p1, NULL);
         }
-        // v56: P1's own uninterrupted >10-second cursor lock on the same
-        // object also fires the cooperative path. The cursor lock is the
-        // engine's "P1 is holding cast on this target" signal - the engine
-        // already handles PressedFire/ReleasedFire/cast state on the
-        // release; the mod borrows the other two heroes alongside. P1's
-        // natural release still fires its single spell, the trio then
-        // converges through coopMaintain until the holder releases.
+        // P1's uninterrupted >10-second cursor lock arms the charge. The
+        // engine still owns P1's ordinary release; the mod only adds the two
+        // same-caster bonus projectiles after that lock is released.
         coopP1HoldTry(p1);
-        // Drive the cooperative hold for P1: when the cursor is locked,
-        // P1 is "holding cast"; when the cursor releases, the shared hold
-        // restores (holder released). coopTick takes the same path as a
-        // P2/P3 hold - maintain, restore, fire (no-op once coopStart ran).
+        // Drive the charged hold for P1: the stock cursor lock is the hold;
+        // releasing it ends the hold and creates the two same-caster bonuses.
         {
             BOOL p1Held = (g_p1CursorLockedTarget != NULL);
             coopTick(0, p1, p1Held);
@@ -3079,6 +3129,55 @@ static BOOL coopClassIsCooperative(void *cls)
     return coopClassMatchesProof(cls) || coopClassHasCompanionToken(cls);
 }
 
+// P1's stock SpellCursor lock recruits companion controllers immediately,
+// before the ten-second charge can arm. v59 removed the mod's own borrowing,
+// but the hardware log proves Ron still entered StateCasting and ran back and
+// forth under this stock route. While P1 deliberately charges a cooperative
+// target, neutralize only the horizontal motion impulses of companions who are
+// still AI-controlled. Their controller links, follow fields, target/spell
+// fields, cast state and animations remain engine-owned; as soon as P1 unlocks,
+// this function stops writing and normal following resumes on the next tick.
+static void coopQuietStockCompanionMotion(void *target)
+{
+    if (!g_coopCastFallback || !g_castGameplay || !target) return;
+    static void *sLoggedTarget[3] = { NULL, NULL, NULL };
+    for (int p = 1; p <= 2; p++) {
+        // In a live split these slots are human-driven. With split off, both
+        // companions are AI; in a two-player split Ron (slot 2) remains AI.
+        if (g_splitOn && p < g_numPlayers) continue;
+        void *pawn = getPawn(p);
+        if (!pawn || !cgLiveObject(pawn) || F.PawnController <= 0 ||
+            IsBadReadPtr((BYTE *)pawn + F.PawnController, 4)) continue;
+        void *ctrl = *(void **)((BYTE *)pawn + F.PawnController);
+        if (!ctrl || IsBadReadPtr(ctrl, 0x100) || !cgLiveObject(ctrl)) continue;
+        char ctrlName[160]; objName(ctrl, ctrlName, sizeof(ctrlName));
+        if (!isCompanionCtrl(ctrlName)) continue;
+
+        BOOL wrote = FALSE;
+        if (F.Velocity > 0 &&
+            !IsBadWritePtr((BYTE *)pawn + F.Velocity, 12)) {
+            float *v = (float *)((BYTE *)pawn + F.Velocity);
+            if (v[0] != 0.0f || v[1] != 0.0f) wrote = TRUE;
+            v[0] = 0.0f; v[1] = 0.0f;
+        }
+        if (F.Acceleration > 0 &&
+            !IsBadWritePtr((BYTE *)pawn + F.Acceleration, 12)) {
+            float *a = (float *)((BYTE *)pawn + F.Acceleration);
+            if (a[0] != 0.0f || a[1] != 0.0f) wrote = TRUE;
+            a[0] = 0.0f; a[1] = 0.0f; // preserve gravity/jump acceleration
+        }
+        if (sLoggedTarget[p] != target) {
+            sLoggedTarget[p] = target;
+            char pawnName[160], targetName[160];
+            logf_("[coopcast] P1 stock companion-join guard: %s AI movement "
+                  "held at zero while charging %s%s",
+                  objName(pawn, pawnName, sizeof(pawnName)),
+                  objName(target, targetName, sizeof(targetName)),
+                  wrote ? "" : " (already still)");
+        }
+    }
+}
+
 // A class is certified from behaviour, not its name: P1's unmodified cursor
 // is holding this exact object and BOTH of the real companions have independently
 // selected it too. This filters ordinary one-person SpellTriggers without
@@ -3128,6 +3227,17 @@ static void coopObserveP1(void *p1, void *cursorTarget)
             g_coopProofPendingSince = 0;
         }
         // otherwise: brief None - keep the lock state intact
+    }
+
+    // Keep the movement guard active across the same brief None-frame cursor
+    // flicker that preserves the P1 hold. Otherwise stock AI gets an impulse
+    // on every flicker even though the cooperative lock never ended.
+    void *guardTarget = validTarget ? cursorTarget : g_p1CursorLockedTarget;
+    if (guardTarget && cgLiveObject(guardTarget) &&
+        actorInCurrentLevel(guardTarget) && !cgDeleted(guardTarget)) {
+        void *guardClass = cgClassOf(guardTarget);
+        if (guardClass && coopClassIsCooperative(guardClass))
+            coopQuietStockCompanionMotion(guardTarget);
     }
 
     if (!validTarget) {
@@ -4555,7 +4665,13 @@ struct CoopCastActive {
     // arming; a <=250 ms pick/cursor flicker no longer tears down the trio.
     DWORD lastSeenAt;
     char name[160];
-    CoopCastHero hero[3];       // Harry, Hermione, Ron only
+    // Stable per-arm candidate snapshot. fireCast used to discard its live
+    // candidate when retaining the charged target, so even the holder's
+    // ordinary P2 shot had no autohit watch. The same snapshot supplies both
+    // independently tracked bonus deliveries, including metadata-less P1
+    // cooperative targets.
+    CgCand candidate;
+    CoopCastHero hero[3];       // identity only in v59+
 };
 static hp3coop::Hold  g_coopHold[8] = {};
 static DWORD           g_coopTryAt[8] = {0};
@@ -4878,29 +4994,99 @@ static void coopCallCursorUnlock(void *cursor)
     g_ProcessEvent(cursor, NULL, g_coopFnCursorUnlock, parms, NULL);
 }
 
-// v58: two endings for the armed trio hold.
+static CgCand *coopActiveCandidate(void)
+{
+    if (!g_coopActive.active) return NULL;
+    CgCand *c = &g_coopActive.candidate;
+    if (c->obj == g_coopActive.target.object &&
+        c->slot == g_coopActive.target.slot && cgCandAlive(c))
+        return c;
+    // A scan refresh can replace g_cgCand while a charge is armed. Prefer a
+    // fresh entry when available, but never accept a different object.
+    c = cgFindCand(g_coopActive.target.object);
+    return (c && cgCandAlive(c)) ? c : NULL;
+}
+
+// SpawnSpell's normal script caller gives a new projectile its launch setup.
+// A raw ProcessEvent call does not: v59 hardware showed both P1 bonuses and
+// one P2 bonus sitting at the pawn forever as a red glow. Give every charged
+// bonus actor an explicit, target-directed projectile launch before the next
+// engine tick. This changes only the newly spawned spell actor.
+static BOOL coopLaunchBonusProjectile(int holder, void *pawn, void *spawned,
+                                      CgCand *candidate, int shot)
+{
+    if (!pawn || !spawned || !candidate || !cgCandAlive(candidate) ||
+        F.Location <= 0 || F.Velocity <= 0 ||
+        IsBadReadPtr((BYTE *)pawn + F.Location, 12) ||
+        IsBadWritePtr((BYTE *)spawned + F.Location, 12) ||
+        IsBadWritePtr((BYTE *)spawned + F.Velocity, 12))
+        return FALSE;
+
+    float aim[3]; cgAimPoint(candidate, aim);
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    float speed = 1200.0f;
+    if (g_offProjSpeed > 0 &&
+        !IsBadReadPtr((BYTE *)spawned + g_offProjSpeed, 4)) {
+        float nativeSpeed = *(float *)((BYTE *)spawned + g_offProjSpeed);
+        if (nativeSpeed > 100.0f && nativeSpeed < 20000.0f) speed = nativeSpeed;
+    }
+    // Match the ordinary mod projectile's chest/wand-height spawn rather than
+    // launching along the floor from the pawn origin.
+    hp3charged::Vec3 origin = { pl[0], pl[1], pl[2] + 45.0f };
+    hp3charged::Vec3 target = { aim[0], aim[1], aim[2] };
+    hp3charged::LaunchPlan plan =
+        hp3charged::planTargetedLaunch(origin, target, speed);
+    if (!plan.valid) return FALSE;
+
+    if (F.Base > 0 && !IsBadWritePtr((BYTE *)spawned + F.Base, 4) &&
+        *(void **)((BYTE *)spawned + F.Base) == pawn)
+        *(void **)((BYTE *)spawned + F.Base) = NULL;
+
+    float *sl = (float *)((BYTE *)spawned + F.Location);
+    float *sv = (float *)((BYTE *)spawned + F.Velocity);
+    sl[0] = plan.location.x; sl[1] = plan.location.y; sl[2] = plan.location.z;
+    sv[0] = plan.velocity.x; sv[1] = plan.velocity.y; sv[2] = plan.velocity.z;
+
+    const float flat = sqrtf(plan.velocity.x * plan.velocity.x +
+                             plan.velocity.y * plan.velocity.y);
+    const int pitch = (int)(atan2(plan.velocity.z, flat) *
+                            (65536.0 / 6.283185307179586));
+    const int yaw = (int)(atan2(plan.velocity.y, plan.velocity.x) *
+                          (65536.0 / 6.283185307179586));
+    if (F.Rotation > 0 && !IsBadWritePtr((BYTE *)spawned + F.Rotation, 12)) {
+        int *r = (int *)((BYTE *)spawned + F.Rotation);
+        r[0] = pitch; r[1] = yaw; r[2] = 0;
+    }
+    if (F.DesiredRotation > 0 &&
+        !IsBadWritePtr((BYTE *)spawned + F.DesiredRotation, 12)) {
+        int *r = (int *)((BYTE *)spawned + F.DesiredRotation);
+        r[0] = pitch; r[1] = yaw; r[2] = 0;
+    }
+    if (g_offProjSpeed > 0 &&
+        !IsBadWritePtr((BYTE *)spawned + g_offProjSpeed, 4))
+        *(float *)((BYTE *)spawned + g_offProjSpeed) = speed;
+    if (g_offProjMaxSpeed > 0 &&
+        !IsBadWritePtr((BYTE *)spawned + g_offProjMaxSpeed, 4))
+        *(float *)((BYTE *)spawned + g_offProjMaxSpeed) = speed * 1.5f;
+    if (F.Physics > 0 && !IsBadWritePtr((BYTE *)spawned + F.Physics, 1))
+        *((BYTE *)spawned + F.Physics) = 6;       // PHYS_Projectile
+
+    logf_("  [coopcast] P%d bonus shot %d/3 launched from (%.0f %.0f %.0f) "
+          "toward (%.0f %.0f %.0f) at %.0f units/s",
+          holder + 1, shot, sl[0], sl[1], sl[2], aim[0], aim[1], aim[2], speed);
+    return TRUE;
+}
+
+// v60 has two endings for the armed single-caster charge.
 //
-// fireTrio == TRUE: the holder deliberately RELEASED the cast. Their own
-// natural release path (the engine for P1, the mod cast-fire for P2/P3) has
-// already spawned their single projectile this frame or will finalise it in
-// the next few hundred ms. Every borrowed hero now RELEASES once too: one
-// ReleasedFire while they are genuinely in the game's held cast state -
-// exactly the stock companion release. Three near-same-frame real spells
-// converge on the shared target, which is what its script counts as the
-// cooperative cast. Crucially:
-//   * NO StopCasting first (v57 did StopCasting then ReleasedFire, so the
-//     release ran outside the cast state: the hero shouted the spell and
-//     played the release animation but SpawnSpell never ran), and
-//   * NO field restore on the fired heroes (the engine's StateCasting
-//     finalize re-reads currentSpell at AnimEnd ~300 ms later; v57 restored
-//     it to the pre-arm NULL in this same frame, so later trio fires spawned
-//     nothing - the user-visible "Harry shouts but doesn't shoot"). Their
-//     natural finalization consumes/resets the fields; the holder's own
-//     cast state owns theirs from release onward.
-// fireTrio == FALSE (target changed/deleted, another player cast, level
-// travel, split shutdown): a clean silent cancel - StopCasting only, no
-// ReleasedFire noise events on AI pawns (those events on an idle pawn were
-// also feeding Ron's cast/follow oscillation).
+// fireTrio == TRUE: the holder deliberately RELEASED the cast. The holder's
+// untouched path (engine for P1, mod cast-fire for P2/P3) supplies normal
+// shot #1. Two raw SpawnSpell calls below create shots #2/#3 from the same
+// holder; coopLaunchBonusProjectile completes their missing trajectory setup
+// and independent pending slots watch each delivery.
+//
+// fireTrio == FALSE: target change/deletion, another player cast, level
+// travel, or split shutdown cancels without creating any bonus actors.
 static void coopRestore(const char *why, BOOL fireTrio)
 {
     if (!g_coopActive.active) return;
@@ -4909,13 +5095,11 @@ static void coopRestore(const char *why, BOOL fireTrio)
     if (coopTargetAlive(g_coopActive.target))
         tn = objName(g_coopActive.target.object, targetName, sizeof(targetName));
 
-    // v59: a charged cooperative cast belongs solely to its holder.  Do not
-    // touch Harry/Hermione/Ron, their controllers, their cast state, or P1's
-    // cursor.  On release the holder's normal path supplies shot #1; two
-    // additional SpawnSpell calls from that SAME pawn supply the remaining
-    // two game-native spell actors.  The target therefore receives three
-    // ordinary spell touches, which is the useful gameplay contract of the
-    // stock joined cast, without moving or borrowing companion pawns.
+    // A charged cooperative cast belongs solely to its holder. Do not cast
+    // through Harry/Hermione/Ron or change their controller/cast state. On
+    // release the holder's normal path supplies shot #1; two additional
+    // SpawnSpell calls from that SAME pawn supply shots #2/#3, with explicit
+    // launch setup and one delivery watch apiece.
     if (fireTrio && coopTargetAlive(g_coopActive.target)) {
         int holder = g_coopActive.holder;
         void *pawn = (holder >= 0 && holder < 8) ? getPawn(holder) : NULL;
@@ -4923,6 +5107,7 @@ static void coopRestore(const char *why, BOOL fireTrio)
             g_coopActive.spell && cgIsKnownClass(g_coopActive.spell)) {
             logf_("[coopcast] P%d RELEASED charged cast on %s: one normal shot + two same-caster bonus shots",
                   holder + 1, tn);
+            CgCand *cand = coopActiveCandidate();
             for (int shot = 2; shot <= 3; shot++) {
                 BYTE parms[64]; memset(parms, 0, sizeof(parms));
                 *(void **)(parms + 0x00) = g_coopActive.spell;
@@ -4930,15 +5115,23 @@ static void coopRestore(const char *why, BOOL fireTrio)
                 callFnP(pawn, g_fnSpawnSpell, parms, 12,
                         "SpawnSpell(cls,target) [charged x3]");
                 void *spawned = *(void **)(parms + 0x08);
-                // Use the same native pending-hit path as an ordinary cast so
-                // stationary projectiles still deliver ProcessTouch.  Only
-                // one slot exists per player, so arm the last bonus; both
-                // actors retain TargetActor and normally collide themselves.
-                if (shot == 3 && spawned) {
-                    CgCand *cand = cgFindCand(g_coopActive.target.object);
-                    if (cand) cgArmHit(holder, pawn, spawned, cand, g_coopActive.spell);
+                BOOL launched = coopLaunchBonusProjectile(holder, pawn, spawned,
+                                                           cand, shot);
+                BOOL watched = cand && cgArmBonusHit(holder, shot, pawn, spawned,
+                                                     cand, g_coopActive.spell);
+                // Never repeat v59's permanent caster glow. If reflection did
+                // not leave enough metadata either to launch or deliver this
+                // actor, destroy only the unusable bonus; shot #1 remains the
+                // holder's untouched normal cast.
+                if (spawned && !launched && !watched) {
+                    BOOL gone = destroyActorFX(spawned);
+                    logf_("  [coopcast] bonus shot %d/3 could not be launched or "
+                          "tracked - spell actor %s", shot,
+                          gone ? "destroyed" : "DESTROY FAILED");
                 }
-                logf_("  [coopcast] same-caster bonus shot %d/3 -> %p", shot, spawned);
+                logf_("  [coopcast] same-caster bonus shot %d/3 -> %p "
+                      "(launched=%d watched=%d)", shot, spawned,
+                      launched ? 1 : 0, watched ? 1 : 0);
             }
         } else {
             logf_("[coopcast] P%d charged release on %s could not create bonus shots; leaving normal cast untouched",
@@ -4951,10 +5144,10 @@ static void coopRestore(const char *why, BOOL fireTrio)
     memset(&g_coopActive, 0, sizeof(g_coopActive));
 }
 
-// The holder owns an ordinary P2/P3 aim that predates the bridge, so normal
-// restore intentionally does not stop it (its release must be allowed to fire
-// once). Split shutdown is different: there will be no controlled release, so
-// cancel that original hold before returning its pawn to AI.
+// The holder owns an ordinary P2/P3 aim that predates the charge, so normal
+// restore does not stop it (its release must fire shot #1). Split shutdown has
+// no controlled release, so cancel that original hold before returning its
+// pawn to AI.
 static void coopStopHolderForSplitShutdown(void)
 {
     if (!g_coopActive.active) return;
@@ -5080,9 +5273,18 @@ static BOOL coopStart(int holder, CgCand *candidate, const hp3coop::Target &key)
     g_coopActive.lastSeenAt = g_coopActive.beganAt;
     g_coopActive.hero[holder].pawn = pawn; // identity only; never borrowed
     strncpy(g_coopActive.name, candidate->name, sizeof(g_coopActive.name) - 1);
+    g_coopActive.candidate = *candidate;
+    // The P1 ad-hoc path resolves the object-table slot after constructing its
+    // temporary candidate. Bind the snapshot to the validated hold identity.
+    g_coopActive.candidate.obj = key.object;
+    g_coopActive.candidate.slot = key.slot;
+    g_coopActive.candidate.info = cgClassInfo(key.clazz);
+    if (!g_coopActive.candidate.name[0])
+        strncpy(g_coopActive.candidate.name, g_coopActive.name,
+                sizeof(g_coopActive.candidate.name) - 1);
 
     char spellName[160];
-    logf_("[coopcast] P%d held %s for more than %lu seconds: charged x3 %s armed on %s; companions and AI untouched; fires only on release",
+    logf_("[coopcast] P%d held %s for more than %lu seconds: same-caster charged x3 %s armed on %s; fires only on release",
           holder + 1, candidate->name[0] ? candidate->name : "co-op target",
           (unsigned long)g_coopCastHoldMs / 1000u,
           objName(spell, spellName, sizeof(spellName)), g_coopActive.name);
@@ -5094,18 +5296,14 @@ static void coopTick(int i, void *pawn, BOOL held)
     if (i < 0 || i > 2) return;       // Players 1..3 (0 = P1, 1 = P2, 2 = P3)
     DWORD now = GetTickCount();
 
-    // v57: Player 1's hold is keyed by the ENGINE's own cursor lock
-    // (g_p1CursorLockedTarget), not by a camera-ray pick - the stock cursor
-    // is the authoritative "P1 is hovering cast on this object" signal, and
-    // a ray pick can legitimately disagree with it. coopP1HoldTry owns the
-    // >10s arming; this branch only maintains/restores an active P1 hold.
+    // Player 1's hold is keyed by the ENGINE's own cursor lock
+    // (g_p1CursorLockedTarget), not by a camera-ray pick. coopP1HoldTry owns
+    // the >10s arming; this branch maintains/restores an active P1 charge.
     if (i == 0) {
         if (!g_coopActive.active || g_coopActive.holder != 0) return;
-        // v58: P1's "held" is the stock cursor lock, and the lock state
-        // already carries the 250 ms None-frame grace (coopObserveP1). When
-        // the lock ends the player released: the holder's engine cast fires
-        // its one shot and the borrowed heroes release alongside - the trio
-        // fires exactly once.
+        // P1's lock state already carries the 250 ms None-frame grace. When
+        // the lock ends, the holder's engine cast supplies shot #1 and the
+        // armed charge supplies same-caster shots #2/#3.
         if (!held) {
             coopRestore("holder released cast", TRUE);
             return;
@@ -5145,12 +5343,10 @@ static void coopTick(int i, void *pawn, BOOL held)
     }
 
     if (g_coopActive.active && g_coopActive.holder == i) {
-        // v58: the RELEASE is the trio's fire moment, not a cancellation -
-        // the holder's own normal release already fires its one shot at the
-        // shared target and the borrowed heroes release one natural shot each
-        // (see coopRestore). A reticle flicker (<=250 ms) while the button
-        // stays held no longer tears down the armed hold; only a real target
-        // change/deletion past the grace cancels silently.
+        // Release is the charged fire moment, not cancellation: the holder's
+        // normal path supplies shot #1 and coopRestore adds shots #2/#3. A
+        // reticle flicker (<=250 ms) while held keeps the charge alive; only a
+        // real target change/deletion past the grace cancels silently.
         if (!held) {
             coopRestore("holder released cast", TRUE);
         } else if (valid && hp3coop::sameTarget(g_coopActive.target, key)) {
@@ -5175,21 +5371,14 @@ static void coopTick(int i, void *pawn, BOOL held)
     }
 }
 
-// v56: P1's own uninterrupted >10-second cursor lock on the same object
-// fires the three-character cooperative path. The cursor lock is P1's
-// "holding cast on this target" signal; P1's normal cast state is already
-// authoritative (the engine drives PressedFire/ReleasedFire/cast state on
-// release), so the mod only has to borrow Hermione and Ron alongside. A
-// short cursor flicker (<= kP1CursorGrace) is tolerated: a deliberate P1
-// hold on a CompanionSpellTrigger would otherwise never satisfy this dwell
-// because the stock cursor can report None for a frame or two between
-// controller updates.
+// P1's own uninterrupted >10-second cursor lock arms the same single-caster
+// charge as P2/P3. The stock cursor is P1's authoritative "holding cast on
+// this target" signal; P1's normal state supplies the ordinary release. A
+// short cursor flicker (<= kP1CursorGrace) is tolerated.
 //
-// v58: the locked object's CLASS must belong to the genuine cooperative
-// family (CompanionSpellTrigger-type or session-certified). A 10-second lock
-// on an ordinary castable (a pumpkin, a spawner) no longer arms the trio and
-// no longer certifies its class - that self-certification was the poisoned
-// gate that let any casual 10-second hold hijack Ron out of his AI routine.
+// The locked object's class must belong to the genuine cooperative family
+// (CompanionSpellTrigger-type or session-certified). An ordinary pumpkin or
+// spawner therefore remains a normal single cast.
 static void coopP1HoldTry(void *p1)
 {
     if (!g_coopCastFallback || !g_castGameplay || g_coopActive.active ||
@@ -5209,8 +5398,8 @@ static void coopP1HoldTry(void *p1)
     if (!coopClassIsCooperative(cls)) {
         char tname[180];
         logf_("[coopcast] P1 >%lu-second cursor lock on %s: not the cooperative "
-                "CompanionSpellTrigger class family - no trio arm (ordinary "
-                "holds stay a plain single-character cast in v58)",
+                "CompanionSpellTrigger class family - no charged x3 arm "
+                "(ordinary holds stay a plain single-character cast)",
               (unsigned long)g_coopCastHoldMs / 1000u,
               objName(target, tname, sizeof(tname)));
         return;
@@ -5228,7 +5417,7 @@ static void coopP1HoldTry(void *p1)
     if (!cand) {
         // No candidate found - the locked object isn't in either scan (a
         // cooperative-family actor with no vulnerable-class metadata). Build
-        // an ad-hoc candidate; the class already passed the v58 family gate
+        // an ad-hoc candidate; the class already passed the family gate
         // above, so the arm itself is allowed.
         static CgCand sAdHoc = {};
         sAdHoc = {};
@@ -5250,12 +5439,12 @@ static void coopP1HoldTry(void *p1)
     }
     if (slot < 0) {
         logf_("[coopcast] P1 10s hold on %s: target not in GObjObjects - "
-              "skip cooperative arming", objName(target, cand->name, sizeof(cand->name)));
+              "skip charged x3 arming", objName(target, cand->name, sizeof(cand->name)));
         return;
     }
     hp3coop::Target key = { target, cls, slot };
     char tname[180];
-    logf_("[coopcast] P1 >%lu-second hold on %s (cursor lock, split=%s): arming shared hold",
+    logf_("[coopcast] P1 >%lu-second hold on %s (cursor lock, split=%s): arming same-caster charged x3",
           (unsigned long)g_coopCastHoldMs / 1000u,
           objName(target, tname, sizeof(tname)), g_splitOn ? "ON" : "OFF");
     coopStart(0, cand, key);
@@ -5764,13 +5953,20 @@ static void fireCast(int i, void *pawn)
         // normal cast's TargetActor; it does not synthesize a hit/Trigger.
         if (g_coopActive.active && g_coopActive.holder == i &&
             coopTargetAlive(g_coopActive.target)) {
-            gameCand = NULL;
+            CgCand *chargedCand = coopActiveCandidate();
+            // Keep the live pick when it is already this target; otherwise use
+            // the stable candidate captured at arm time. v59 unconditionally
+            // nulled gameCand here, so P2's normal shot logged "target gone"
+            // and lost its guaranteed delivery even though the target lived.
+            if (!gameCand || gameCand->obj != g_coopActive.target.object)
+                gameCand = chargedCand;
             gameTarget = g_coopActive.target.object;
             target = gameTarget;
             if (g_coopActive.spell && cgIsKnownClass(g_coopActive.spell))
                 cls = g_coopActive.spell;
-            logf_("  [coopcast] P%d ordinary release retains shared target %s", i + 1,
-                  g_coopActive.name);
+            logf_("  [coopcast] P%d ordinary release retains charged target %s "
+                  "(delivery watch=%s)", i + 1, g_coopActive.name,
+                  gameCand ? "armed" : "native-only");
         }
         if (cls && g_offCurrentSpell > 0 && !IsBadWritePtr((BYTE *)pawn + g_offCurrentSpell, 4) &&
             *(void **)((BYTE *)pawn + g_offCurrentSpell) != cls) {

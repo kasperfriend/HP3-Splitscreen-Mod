@@ -897,3 +897,48 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       ordinary single cast on release.
     * Long session exploration - Ron/Hermione AI follow behaviour normal.
     * Level travel in and out of hub areas - no crash (regression check).
+
+17. v60 hardware-report diagnosis and source correction (2026-09-09)
+  The supplied startup banner proves the failing run used v59. Its
+  same-caster design is retained: a mature 10-second hold arms only, then the
+  initiating player's release is one normal shot plus two bonus SpawnSpell
+  calls on that same pawn. No companion is borrowed to manufacture x3.
+
+  Three separate v59 delivery defects explain the red light and weak P2 cast:
+    * a raw reflected SpawnSpell(cls,target) returned a spell actor but did not
+      perform the normal caller's launch setup; the bonuses remained at the
+      pawn with zero velocity;
+    * both bonuses reused one g_cgPend[player] slot, so shot 3/3 replaced shot
+      2/3, and cgTick intentionally began at player slot 1, so neither P1
+      bonus watcher ever ran;
+    * fireCast retained the charged TargetActor but set gameCand=NULL, dropping
+      P2/P3's ordinary-shot delivery watch even though the target still lived.
+
+  v60 completes each raw bonus before the next engine tick: it detaches the
+  actor from the caster, starts at chest/wand height clear of the collision
+  body, computes a normalized target trajectory, writes Location, Velocity,
+  Rotation/DesiredRotation, Speed/MaxSpeed and PHYS_Projectile, and gives each
+  bonus an independent pending-delivery slot. Clearance is capped at half the
+  target distance so a close target is not overshot. P2/P3's ordinary release
+  reuses a stable candidate captured when the charge armed. A bonus that can
+  neither launch nor be tracked is destroyed rather than becoming a permanent
+  glow. Host trajectory tests cover normal, close, vertical, zero-distance and
+  invalid-speed plans.
+
+  v59 correctly removed mod-driven companion borrowing, but P1's unmodified
+  SpellCursor still asks the stock companion controller to join a cooperative
+  target roughly 0.7 seconds after lock-on. Thus waiting until the ten-second
+  arm (or merely removing the old borrow code) cannot prevent Ron's observed
+  StateCasting run/cast/run loop. v60 guards movement from the first P1 cursor
+  lock on a cooperative-family target: AI-controlled Hermione/Ron slots have
+  only horizontal Velocity/Acceleration held at zero. Human split slots are
+  skipped, vertical physics is preserved, and no controller link, follow
+  field, target/current-spell field, cast function, or release event changes.
+  The stock cast lifecycle remains engine-owned and ordinary AI movement
+  resumes when P1 unlocks. This source-level guard still requires hardware
+  confirmation.
+
+  Local validation: all host policy suites pass; a stripped 32-bit Windows DLL
+  cross-build succeeds; Direct3DCreate8 and Direct3DCreate8@4 exports plus the
+  v60 startup banner are present. In-game HP3 behavior is not available in the
+  sandbox and must be checked on hardware.
