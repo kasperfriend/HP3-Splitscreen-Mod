@@ -1693,6 +1693,9 @@ static DWORD g_coopDiscoveredAt = 0;
 static BOOL coopClassMatchesProof(void *cls);
 static void coopObserveP1(void *p1, void *cursorTarget);
 static void coopP1HoldTry(void *p1);
+// v56: cgWatchP1 also drives the coop hold for P1; coopTick itself is
+// defined further down with the rest of the cooperative machinery.
+static void coopTick(int i, void *pawn, BOOL held);
 
 static void cgResetLevel(void)
 {
@@ -3114,104 +3117,6 @@ static void coopObserveP1(void *p1, void *cursorTarget)
               proof->path, objName(cursorTarget, targetName, sizeof(targetName)));
 }
 
-// v56: P1's own uninterrupted >10-second cursor lock on the same object
-// fires the three-character cooperative path. The cursor lock is P1's
-// "holding cast on this target" signal; P1's normal cast state is already
-// authoritative (the engine drives PressedFire/ReleasedFire/cast state on
-// release), so the mod only has to borrow Hermione and Ron alongside. A
-// short cursor flicker (<= kP1CursorGrace) is tolerated: a deliberate P1
-// hold on a CompanionSpellTrigger would otherwise never satisfy this dwell
-// because the stock cursor can report None for a frame or two between
-// controller updates.
-//
-// A single 10-second uninterrupted cursor lock implicitly certifies the
-// class and then fires the cooperative path - no separate 1.2-second cert
-// gate is required. A deliberate sustained lock IS the evidence; the proof
-// is added the same way coopObserveP1 would have, so any later P2/P3 hold
-// still benefits from the certification entry as well.
-static void coopP1HoldTry(void *p1)
-{
-    if (!g_coopCastFallback || !g_castGameplay || g_coopActive.active ||
-        g_p1CursorFired || g_p1CursorLockedTarget == NULL || !p1)
-        return;
-    if (g_offSpellTarget <= 0) return;
-    DWORD now = GetTickCount();
-    if (g_p1CursorLockedAt == 0) return;
-    if ((DWORD)(now - g_p1CursorLockedAt) <= g_coopCastHoldMs) return;
-    // Latch so we only fire once per lock; release of the cursor resets the
-    // latch (handled in coopObserveP1 when the target changes/gone).
-    g_p1CursorFired = 1;
-    void *target = g_p1CursorLockedTarget;
-    if (!actorInCurrentLevel(target) || cgDeleted(target)) return;
-    void *cls = cgClassOf(target);
-    if (!cls || !cgIsKnownClass(cls)) return;
-    // Implicitly certify the class if a 1.2s cert was previously interrupted
-    // by cursor flicker. The 10s uninterrupted lock is the proof.
-    BOOL alreadyCertified = FALSE;
-    for (int p = 0; p < g_nCoopProof; p++)
-        if (g_coopProof[p].cls == cls) { alreadyCertified = TRUE; break; }
-    if (!alreadyCertified &&
-        g_nCoopProof < (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
-        CoopClassProof *proof = &g_coopProof[g_nCoopProof++];
-        proof->cls = cls; proof->observedAt = now;
-        char full[180];
-        objName(cls, full, sizeof(full));
-        const char *sp = strchr(full, ' ');
-        strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
-        proof->path[sizeof(proof->path) - 1] = 0;
-        char targetName[180];
-        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's "
-              "sustained >10s cursor lock on %s; firing shared hold now",
-              proof->path, objName(target, targetName, sizeof(targetName)));
-    } else if (!alreadyCertified) {
-        logf_("[coopcast] P1 10s hold on %s: proof table full; cannot certify class",
-              cls ? "object" : "?");
-        return;
-    }
-    // Find a CgCand for the locked object (the normal list prefers, the
-    // certified list as fallback). Whichever is found, build the hp3coop
-    // key from the same slot/object/class the candidate was built from.
-    if (g_castGameplay) cgScanCandidates(p1, FALSE);
-    CgCand *cand = cgFindCand(target);
-    if (!cand) {
-        coopRefreshCertifiedCandidates();
-        for (int k = 0; k < g_nCoopDiscovered; k++)
-            if (g_coopDiscovered[k].obj == target) { cand = &g_coopDiscovered[k]; break; }
-    }
-    if (!cand) {
-        // No candidate found - the locked object isn't in either scan
-        // (a fragile certified-class without metadata). We still try
-        // coopStart with an ad-hoc candidate; it will reject unless the
-        // class is already in the proof table (which it is now).
-        static CgCand sAdHoc = {};
-        sAdHoc = {};
-        sAdHoc.obj = target;
-        sAdHoc.slot = -1;
-        sAdHoc.info = cgClassInfo(cls);
-        objName(target, sAdHoc.name, sizeof(sAdHoc.name));
-        if (F.Location > 0 && !IsBadReadPtr((BYTE *)target + F.Location, 12))
-            memcpy(sAdHoc.loc, (BYTE *)target + F.Location, 12);
-        cand = &sAdHoc;
-    }
-    // Look up the slot in GObjObjects - coopTargetAlive/recoopStart both
-    // require a valid slot index.
-    int slot = cand->slot;
-    if (slot < 0 && g_objArray) {
-        int n = g_objArray->Num;
-        for (int j = 0; j < n && j < 400000; j++)
-            if (g_objArray->Data[j] == target) { slot = j; break; }
-    }
-    if (slot < 0) {
-        logf_("[coopcast] P1 10s hold on %s: target not in GObjObjects - "
-              "skip cooperative arming", objName(target, cand->name, sizeof(cand->name)));
-        return;
-    }
-    hp3coop::Target key = { target, cls, slot };
-    char tname[180];
-    logf_("[coopcast] P1 10s hold on %s (cursor lock, split=%s): arming shared hold",
-          objName(target, tname, sizeof(tname)), g_splitOn ? "ON" : "OFF");
-    coopStart(0, cand, key);
-}
 
 // Pick something worth casting at. A companion's natural targets in this game
 // are the level's spell triggers (HP3_InsideHub ships eight of them), so the
@@ -5182,6 +5087,105 @@ static void coopTick(int i, void *pawn, BOOL held)
         g_coopTryAt[i] = now;
         coopStart(i, candidate, key);
     }
+}
+
+// v56: P1's own uninterrupted >10-second cursor lock on the same object
+// fires the three-character cooperative path. The cursor lock is P1's
+// "holding cast on this target" signal; P1's normal cast state is already
+// authoritative (the engine drives PressedFire/ReleasedFire/cast state on
+// release), so the mod only has to borrow Hermione and Ron alongside. A
+// short cursor flicker (<= kP1CursorGrace) is tolerated: a deliberate P1
+// hold on a CompanionSpellTrigger would otherwise never satisfy this dwell
+// because the stock cursor can report None for a frame or two between
+// controller updates.
+//
+// A single 10-second uninterrupted cursor lock implicitly certifies the
+// class and then fires the cooperative path - no separate 1.2-second cert
+// gate is required. A deliberate sustained lock IS the evidence; the proof
+// is added the same way coopObserveP1 would have, so any later P2/P3 hold
+// still benefits from the certification entry as well.
+static void coopP1HoldTry(void *p1)
+{
+    if (!g_coopCastFallback || !g_castGameplay || g_coopActive.active ||
+        g_p1CursorFired || g_p1CursorLockedTarget == NULL || !p1)
+        return;
+    if (g_offSpellTarget <= 0) return;
+    DWORD now = GetTickCount();
+    if (g_p1CursorLockedAt == 0) return;
+    if ((DWORD)(now - g_p1CursorLockedAt) <= g_coopCastHoldMs) return;
+    // Latch so we only fire once per lock; release of the cursor resets the
+    // latch (handled in coopObserveP1 when the target changes/gone).
+    g_p1CursorFired = 1;
+    void *target = g_p1CursorLockedTarget;
+    if (!actorInCurrentLevel(target) || cgDeleted(target)) return;
+    void *cls = cgClassOf(target);
+    if (!cls || !cgIsKnownClass(cls)) return;
+    // Implicitly certify the class if a 1.2s cert was previously interrupted
+    // by cursor flicker. The 10s uninterrupted lock is the proof.
+    BOOL alreadyCertified = FALSE;
+    for (int p = 0; p < g_nCoopProof; p++)
+        if (g_coopProof[p].cls == cls) { alreadyCertified = TRUE; break; }
+    if (!alreadyCertified &&
+        g_nCoopProof < (int)(sizeof(g_coopProof) / sizeof(g_coopProof[0]))) {
+        CoopClassProof *proof = &g_coopProof[g_nCoopProof++];
+        proof->cls = cls; proof->observedAt = now;
+        char full[180];
+        objName(cls, full, sizeof(full));
+        const char *sp = strchr(full, ' ');
+        strncpy(proof->path, sp ? sp + 1 : full, sizeof(proof->path) - 1);
+        proof->path[sizeof(proof->path) - 1] = 0;
+        char targetName[180];
+        logf_("[coopcast] CERTIFIED cooperative class %s from Player 1's "
+              "sustained >10s cursor lock on %s; firing shared hold now",
+              proof->path, objName(target, targetName, sizeof(targetName)));
+    } else if (!alreadyCertified) {
+        logf_("[coopcast] P1 10s hold on %s: proof table full; cannot certify class",
+              cls ? "object" : "?");
+        return;
+    }
+    // Find a CgCand for the locked object (the normal list prefers, the
+    // certified list as fallback). Whichever is found, build the hp3coop
+    // key from the same slot/object/class the candidate was built from.
+    if (g_castGameplay) cgScanCandidates(p1, FALSE);
+    CgCand *cand = cgFindCand(target);
+    if (!cand) {
+        coopRefreshCertifiedCandidates();
+        for (int k = 0; k < g_nCoopDiscovered; k++)
+            if (g_coopDiscovered[k].obj == target) { cand = &g_coopDiscovered[k]; break; }
+    }
+    if (!cand) {
+        // No candidate found - the locked object isn't in either scan
+        // (a fragile certified-class without metadata). We still try
+        // coopStart with an ad-hoc candidate; it will reject unless the
+        // class is already in the proof table (which it is now).
+        static CgCand sAdHoc = {};
+        sAdHoc = {};
+        sAdHoc.obj = target;
+        sAdHoc.slot = -1;
+        sAdHoc.info = cgClassInfo(cls);
+        objName(target, sAdHoc.name, sizeof(sAdHoc.name));
+        if (F.Location > 0 && !IsBadReadPtr((BYTE *)target + F.Location, 12))
+            memcpy(sAdHoc.loc, (BYTE *)target + F.Location, 12);
+        cand = &sAdHoc;
+    }
+    // Look up the slot in GObjObjects - coopTargetAlive/recoopStart both
+    // require a valid slot index.
+    int slot = cand->slot;
+    if (slot < 0 && g_objArray) {
+        int n = g_objArray->Num;
+        for (int j = 0; j < n && j < 400000; j++)
+            if (g_objArray->Data[j] == target) { slot = j; break; }
+    }
+    if (slot < 0) {
+        logf_("[coopcast] P1 10s hold on %s: target not in GObjObjects - "
+              "skip cooperative arming", objName(target, cand->name, sizeof(cand->name)));
+        return;
+    }
+    hp3coop::Target key = { target, cls, slot };
+    char tname[180];
+    logf_("[coopcast] P1 10s hold on %s (cursor lock, split=%s): arming shared hold",
+          objName(target, tname, sizeof(tname)), g_splitOn ? "ON" : "OFF");
+    coopStart(0, cand, key);
 }
 
 // Give a real human cast priority before *any* normal input event touches its
