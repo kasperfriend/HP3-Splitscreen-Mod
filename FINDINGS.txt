@@ -771,3 +771,129 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
   checked-in binary finally matches the source banner (it had been stale
   since v54). Host policy tests (cast_ground, aim_policy, coop_cast with the
   new grace assertions, native_aim) all pass.
+
+17. v58 HARDWARE FEEDBACK ON v57 + TRIO-ON-RELEASE + RON AI FIXES
+
+  The user's v57 test report (level-crash fix CONFIRMED working; do not
+  regress the cgLiveObject/every-frame detector sites listed in §16):
+
+  A. Trio auto-launches. "After 10 s of holding cast, Player 1 (Harry)
+     automatically launches the spell at the object, and after a couple of
+     times it breaks: Harry just shouts the spell, plays the animation,
+     but doesn't shoot." Intended behaviour (explicit user spec): any
+     player holds the cast for 10 s on the target -> the trio forms; when
+     the player RELEASES, the trio fires once and counts as the
+     cooperative spell. No auto-launch.
+  B. Ron's AI broken: "he tries to run back and forth to cast spell
+     together with player 1".
+
+  ROOT CAUSES (all confirmed in source; log evidence in the v56/v57 pelog
+  windows decoded by pawn-slot: p0=Harry, p1=Hermione, p2=Ron):
+
+  1. AUTO-FIRE = PressedFire on borrowed heroes. coopBeginBorrowedHero
+     called KWPawn.PressedFire ("g_fnFire [coopcast hold]") before
+     StartCasting(cls,1.0)+playCastAim. On the ENGINE-controlled pawn
+     (Harry) PressedFire enters the genuine fire pipeline: StateCast.Tick
+     ~+1215 ms, finalizeSpell ~+1465 ms, SpawnSpell ~250 ms later with NO
+     release input - the interval between StateCast entry and finalize is
+     the wind-up animation length, and the throw fires by itself. On AI
+     pawns PressedFire only nudges them into StateCasting. The mod's own
+     P2 hold path provably enters AND holds StateCasting with
+     ChooseSpell/ShowWeapon/SwitchToFightStanceAnims/canCast/
+     StartCasting(cls,1.0)/playCastAim alone - PressedFire was harmful AND
+     redundant. v58: removed from the borrow sequence entirely.
+
+  2. "SHOUTS BUT DOESN'T SHOOT" = ReleasedFire-after-StopCasting plus
+     restore-before-finalize. coopRestore ran StopCasting THEN
+     HPCharacter.ReleasedFire THEN KWPawn.ReleasedFire for BOTH aborts and
+     the normal holder release. A ReleasedFire issued after StopCasting
+     runs outside StateCasting: the pawn plays the release shout/animation
+     and spawns nothing (the exact p2 sequence in the InsideHub pelog
+     window 3/3). Worse, on a holder release (p1 SpawnSpell ->
+     DepulsoSpell29 in the SAME frame, proven by ordering) the restore
+     also returned every hero's currentSpell/spellTarget to the pre-arm
+     NULL immediately - the engine's StateCasting finalize re-reads
+     currentSpell at AnimEnd ~300-500 ms after the release trigger, so a
+     RESTORE-then-fire cycle desyncs the engine pawn: his next cast
+     spawns nothing. v58 split the restore into two endings:
+       * RELEASE (holder released cast): the holder's own natural path
+         fires (engine for P1, mod cast-fire for P2/P3 - the ordering in
+         the pelog proves the holder's SpawnSpell precedes the restore in
+         the same frame). Each mod-borrowed hero gets exactly ONE
+         HPCharacter.ReleasedFire while actually inside the held cast
+         state (the stock companion release): three near-same-frame real
+         projectiles converge on the shared target, which its script
+         counts as the cooperative spell. No StopCasting, NO field restore
+         on the fired heroes (finalize needs currentSpell ~300 ms later).
+       * CANCEL (target changed/deleted, another player cast, level travel,
+         split shutdown): StopCasting only. The two ReleasedFire calls are
+         gone - on an idle AI pawn those noise events are exactly the
+         cast-without-projectile pattern and fed the Ron oscillation.
+
+  3. RON "RUNS BACK AND FORTH" = v57's any-candidate arming.
+     coopCandidateTarget v57 admitted ANY living CgCand (pumpkins,
+     spawners, any vulnerableToClass object), so EVERY casual 10 s hold
+     force-borrowed Ron/Hermione out of their HPAIController follow state
+     into a held cast they must NOT leave, (a) producing the run/cast/run
+     oscillation silhouette and (b) issuing the ReleasedFire-until-cancel
+     pattern from (2). Additionally coopObserveP1's split-ON branch
+     certified any class from a 1.2 s P1 cursor lock, self-poisoning the
+     proof table so the hold stayed broadly open. v58 re-gates admission
+     to the genuine cooperative class FAMILY (coopClassIsCooperative):
+     the CompanionSpellTrigger class token on the class chain (observed
+     trio objects on hardware: CompanionSpellTrigger0/2/10) OR a class
+     certified this session by the strict all-three companion observation.
+     This is a class-family gate, NOT the v54-v56 behaviour-proven gate:
+     that one was structurally unreachable on hardware (the game's own
+     companion join enters StateCasting WITHOUT setting both companions'
+     pawn spellTarget fields, and Harry's P1 cursor is never watched when
+     the holder is P2/P3). coopRefreshCertifiedCandidates now discovers
+     family actors for metadata-less cooperative objects; split-ON token
+     certification requires the family token. A 10 s hold on a
+     pumpkin/spawner now stays a plain single-character cast: Ron is no
+     longer hijacked and his AI resumes cleanly after any real trio.
+
+  4. While borrowed, AI heroes are pinned: coopMaintain zeroes the XY
+     velocity and acceleration of each mod-borrowed, AI-driven hero every
+     frame (their controller keeps pushing movement per tick while State
+     has them holding a cast pose). Human-controlled heroes are not
+     pinned. alreadyHolding heroes (the game's own join) are never pinned.
+
+  5. POST-ARM FLICKER TEARDOWN (new bug found in source review):
+     coopTick's ACTIVE-hold branch restored on raw per-frame
+     !valid||!sameTarget, but hp3coop::update's kCoopFlickerGrace only
+     covers the PRE-fire dwell (grace requires !hold.fired and coopStart
+     latches the Ready result). One bad camera-ray frame while still
+     holding tore the armed trio down ("holder changed target", cancel).
+     v58: CoopCastActive.lastSeenAt anchors its own 250 ms grace for the
+     active hold (both P1-cursor and P2/P3-ray holders).
+
+  NOT regenerated behaviour: the holder's own release ordering - the
+  mod's cast-fire/fireCast for P2/P3 runs BEFORE coopTick's restore in the
+  same frame (pelog), so the coop-preserve-target branch in fireCast still
+  sees the live shared target, and the trio's two borrowed shots follow in
+  the same tick. The "target gone before the fire completed" cgArmHit
+  noise in v57 was the holder's pre-arm NULL field restore arriving before
+  the pending-hit arm read it; fire-mode restore no longer writes fields.
+
+  Build note: same host constraint as the v57 build note at the end of §16
+  (no mingw-w64; additionally ziglang.org and the GitHub release-asset
+  hosts are unreachable from this sandbox), so v58 was cross-compiled
+  locally with zig cc 0.16 installed via the PyPI 'ziglang' wheel
+  (pypi.org IS reachable):
+    zig c++ -target x86-windows-gnu -O2 -s -shared -static \
+      -o dist/d3d8.dll src/dllmain.cpp src/d3d8.def -lwinmm -Wall -Wextra
+  Direct3DCreate8 export pair verified; bin/d3d8.dll refreshed so the
+  checked-in binary matches the v58 banner; host policy tests
+  (cast_ground, aim_policy, coop_cast, native_aim) all pass.
+
+  HARDWARE CHECK LIST for the user:
+    * 10 s hold on a CompanionSpellTrigger by any player - the trio forms
+      (all three wizards in the held-cast pose) and NOTHING fires at 10 s.
+    * Release - ONE converging volley (holder + both borrowed heroes),
+      once, and the trigger counts the cooperative spell.
+    * Repeat several times in a row - no "shout with no shot" cases.
+    * 10 s hold on a pumpkin/other object - NO trio, Ron keeps following,
+      ordinary single cast on release.
+    * Long session exploration - Ron/Hermione AI follow behaviour normal.
+    * Level travel in and out of hub areas - no crash (regression check).
