@@ -1453,3 +1453,134 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       rejected entry would show as "[lumos] v66.3 BLOCKED Trigger()".
     * Secret walls still open for every player while a Lumos light is
       carried (the real trigger/wall actors are unchanged by this fix).
+
+==========================================================================
+2026-09-09 (night) - v66.4: LUMOS AS PLAYER 2 GPF, SECOND RECEIVER
+                     (LumosSparklesEmitter actor, with v66.3 running)
+==========================================================================
+
+- FIELD REPORT: with build v66.3 installed (its log banner confirms it),
+  casting Lumos as Player 2 (Hermione, driven pawn index p1) at the SAME
+  HP3_InsideHub gargoyle crashed again with the Windows fault dialog:
+
+    History: UObject::ProcessEvent <- (LumosSparklesEmitter
+             HP3_InsideHub.LumosSparklesEmitter0,
+             Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render
+             <- UGameEngine::Draw <- UWindowsViewport::Repaint <- ...
+
+  hp3mod.log ends with the fire itself visible - the mod's own callFn lines
+  interleaved with the pelog ProcessEvent hook output:
+
+      -> ProcessEvent LumosTrigger.Trigger
+  [pelog] @+1372ms LumosTrigger HP3_InsideHub.LumosTrigger0
+         :: Function KWGame.KWPawn.Trigger
+      -> ProcessEvent LumosTrigger.Trigger
+  [pelog] @+1372ms LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0
+         :: Function KWGame.KWPawn.Trigger
+  === detach (frames=1151 postrender=1152) ===
+
+  So this time the GPF receiver is not a stray texture but a real placed
+  ACTOR of class hgame.LumosSparklesEmitter (the secret-wall sparkles
+  effect emitter), fired on one cache slot after the genuine LumosTrigger0.
+
+- ROOT CAUSE (two cooperating defects):
+
+  1. v66.3 MOVED the substring match but did not REMOVE it. Its
+     isLumosTriggerClassToken() substring-matched WITHIN the class token
+     (strstr(clsTok, "LumosSparkles")), and the fire-time chain re-verify
+     (lumosClassVerified) re-ran that same substring on the chain-derived
+     class token behind an isActor gate. Class token "LumosSparklesEmitter"
+     contains "LumosSparkles", and an Engine.Emitter IS an actor subclass -
+     both gates green. The hub scan line in the field log shows the result:
+     "[lumos] scan: 21 triggers, 80 walls cached; 62+18 name look-alikes
+     rejected (v66.3 class-token rule)" - 21 cached "triggers" for a level
+     whose placed Lumos trigger actors number far fewer (the same level's
+     castgame scan lists two gargoyles and a handful of trigger triggers);
+     the emitters filled the rest.
+
+  2. The deeper defect, unchanged since v66: the trigger fire loop called
+     ONE globally resolved function pointer (g_fnTrigger, resolved at init
+     to "KWGame.KWPawn.Trigger") on every cached entry. ProcessEvent
+     dispatches exactly the UFunction it is handed, with whatever 'this' it
+     is handed - there is no receiver-class check - so any admitted
+     non-pawn object executes pawn member-offset reads/writes with a
+     too-small 'this'. (The genuine LumosTrigger0 merely survived the same
+     misuse, which is why only the second fire in the pair above detaches.)
+     Receiver AND function are both named verbatim in the crash history.
+
+- FIX (v66.4, three layers - src/lumos_sync.h + src/dllmain.cpp):
+
+    * Scan membership by name is now EXACT class-token equality, case
+      insensitive (hp3lumos::tokenEquals): triggers = "LumosTrigger" /
+      "LumosSparklesTrigger" only, walls = "GenericColObj" /
+      "KWBlockingVolume" only. NO substring comparison remains on any Lumos
+      gate. "LumosSparklesEmitter", "LumosTriggerLarge", "LumosSparkles",
+      "LumosLight", icon/texture/class/function look-alikes all reject at
+      the name test. The look-alike rejection counters and per-scan log
+      line are kept (now "... (v66.4 exact-family rule)").
+
+    * The only feature the substring ever bought - catching a
+      differently-named SUBCLASS of one of those classes - is now served by
+      proof instead of text: lumosChainProves() walks the receiver's
+      calibrated UObject::Class -> UStruct::SuperField chain (cgClassOf /
+      cgSuper: IsBadReadPtr-guarded dword reads, known-class validation, no
+      GetFullName anywhere) and pointer-compares it against the family
+      class objects resolved by path at init (hgame.LumosTrigger,
+      hgame.LumosSparklesTrigger, KWGame.GenericColObj,
+      KWGame.KWBlockingVolume - printed once in the log as "[lumos] family
+      classes:"). A name can never fake a pointer in the chain. The proof
+      runs at scan admission (for name look-alikes only, so the once-per
+      level scan stays cheap) and inside lumosClassVerified at every
+      fire/write. While the class chain is not yet verified on a fresh
+      level, the strict exact-name scan result stands (the v66.3 documented
+      trust level); a first scan that raced the chain calibration and left
+      look-alikes unproven re-runs exactly once once the chain verifies
+      (g_lumosRescanOnChain), so subclass admission cannot be lost to init
+      order either.
+
+    * ROOT-CAUSE HARDENING at the fire site: the mod no longer replays a
+      function found on a DIFFERENT class onto any receiver. With the chain
+      verified, the fire resolves the most-derived Trigger declaration in
+      the RECEIVER's OWN class chain (CgClass::fnTrigger - the castgame
+      index already maps every class-level "Trigger" function onto every
+      class, most-derived first), and falls back to Engine.Actor.Trigger -
+      the base Trigger event every actor owns - if the chain declares no
+      override. If neither can be proven for the object in hand, the fire
+      is skipped and logged ("[lumos] v66.4 BLOCKED Trigger() on %p - ...").
+      Even a hypothetical FUTURE admission bug therefore cannot execute
+      foreign bytecode on a live object again, and for real Lumos trigger
+      actors this fires exactly what the engine's own touch path
+      dispatches, so stock behaviour is unchanged. (The pawn-only
+      doUse()/Trigger() path is untouched - its receivers are pawns, which
+      is what g_fnTrigger was always correct for.)
+
+- VERIFICATION: host policy suites pass (tests/run.sh); the lumos suite
+  (tests/lumos_sync_test.cpp) replays BOTH crash receivers verbatim
+  ("Texture hgame.LumosTriggerIcon", "LumosSparklesEmitter
+  HP3_InsideHub.LumosSparklesEmitter0"), the previously-accepted token
+  substrings that must now reject ("LumosSparkles", "LumosTriggerLarge"),
+  case-insensitive exact acceptance of the four stock class tokens, and the
+  chainContainsAny subclass-proof primitive (hit at chain position 0 and
+  deep, wall family with an unresolved second ref, and all NULL/empty guard
+  rails). The Windows DLL could NOT be rebuilt in this sandbox (no i686
+  MinGW toolchain; package install blocked), so dist/d3d8.dll and
+  bin/d3d8.dll are NOT refreshed here - build via CI (build-release.yml,
+  workflow_dispatch) and confirm line 2 of hp3mod.log says build v66.4.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v66.4 (else an old DLL is being tested).
+    * "[lumos] family classes: LumosTrigger=........ LumosSparklesTrigger=
+      ........ GenericColObj=........ KWBlockingVolume=........" prints
+      non-NULL pointers once per session.
+    * The once-per-level scan line reads "[lumos] scan: N triggers, M walls
+      cached; A+B name look-alikes rejected, C+D subclasses chain-admitted
+      (v66.4 exact-family rule)"; in HP3_InsideHub N drops well below the
+      bogus 21 (the emitters are no longer cached - they only ever needed
+      to be triggered BY the real triggers' own scripts).
+    * Casting Lumos as Player 2 at the HP3_InsideHub gargoyle: the
+      "-> ProcessEvent LumosTrigger.Trigger" line is followed by normal
+      [pelog]/[castwatch] traffic instead of the detach line, and nothing
+      named "LumosSparklesEmitter" is ever the receiver of that call.
+    * Any surviving anomaly shows up as "[lumos] v66.4 BLOCKED Trigger()".
+    * Secret walls still open for every player while a Lumos light is
+      carried (the real trigger/wall actors are unchanged by this fix).

@@ -134,13 +134,30 @@ inline bool shouldSecretWallBePassable(bool lumosActive, bool playerNear)
 // the shared UObject allocator arena, so they return garbage that can pass
 // the proximity test) and is then handed to ProcessEvent as the receiver of
 // KWGame.KWPawn.Trigger - pawn bytecode running on a texture-sized object.
-// That is the exact 2026-09-09 general protection fault, reproduced by
-// casting Lumos as Player 2:
+// That was the first 2026-09-09 general protection fault:
 //   UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon,
 //      Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render
-// Only the object's CLASS - the token before the first space - may decide
-// cache membership now, so an asset or reflection object can never enter the
-// trigger/wall caches again.
+//
+// v66.4 crash fix (the SECOND 2026-09-09 Player-2 Lumos GPF, on the SAME
+// gargoyle, with v66.3 running):
+//   UObject::ProcessEvent <- (LumosSparklesEmitter
+//      HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger)
+//      <- FPlayerSceneNode::Render
+// The v66.3 class-token gate substring-matched WITHIN the class token
+// (strstr(clsTok, "LumosSparkles")), so the placed secret-wall sparkles
+// actor - class token "LumosSparklesEmitter" - still joined the trigger
+// cache, and the fire-time chain re-verify reused the same substring test
+// behind an isActor gate that an Emitter trivially passes (the hub scan
+// line showed "21 triggers" cached for that level). The fire loop then ran
+// KWGame.KWPawn.Trigger with an emitter as 'this' - pawn bytecode touching
+// pawn member offsets far past an emitter's allocation. Class-token
+// membership is therefore EXACT now: the only trigger tokens are the two
+// classes the stock game actually places at secret walls ("LumosTrigger",
+// "LumosSparklesTrigger"), the only wall tokens are "GenericColObj" and
+// "KWBlockingVolume". A subclass of one of those can no longer slip in
+// through its name at all - subclasses are admitted exclusively through the
+// calibrated class-CHAIN pointer proof in dllmain.cpp (lumosChainProves,
+// built on chainContainsAny below), never through a string.
 // ---------------------------------------------------------------------------
 
 // Copy the class token (the word before the first space) out of a GetFullName
@@ -159,23 +176,60 @@ inline void classTokenOf(const char* fullName, char* out, unsigned cap)
     out[k] = 0;
 }
 
-inline bool isLumosTriggerClassToken(const char* clsTok)
+// ASCII case-insensitive equality (class tokens come out of GetFullName with
+// the package's own capitalisation; compare defensively anyway).
+inline bool tokenEquals(const char* a, const char* b)
 {
-    return clsTok && (std::strstr(clsTok, "LumosSparklesTrigger") != 0 ||
-                      std::strstr(clsTok, "LumosTrigger") != 0 ||
-                      std::strstr(clsTok, "LumosSparkles") != 0);
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char x = *a++, y = *b++;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return *a == 0 && *b == 0;
 }
 
+// v66.4: EXACT class-token equality against the two classes the stock game
+// places at secret walls. NO substring anywhere: "LumosSparklesEmitter" (the
+// second 2026-09-09 GPF receiver), "LumosTriggerLarge", "LumosLight",
+// "LumosSpell" and every other look-alike reject here. A true subclass of
+// LumosTrigger/LumosSparklesTrigger re-enters ONLY via the dllmain.cpp class
+// chain proof (lumosChainProves), which pointer-compares the receiver's
+// UObject::Class -> UStruct::SuperField chain against the resolved family
+// class objects - the one comparison a name can never fake.
+inline bool isLumosTriggerClassToken(const char* clsTok)
+{
+    return tokenEquals(clsTok, "LumosTrigger") ||
+           tokenEquals(clsTok, "LumosSparklesTrigger");
+}
+
+// Same exact-token rule for the secret walls the Lumos triggers unblock.
 inline bool isSecretWallClassToken(const char* clsTok)
 {
-    return clsTok && (std::strstr(clsTok, "GenericColObj") != 0 ||
-                      std::strstr(clsTok, "KWBlockingVolume") != 0);
+    return tokenEquals(clsTok, "GenericColObj") ||
+           tokenEquals(clsTok, "KWBlockingVolume");
+}
+
+// Subclass-proof primitive: does a class chain (receiver class first, ending
+// near Object) contain any of the wanted family class objects? Pointers only;
+// callers pass REFS as the family class objects resolved by path at init
+// (NULL entries are skipped, a chain stops at its first NULL/unknown link).
+inline bool chainContainsAny(void* const* chain, int chainN,
+                             void* const* refs, int refsN)
+{
+    if (!chain || !refs || chainN <= 0 || refsN <= 0) return false;
+    for (int i = 0; i < chainN && chain[i]; ++i)
+        for (int j = 0; j < refsN; ++j)
+            if (refs[j] && chain[i] == refs[j]) return true;
+    return false;
 }
 
 // Membership tests for the scan caches. fullName must be the mod's GetFullName
-// rendering ("ClassToken Package.Object"). "Texture hgame.LumosTriggerIcon"
-// and "Class hgame.LumosTrigger" reject; the placed actor
-// "LumosTrigger HP3_InsideHub.LumosTrigger3" accepts.
+// rendering ("ClassToken Package.Object"). "Texture hgame.LumosTriggerIcon",
+// "Class hgame.LumosTrigger" and the placed emitter
+// "LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0" reject; the
+// placed actor "LumosTrigger HP3_InsideHub.LumosTrigger3" accepts.
 inline bool isLumosTriggerObject(const char* fullName)
 {
     char tok[64];
