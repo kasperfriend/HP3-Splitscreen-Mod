@@ -30,6 +30,12 @@ struct NativeAimState {
     BOOL gesture, configured, visible, ready;
     float radius;
     DWORD spawnedAt, retryAt;
+    // v64: stock gesture motion. stateLockedOn.Tick chases the goal with
+    // MoveSmooth((goal-loc)*rate*dt) after the one LockOn SetLocation snap,
+    // so the LOCK icon glides instead of teleporting when the aim moves.
+    float smooth[3];
+    DWORD smoothAt;
+    BOOL  smoothStarted;
 };
 static NativeAimState g_na[8] = {};
 static BOOL g_naFailed[8] = {0}; // a failed renderer stays legacy until next hold
@@ -354,12 +360,28 @@ static BOOL updateNativeAim(int i, void *pawn, BOOL held, const float cam[3], co
         objName(g_aimFX[i],s.name,sizeof(s.name));
         for(int slot=0;slot<g_objArray->Num;slot++) if(g_objArray->Data[slot]==g_aimFX[i]) {s.slot=slot;break;}
         g_nativeAimOwned[i]=TRUE;g_aimFXAt[i]=s.spawnedAt;
+        s.smoothStarted=FALSE; s.smoothAt=0;
         if(!nativeAimOwnedAlive(i) || !nativeSetPhysics(g_aimFX[i],0)) {return naFallback(i);}
     }
     int facing[3]={-rot[0],(rot[1]+32768)&65535,0}; // gesture faces -vLOS_Dir
-    BOOL placed=naPlace(g_aimFX[i],at,gesture?facing:rot);
+    const float *placeAt=at;
+    if (gesture) {
+        // Stock stateLockedOn.Tick: LockOn snaps the gesture once (SetLocation
+        // at vLOS_End), then every tick chases the goal with
+        // MoveSmooth((goal-loc)*10*dt). Recreate it so the wet icon glides in
+        // the air with the aim instead of teleporting.
+        bool started=s.smoothStarted!=FALSE;
+        float dt=s.smoothAt? (float)(GetTickCount()-s.smoothAt)/1000.0f : 0.0f;
+        if (dt<0.0f) dt=0.0f;
+        if (dt>hp3trio::kMaxDt) dt=hp3trio::kMaxDt;
+        hp3trio::moveSmooth(s.smooth,started,at,(float)hp3trio::kSmoothRate,dt);
+        s.smoothStarted=started?TRUE:FALSE;
+        s.smoothAt=GetTickCount();
+        placeAt=s.smooth;
+    }
+    BOOL placed=naPlace(g_aimFX[i],placeAt,gesture?facing:rot);
     if(!placed) {logf_("[nativeaim] p%d native SetLocation failed; legacy marker until release",i+1);return naFallback(i);}
-    memcpy(g_aimLast[i],at,12);
+    memcpy(g_aimLast[i],placeAt,12);
     if(!s.configured) {
         if(!naParticles(g_aimFX[i],cls,gesture?2:1)) {
             naVisible(i,FALSE);

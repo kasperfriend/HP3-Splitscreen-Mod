@@ -38,6 +38,37 @@ liveness rule described below: no resolvable wet `SpellIcon`, failed spawn/
 placement, missing private particles, or a recycled object-table slot skips or
 drops the overlay without touching what fires on release.
 
+### v64 stock gesture motion ("floating in the air", not pinned)
+
+v63 pinned the two companion icons beside the target plane. The stock gesture
+is not pinned: `SpellCursor.LockOn` snaps the new `SpellGesture` to `vLOS_End`
+once, and `stateLockedOn.Tick` then chases the live goal every tick with
+`SpellGesture.MoveSmooth((goal - SpellGesture.Location) * rate * fTimeDelta)`
+- rate 10 while the target is still the current possible target, rate 8 on the
+centre-offset goal (`target.Location + CentreOffset + Normal(heroLoc -
+targetLoc) * fFinalGestureDistance`) during a target flicker. v64 reproduces
+that on the mod-owned gestures:
+
+- The holder's native-aim LOCK gesture keeps its stock goal (`vLOS_End` at
+  `1.1 * CollisionRadius * SizeModifier + 2 + GestureDistance`) and now chases
+  it with the same `MoveSmooth` semantics instead of `SetLocation` every frame.
+- Each companion goal is the stock front-of-target point pushed sideways along
+  its own hero's direction (projected perpendicular to the pane's view), with
+  the v63 lateral spacing; each is chases with `MoveSmooth` as well. The three
+  icons therefore hover in front of the target clustered on their heroes'
+  sides - the stock single-player look - and glide in the air after the aim
+  and the heroes instead of being locked.
+- The two companion gestures survive the same 250 ms target flicker the hold
+  tolerates: they keep gliding toward their last goals instead of being
+  destroyed for a frame (the stock lock keeps its gesture through the flicker).
+- The v63 lateral recipe is retained only as the fallback when a companion
+  pawn is unavailable.
+
+The pure placement/motion policy is in `src/coop_trio.h` (stock goal geometry,
+front/cluster goals, `MoveSmooth`, facing yaw, lateral fallback) and is
+covered by `tests/coop_trio_test.cpp`; `tests/native_aim_test.cpp` now also
+asserts the one-snap-then-chase behavior of the LOCK gesture.
+
 ## What the actual game packages establish
 
 The supplied `Core.u`, `Engine.u`, `kwGame.u`, and `HGame.u` are uncompressed

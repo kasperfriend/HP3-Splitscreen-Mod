@@ -13,7 +13,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 - **Distinct characters per view** (Harry / Hermione / Ron), each with their own camera, floor and collision
 - Real spellcasting through the game's own script VM (Rictusempra, Depulso, Lumos, ... ) with hold-to-aim, vertical aim, and (v51) player-1-faithful gameplay activation: statues, jump pads, doors and lesson objects react to player 2's spells
 - **Native HP3 aim effects (v52/v53)**: original seeking particles and target-sized hovered spell icons; hardware verification pending.
-- **Holder-origin virtual-trio charge (v63, fires on release)**: hold a cast on a cooperative-family target for 8 seconds to arm x3 power. The interval never auto-fires. On release, all three spells leave from the holder in the same direction: P2/P3 bonuses copy the normal shot’s exact projectile kinematics, while P1 uses one shared holder-origin fallback. Bonus `Instigator` labels still let the trigger observe three distinct casters. The mod never borrows companions’ controllers, cast state, or AI. When P2/P3 arms the charge, the holder’s one floating wet-shader spell is joined by two companion wet-spell gestures — the same three-floating-spells look as stock P1’s held cast plus its AI companions joining (P1 already shows it through the stock cursor/companions). While P1 charges, AI companions that are actually casting are held still (movement stats pinned with save/restore) so Ron stops his run/cast/run oscillation yet keeps walking to range; everything restores on unlock.
+- **Holder-origin virtual-trio charge (v64, fires on release)**: hold a cast on a cooperative-family target for 8 seconds to arm x3 power. The interval never auto-fires. On release, all three spells leave from the holder in the same direction: P2/P3 bonuses copy the normal shot’s exact projectile kinematics, while P1 uses one shared holder-origin fallback. Bonus `Instigator` labels still let the trigger observe three distinct casters. The mod never borrows companions’ controllers, cast state, or AI. When P2/P3 arms the charge, the holder’s one floating wet-shader spell is joined by two companion wet-spell gestures that move the way the stock ones do: all three hover at the stock gesture distance **in front of** the target, each companion icon sits on its own hero’s side, and every icon is chased with the stock `SpellGesture.MoveSmooth((goal-loc)*10*dt)` motion — snapped once at lock, then gliding in the air after the aim and its hero (P1 already shows the stock 1-to-3 look through its own cursor/companions). While P1 charges, AI companions that are actually casting are held still (movement stats pinned with save/restore) so Ron stops his run/cast/run oscillation yet keeps walking to range; everything restores on unlock.
 - Camera that slides against walls instead of clipping, gamepad camera-follow + orbit (v13+)
 - Works on free-roam levels; survives level changes
 
@@ -24,7 +24,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v63`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v64`.
 
 ## Player 2 controls
 
@@ -46,9 +46,31 @@ sudo apt install g++-mingw-w64-i686
 ./build.sh          # -> dist/d3d8.dll
 ```
 
-Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, the cooperative hold lifecycle is in `src/coop_cast.h`, charged-projectile planning is in `src/charged_cast.h`, and the native visual adapter is in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
+Any 32-bit MinGW-w64 toolchain works; the source is a single translation unit (`src/dllmain.cpp`) with an export table (`src/d3d8.def`). The testable floor-handoff policy is in `src/cast_ground.h`; aiming geometry is in `src/aim_policy.h`, the cooperative hold lifecycle is in `src/coop_cast.h`, the stock three-float gesture placement is in `src/coop_trio.h`, charged-projectile planning is in `src/charged_cast.h`, and the native visual adapter is in `src/native_aim.h`. Runtime configuration lives in `src/hp3mod.ini` — the in-code fallbacks deliberately match the shipped defaults.
 
 Run the host-side regression tests with `./tests/run.sh` (requires a native C++ compiler; override with `HOST_CXX`). These test recovery, aim geometry, continuous cooperative-hold identity/timing, charged-projectile trajectories, and native-effect lifecycle using engine-independent policy code—not HP3's actual VM, collision, animation, or rendering.
+
+### v64 stock cooperative gesture motion
+
+v63 showed the armed charge as three wet-shader spell icons but pinned the two
+companion icons **beside the target** at the target plane. v64 replicates what
+the original hero's `SpellCursor` plus the companion join actually does
+(established from the HP3 package gesture-placement rules and the KWGame
+`SpellCursor` source): every icon hovers at the stock gesture distance
+`1.1 * CollisionRadius * SizeModifier + 2 + GestureDistance` in **front** of
+the target (the `vLOS_End` the stock `LockOn` snaps to), each companion icon is
+pushed sideways along its **own hero's** line of sight, and each icon is then
+chased every frame with the stock `SpellGesture.MoveSmooth((goal-loc)*rate*dt)`
+motion — snapped once at lock like `LockOn.SetLocation`, then gliding after the
+aim and the hero (rate 10; rate 8 on the centre-offset goal during a target
+flicker). The holder's own native-aim LOCK gesture gets the same chase, the two
+companion icons survive the same 250 ms target flicker the hold tolerates
+(keeping their last goals instead of vanishing), and the lateral v63 recipe
+remains only as the fallback when a companion pawn is unavailable.
+
+Purely visual: the mod still owns only its gesture actors and never touches
+companion controllers, cast state, target/spell fields, or AI. The 8-second arm
+and once-on-release x3 firing are unchanged from v63.
 
 ### v63 8-second arm + three floating wet spells
 
@@ -193,6 +215,7 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v62** launches the entire virtual trio from the holder: P2/P3 bonuses clone the normal projectile’s exact kinematics, P1’s two bonuses share one holder-origin plan, and companion pawns contribute only distinct `Instigator` labels—remote companions can no longer send shots into walls.
 - **v61** fires a virtual trio instead of same-caster x3 (hardware showed the trigger counts distinct casters): bonus shots launch from the other trio members’ positions at staggered speeds with companion `Instigator` labels, the delivery tick runs with split OFF so P1’s solo bonuses land, and the Ron guard pins only actually-casting companions’ `GroundSpeed`/`AccelRate` with save/restore so the hold survives the AI tick while walkers keep walking.
 - **v63** arms the charged x3 after an 8-second continuous hold (the `CoopCastHoldMs` default/minimum is now 8000) and, for P2/P3 holders, shows the stock cooperative visual: the holder’s one floating wet-shader spell is joined by two companion wet-spell gestures so the armed charge reads as three floating spells (P1 already shows it through the stock cursor/companion-join). The companion gestures are visual only and change nothing about what fires on release.
+- **v64** replaces the pinned companion gestures with the stock motion: all three icons hover at the stock gesture distance in front of the target, companion icons sit on their own heroes’ sides, and every icon is chased with `SpellGesture.MoveSmooth((goal-loc)*rate*dt)` (snap once at lock, then glide) — the holder’s native-aim LOCK gesture gets the same chase, the companions survive the 250 ms target flicker, and the pure placement policy lives in `src/coop_trio.h` with host tests.
 
 ## Disclaimer
 
