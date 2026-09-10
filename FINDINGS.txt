@@ -1758,3 +1758,171 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       mid-spell: NO UnOctree.cpp assertion, no crash dialog on exit.
     * Level travel while a wall is open restores it (no assertion there
       either).
+
+==========================================================================
+25. V67 - WHAT STOCK LUMOS REALLY DOES, REPLICATED FOR P2/P3 (2026-09-10)
+==========================================================================
+
+- FIELD REPORT (v66.5, HP3_InsideHub gargoyle): Lumos as Player 2 no longer
+  crashes and the gargoyle lights, but P2/P3 wands never glow and they still
+  cannot walk through the revealed secret walls ("the game doesn't seem to
+  give them that state").
+
+- THE MISSING ANALYSIS (the user asked: "analyze what Lumos does to main
+  character and replicate to other players"). The decompiled HP2-lineage
+  scripts (github.com/metallicafan212/HP2UScriptDecompile - HP3 inherits the
+  classes verbatim; the HP3 save chain
+  "harry.Wand -> HarryWand.TheLumosLight -> LumosLight" is visible in public
+  save-error dumps) give the whole stock chain:
+
+    gargoyle.HandleSpellLumos(spell, hitLoc)
+      -> baseWand(PlayerHarry.Weapon).LumosTurnOn()
+      -> TheLumosLight.TurnOn():
+           fLumosTime = 0;
+           if (PlayerHarry.bLumosOn) return;      <-- single-player gate
+           bLumosOn = True; PlayerHarry.bLumosOn = True; Enable('Tick');
+           TurnDynamicLightOn();                  LT_Steady, LE_NonIncidence,
+                                                  brightness 400, hue 32,
+                                                  saturation 72, radius 15,
+                                                  radiusInner 5
+           foreach AllActors(Actor, A) A.OnLumosOn();  arms every trigger
+           Particles = Spawn(Class'LumosLightFX', self, , Location);
+                                                  <-- THE visible wand glow
+    baseWand.Tick(): while TheLumosLight.bLumosOn:
+           TheLumosLight.UpdateLocation(WandEndPoint)  light+particles ride
+                                                       the wand tip
+    LumosLight.Tick(): after fLumosTimeToTurnOff (30s) -> TurnOff():
+           PlayerHarry.bLumosOn = False; TurnDynamicLightOff();
+           foreach AllActors -> A.OnLumosOff(); Particles.Destroy();
+
+    LumosTrigger (one placed at every secret wall):
+      OnLumosOn() -> StateWaitingToTurnOn
+      Tick: VSize(Location - PlayerHarry.Location) < fDistanceCheck(512)
+              [optional |dZ| < fZDistanceCheck(64)]
+            -> StateLumosOn -> BeginState:
+                 TriggerEvent(Event, self, None)   <-- OPENS THE WALL
+                 bFirstEventSent = True            (NEVER reset: fires once
+                                                    per level; stock walls
+                                                    are Movers, initial
+                                                    state TriggerToggle,
+                                                    MoveTime=0, so one fire
+                                                    = open permanently)
+
+  THREE splitscreen gaps fall straight out of that source:
+    1. HandleSpellLumos lights PlayerHarry's wand even when P2 casts - a
+       companion NEVER gets a lit wand from the stock chain.
+    2. The wand glow is a spawned LumosLightFX particle actor, not a light
+       property - poking light values (v66.x) can never produce the glow.
+    3. The wall-open path is the trigger's Event, keyed on PlayerHarry's
+       position ONLY. The v66.x SetCollision fallback only covered
+       GenericColObj/KWBlockingVolume and never fired the Event, so the
+       stock Mover wall stayed solid no matter what the mod poked.
+
+- FIX (v67), per gap:
+    1+2. The mod now replicates TurnOn WITHOUT the stock gate (a script
+      TurnOn call would early-out: by sync time the gargoyle already lit
+      the LEAD's light stock-side, and the gate checks PlayerHarry.bLumosOn
+      only). Per driven player with a cold own-light:
+        bLumosOn = True (bit write, hgame.LumosLight.bLumosOn)
+        + the exact TurnDynamicLightOn register (LightEffect=13 and
+          LightRadiusInner=5 ADDED to the v66.5 set; brightness written
+          byte 255 or float 400.0 according to the layout tell
+          brightnessIsFloatByLayout: LightHue - LightBrightness delta 1 =>
+          byte property, >= 4 => float - the v66.5 byte-only write AND the
+          byte-only detection were both silently wrong on a float engine,
+          reading 400.0f as 0x00 = "off")
+        + nativeSetLocation the light next to its owner (a cold light can
+          still sit at the level-entry wand position)
+        + spawn the stock HPParticle.LumosLightFX glow owned by the light
+          (the visible glow; respawned if it dies, destroyed on off)
+        + bLumosOn=True written on every driven pawn (the literal character
+          state; stock keeps it on PlayerHarry only)
+        + auto-off after the stock 30s (fLumosTimeToTurnOff) with the
+          exact TurnDynamicLightOff register + particles destroyed - this
+          breaks the "mod keeps light burning -> ratchet keeps state ->
+          state keeps light burning" deadlock the light-follow timer would
+          otherwise form with its own replication.
+      The light's LOCATION is otherwise left to the STOCK wand Tick
+      (UpdateLocation(WandEndPoint) while bLumosOn) - the mod only
+      self-heals if the light drifts >300 units from its owner (property
+      ever mismatched). The per-wand TheLumosLight offset is now resolved
+      from the wand's OWN class token, walking the class chain for the
+      declaring ancestor (hgame.<WandClassToken>.TheLumosLight) - the
+      fixed "hgame.baseWand"/"hgame.HarryWand" attempts both missed on
+      hardware. The owner-scan fallback now also accepts chain-proven
+      LumosLight subclasses.
+    3. The trigger pass in lumosTick: while the Lumos state is on, for each
+      cached LumosTrigger/LumosSparklesTrigger with a non-empty Event that
+      nobody has fired yet (stock's bFirstEventSent read from the actor,
+      else the mod's once-per-level latch), if ANY tracked player stands
+      inside the trigger's OWN radius (fDistanceCheck/fZDistanceCheck read
+      from the actor, stock defaults 512/64 - stock only ever measured
+      PlayerHarry), the mod fires the stock dispatch:
+        manual Tag walk first: every live actor whose Tag == Event gets its
+          own most-derived Trigger(Other=trigger, Instigator=near pawn)
+          through ProcessEvent - chain-resolved, isActor-proven, never a
+          foreign-class function (v66.4 lesson);
+        Engine.Actor.TriggerEvent native (execThunk) as fallback.
+      Once per level per trigger, exactly like stock's bFirstEventSent;
+      the mod also SETS bFirstEventSent on triggers it fired so a later
+      stock pass (P1 walking up) cannot toggle a TriggerToggle wall CLOSED.
+      The v66.5 octree-safe SetCollision wall path stays as the fallback
+      for collision-proxy walls.
+
+- SAFETY NOTES:
+    * Spawning a LumosLight for wands that lack one was considered and
+      REJECTED: LumosLight.PreBeginPlay writes PlayerHarry.bLumosOn=False,
+      so a mid-spell spawn would stomp the lead's live state. A wand
+      without an own light logs once and gets no glow.
+    * The Tag walk fires only chain-proven Actors (Engine.Actor in the
+      receiver's class chain) and re-verifies trigger identity through
+      lumosClassVerified before the Event is even read.
+    * The dispatch order is deliberate: manual Tag walk (exact parms,
+      proven ProcessEvent fire shape) before the engine native.
+
+- VERIFICATION: host policy suites pass (tests/run.sh). The lumos suite
+  adds section 12: the stock on/off light register values, both layout
+  tells (brightness byte-vs-float, radiusInner adjacency), the type-aware
+  isLightActiveF, the stock InLumosRadius predicate (512/64 defaults, Z
+  gate), triggerShouldFire (the state machine minus the PlayerHarry key),
+  companionLightShouldTurnOn and the 30s stock window. The Windows DLL
+  could NOT be rebuilt in this sandbox (no i686 MinGW toolchain; package
+  installs blocked) - build via CI (build-release.yml) and confirm line 2
+  of hp3mod.log says build v67.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v67 (else an old DLL is being tested).
+    * The startup log gains a "[lumos] v67: ..." line: LightEffect /
+      LightRadiusInner offsets, brightnessIsFloat (1 on a float engine),
+      LumosLight.bLumosOn, Pawn.bLumosOn, Trig.bFirstEventSent,
+      Trig.fDistanceCheck, execTriggerEvent, GlowFX class pointer. If
+      bLumosOn=+0xFFFFFFFF the light replication still works (register
+      only); if execTriggerEvent=0 the Tag walk covers the dispatch.
+    * Cast Lumos as P2 at the gargoyle: expect
+      "[lumos] v67 P1 TheLumosLight turned ON" is STOCK (its own TurnOn)
+      and "[lumos] v67 P1 wand glow spawned" only for lights WE lit.
+      P2/P3: "TheLumosLight turned ON", "wand glow spawned" - the wand
+      now glows visibly.
+    * Walk P2 into the revealed wall: expect
+      "[lumos] v67 TriggerEvent fired: ... event=0x... instigator=..." -
+      the wall OPENS (stock Mover path). If instead only the older
+      "[lumos] v66.5 opened secret wall" line appears, the wall is a
+      collision proxy, not a Mover - also fine.
+    * The window ends 30s after the light: "auto-off after stock 30s".
+
+  VERIFICATION (v67, completed):
+    * tools/hostcheck/{windows.h,mmsystem.h,check.sh} - new repeatable
+      host-side syntax check: a minimal hand-written Win32 stub surface
+      for "g++ -fsyntax-only -std=c++11 -fms-extensions -Wall -Wextra".
+      NOT part of the shipped DLL; the real build remains CI mingw32.
+      First run found a REAL v67 bug: g_execTriggerEvent was declared
+      void* but called as a function pointer (fixed to PFN_execActorFn
+      with matching casts in resolveLumosFields). Also flushed out a
+      write-only leftover sPrevBtn in the pad code (removed).
+      Win32 stub notes for future edits: __declspec(x) must be #defined
+      empty (host gcc has no __declspec), __stdcall empty, FARPROC
+      void*, CreateThread's LPTHREAD_START_THREAD returns unsigned long.
+    * tests/run.sh: ALL suites pass (lumos sync incl. v67 section 12a-f,
+      stuck pawn, live index, frame carve, etc.).
+    * dllmain.cpp structurally clean: braces/parens balanced, declaration
+      order audited, -Wall -Wextra silent.

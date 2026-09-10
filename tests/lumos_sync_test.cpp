@@ -304,8 +304,108 @@ int main()
         assert(!wrap.isExpired(0x40Fu));
     }
 
+    // -----------------------------------------------------------------------
+    // 12. v67: the stock Lumos chain, replicated. Decompiled HP2 lineage
+    //     (HP3 inherits it verbatim): LumosLight.TurnOn / TurnDynamicLightOn,
+    //     the 30 s fLumosTimeToTurnOff window, and LumosTrigger's once-per-
+    //     level Event fire keyed on a proximity check that stock only ever
+    //     runs for PlayerHarry.
+    // -----------------------------------------------------------------------
+    // 12a. The stock light register, on and off. Script declares brightness
+    //      400; a byte property truncates to 255, a float keeps 400.0 - the
+    //      register carries both and the caller picks by layout.
+    {
+        LumosLightRegister on = stockLumosLightOn();
+        assert(on.lightType   == 1);    // LT_Steady
+        assert(on.lightEffect == 13);   // LE_NonIncidence
+        assert(on.brightnessByte == 255);
+        assert(near(on.brightnessFloat, 400.0f));
+        assert(on.hue == 32);
+        assert(on.saturation == 72);
+        assert(near(on.radius, 15.0f));
+        assert(near(on.radiusInner, 5.0f));
+
+        LumosLightRegister off = stockLumosLightOff();
+        assert(off.lightType == 0 && off.lightEffect == 0);
+        assert(off.brightnessByte == 0 && off.brightnessFloat == 0.0f);
+        assert(off.hue == 0 && off.saturation == 0);
+        assert(near(off.radius, 0.0f) && near(off.radiusInner, 0.0f));
+    }
+    // 12b. Layout tells. LightHue (a byte) is declared right after
+    //      LightBrightness: delta 1 => byte property, delta >= 4 => float.
+    //      A wrong guess either never sees a burning light (float 400.0f's
+    //      low byte is 0x00) or corrupts the hue byte next to it.
+    assert(!brightnessIsFloatByLayout(0x1A2, 0x1A3));   // adjacent bytes
+    assert(!brightnessIsFloatByLayout(0x1A2, 0x1A4));   // 2 apart: still byte+pad
+    assert( brightnessIsFloatByLayout(0x1A2, 0x1A6));   // float + 4-byte step
+    assert(!brightnessIsFloatByLayout(0, 0x1A3));       // unresolvable -> byte
+    assert(!brightnessIsFloatByLayout(-1, 0x1A3));
+    // LightRadiusInner beside float LightRadius: adjacent (4) => float.
+    assert(radiusInnerIsFloatByLayout(0x1B0, 0x1B4));
+    assert(!radiusInnerIsFloatByLayout(0x1B0, 0x1B5));
+    assert(!radiusInnerIsFloatByLayout(0x1B0, -1));
+    assert(!radiusInnerIsFloatByLayout(-1, 0x1B4));
+    // Type-aware "light is burning": the byte variant of a burning float
+    // light reads 0 - the exact v66.5 detection blindness this fixes.
+    assert(isLightActiveF(false, 1, 400.0f));
+    assert(isLightActiveF(false, 1, 0.5f));
+    assert(!isLightActiveF(false, 0, 400.0f));
+    assert(!isLightActiveF(false, 1, 0.0f));
+    assert(!isLightActiveF(true, 1, 400.0f));
+    // 12c. Stock LumosTrigger.InLumosRadius: VSize(trigger - pawn) < radius,
+    //      with the optional |dZ| gate. Stock defaults 512 / 64.
+    {
+        float trig[3] = { 1000.0f, 2000.0f, 100.0f };
+        assert(StockTriggerDistanceCheck  == 512.0f);
+        assert(StockTriggerZDistanceCheck == 64.0f);
+        float at512[3]  = { 1200.0f, 2200.0f, 160.0f };  // dist ~569? no: 200,200,60 -> 291
+        float at513[3]  = { 1000.0f + 513.0f, 2000.0f, 100.0f };
+        float at511[3]  = { 1000.0f + 511.0f, 2000.0f, 100.0f };
+        assert(stockTriggerInRadius(trig, at512, 512.0f, false, 64.0f));
+        assert(!stockTriggerInRadius(trig, at513, 512.0f, false, 64.0f));
+        assert(stockTriggerInRadius(trig, at511, 512.0f, false, 64.0f));
+        // The Z gate: 3D radius ok, but |dZ| >= fZDistanceCheck rejects.
+        float high[3] = { 1000.0f, 2000.0f, 100.0f + 100.0f };
+        assert(stockTriggerInRadius(trig, high, 512.0f, false, 64.0f));
+        assert(!stockTriggerInRadius(trig, high, 512.0f, true, 64.0f));
+        float highOk[3] = { 1000.0f, 2000.0f, 100.0f + 63.0f };
+        assert(stockTriggerInRadius(trig, highOk, 512.0f, true, 64.0f));
+        // A companion standing where stock never checks - the whole point:
+        // the SAME predicate, evaluated for ANY player, is what opens walls.
+        float companion[3] = { 1000.0f + 100.0f, 2000.0f, 100.0f };
+        assert(stockTriggerInRadius(trig, companion, 512.0f, true, 64.0f));
+    }
+    // 12d. triggerShouldFire: the stock state machine minus the
+    //      PlayerHarry-only key. Lumos burning, event linked, nobody has
+    //      fired it yet (stock bFirstEventSent or the mod latch), a player
+    //      actually inside the trigger's own radius.
+    assert(triggerShouldFire(true, true, false, true));    // the fire case
+    assert(!triggerShouldFire(false, true, false, true));  // Lumos expired
+    assert(!triggerShouldFire(true, false, false, true));  // no Event linked
+    assert(!triggerShouldFire(true, true, true, true));    // already fired
+    assert(!triggerShouldFire(true, true, false, false));  // nobody in radius
+    // 12e. companionLightShouldTurnOn: a cold light turns on while the state
+    //      is on; a stock-burning light (the lead's) and an already-latched
+    //      light are left alone.
+    assert(companionLightShouldTurnOn(true, false, false));
+    assert(!companionLightShouldTurnOn(true, true, false));   // stock burning
+    assert(!companionLightShouldTurnOn(true, false, true));   // mod latched
+    assert(!companionLightShouldTurnOn(false, false, false)); // Lumos expired
+    // 12f. The stock window is 30 s (fLumosTimeToTurnOff = 30.0), and the
+    //      default duration is that stock value - a replicated companion
+    //      light must not outlive (or undershoot) the lead's window.
+    assert(DefaultLumosDurationMs == 30000);
+    assert(StockLumosDurationMs == DefaultLumosDurationMs);
+    {
+        State s;
+        s.activate(1, 0, DefaultLumosDurationMs);
+        assert(!s.isExpired(29999));
+        assert(s.isExpired(30000));
+    }
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
-              "v66.3 class-token, v66.4 exact-family/chain-proof scan and "
-              "v66.5 wall-bits/follow-light assertions passed");
+              "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
+              "v66.5 wall-bits/follow-light and v67 stock-register/"
+              "trigger-fire assertions passed");
     return 0;
 }

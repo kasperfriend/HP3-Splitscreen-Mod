@@ -7,8 +7,13 @@
 
 namespace hp3lumos {
 
-// Default duration for Lumos in milliseconds if not specified by game (typically 20-30s in HP3)
-static const std::uint32_t DefaultLumosDurationMs = 25000;
+// Default duration for Lumos in milliseconds if not specified by game.
+// v67: aligned with the STOCK value - decompiled LumosLight.uc (HP2 lineage,
+// which HP3 inherits verbatim - the HP3 save chain harry.Wand ->
+// HarryWand.TheLumosLight -> LumosLight proves the same layout) auto-TurnOffs
+// after fLumosTimeToTurnOff = 30.0 seconds.
+static const std::uint32_t DefaultLumosDurationMs = 30000;
+static const std::uint32_t StockLumosDurationMs   = DefaultLumosDurationMs;
 // v66.5: while a stock wand light is genuinely burning, the mod's state
 // follows it in short ratchets - refresh() only ever EXTENDS the expiry, so
 // an infinite-Lumos gargoyle keeps secret walls openable for exactly as
@@ -42,6 +47,161 @@ struct LightProperties {
 inline bool isLightActive(bool bHidden, unsigned char lightType, unsigned char lightBrightness)
 {
     return !bHidden && (lightType != 0) && (lightBrightness > 0);
+}
+
+// ---------------------------------------------------------------------------
+// v67: WHAT STOCK LUMOS ACTUALLY DOES TO THE MAIN CHARACTER
+// (decompiled HP2 lineage LumosLight.uc / LumosTrigger.uc / baseWand.uc /
+// gargoyle.uc - HP3 inherits the same classes; the HP3 save-game chain
+// "harry.Wand -> HarryWand.TheLumosLight -> LumosLight" is verbatim):
+//
+//   gargoyle.HandleSpellLumos -> baseWand(PlayerHarry.Weapon).LumosTurnOn()
+//   -> TheLumosLight.TurnOn():
+//        fLumosTime = 0;
+//        if (PlayerHarry.bLumosOn) return;        <-- single-player global gate
+//        bLumosOn = True; PlayerHarry.bLumosOn = True; Enable('Tick');
+//        TurnDynamicLightOn();                    -> the register below
+//        foreach AllActors(Actor, A) A.OnLumosOn();   arms every LumosTrigger
+//        Particles = Spawn(Class'LumosLightFX', self, , Location);  <- THE
+//                                                    visible wand glow
+//   The wand's own Tick then calls TheLumosLight.UpdateLocation(WandEndPoint)
+//   every frame while TheLumosLight.bLumosOn (light + particles ride the wand
+//   tip), and LumosLight.Tick auto-TurnOff()s after fLumosTimeToTurnOff = 30s
+//   (bInfiniteLumos gargoyles never do). TurnOff(): PlayerHarry.bLumosOn =
+//   False, TurnDynamicLightOff(), broadcast OnLumosOff(), Particles.Destroy().
+//
+//   LumosTrigger (one placed at every secret wall) arms on OnLumosOn and fires
+//   TriggerEvent(Event, self, None) EXACTLY ONCE (bFirstEventSent is never
+//   reset) as soon as PlayerHarry comes within fDistanceCheck (512 default) -
+//   the Event opens the linked wall (a Mover: TriggerToggle, MoveTime=0).
+//   Walls open permanently; nothing fires when the hero leaves the radius
+//   (bEventLeaving defaults False).
+//
+//   THE SPLITSCREEN GAP: that chain hardcodes PlayerHarry everywhere - it
+//   lights the LEAD's wand when anyone's spell hits the gargoyle, and it only
+//   ever measures the LEAD's distance to the wall trigger. A companion never
+//   gets a lit wand and never opens a wall, no matter what the mod pokes.
+// ---------------------------------------------------------------------------
+
+// LumosLight.TurnDynamicLightOn/Off - the exact register the stock script
+// writes. LightBrightness is declared 400 in script; on a byte property that
+// truncates to 255, on a float property it stays 400.0 (the shipped engine is
+// a UE1.5/UE2 hybrid, so the mod detects which representation is live from the
+// class layout - see brightnessIsFloatByLayout).
+static const unsigned char StockLightTypeOn           = 1;     // LT_Steady
+static const unsigned char StockLightEffectOn         = 13;    // LE_NonIncidence
+static const unsigned char StockLightBrightnessOnByte = 255;
+static const float StockLightBrightnessOnFloat        = 400.0f;
+static const unsigned char StockLightHueOn            = 32;
+static const unsigned char StockLightSaturationOn     = 72;
+static const float StockLightRadiusOn                 = 15.0f;
+static const float StockLightRadiusInnerOn            = 5.0f;
+
+struct LumosLightRegister {
+    unsigned char lightType;
+    unsigned char lightEffect;
+    unsigned char brightnessByte;   // meaningful when !brightnessIsFloat
+    float         brightnessFloat;  // meaningful when  brightnessIsFloat
+    unsigned char hue;
+    unsigned char saturation;
+    float         radius;
+    float         radiusInner;
+};
+
+inline LumosLightRegister stockLumosLightOn(void)
+{
+    LumosLightRegister r;
+    r.lightType      = StockLightTypeOn;
+    r.lightEffect    = StockLightEffectOn;
+    r.brightnessByte = StockLightBrightnessOnByte;
+    r.brightnessFloat = StockLightBrightnessOnFloat;
+    r.hue            = StockLightHueOn;
+    r.saturation     = StockLightSaturationOn;
+    r.radius         = StockLightRadiusOn;
+    r.radiusInner    = StockLightRadiusInnerOn;
+    return r;
+}
+
+inline LumosLightRegister stockLumosLightOff(void)
+{
+    LumosLightRegister r;
+    r.lightType      = 0;  // LT_None
+    r.lightEffect    = 0;  // LE_None
+    r.brightnessByte = 0;
+    r.brightnessFloat = 0.0f;
+    r.hue            = 0;
+    r.saturation     = 0;
+    r.radius         = 0.0f;
+    r.radiusInner    = 0.0f;
+    return r;
+}
+
+// LightHue (a byte) is declared directly after LightBrightness: layout delta
+// 1 => both bytes (UE1.5), delta >= 4 => brightness is a float (UE2). This is
+// the only honest tell the mod can read from outside the engine - a wrong
+// guess would either never see the light burn (float read as byte 0x00 of
+// 400.0f) or corrupt the neighbouring hue byte (byte written over a float).
+inline bool brightnessIsFloatByLayout(int offBrightness, int offHue)
+{
+    return offBrightness > 0 && offHue > 0 && (offHue - offBrightness) >= 4;
+}
+
+// LightRadiusInner sits directly beside float LightRadius: adjacent (4) means
+// the same float representation; anything else - do not write it.
+inline bool radiusInnerIsFloatByLayout(int offRadius, int offRadiusInner)
+{
+    if (offRadius <= 0 || offRadiusInner <= 0) return false;
+    int d = offRadiusInner - offRadius;
+    if (d < 0) d = -d;
+    return d == 4;
+}
+
+// Type-aware "is a light burning": float brightness 400.0 read as a byte would
+// be 0x00 and look OFF - the v66.5 detection could never see a stock-burning
+// light on a float-brightness engine.
+inline bool isLightActiveF(bool bHidden, unsigned char lightType, float brightness)
+{
+    return !bHidden && (lightType != 0) && (brightness > 0.0f);
+}
+
+// Stock LumosTrigger.InLumosRadius: VSize(Location - pawnLoc) < fDistanceCheck,
+// with the optional |dZ| < fZDistanceCheck gate (bUseZDistanceCheck).
+inline bool stockTriggerInRadius(const float triggerLoc[3], const float pawnLoc[3],
+                                 float fDistanceCheck, bool useZCheck, float fZDistanceCheck)
+{
+    float dx = pawnLoc[0] - triggerLoc[0];
+    float dy = pawnLoc[1] - triggerLoc[1];
+    float dz = pawnLoc[2] - triggerLoc[2];
+    if (useZCheck) {
+        if (dz < 0) dz = -dz;
+        if (dz >= fZDistanceCheck) return false;
+    }
+    return (dx * dx + dy * dy + dz * dz) < fDistanceCheck * fDistanceCheck;
+}
+
+// Stock defaultproperties of LumosTrigger.
+static const float StockTriggerDistanceCheck  = 512.0f;
+static const float StockTriggerZDistanceCheck = 64.0f;
+
+// The trigger-event fire policy: the stock state machine minus the
+// PlayerHarry-only proximity key. lumosActive = the LumosLight chain is on
+// (the stock OnLumosOn broadcast already armed the trigger), eventLinked = the
+// trigger has a non-empty Event, alreadyFired = stock's bFirstEventSent or the
+// mod's own once-per-level latch, playerNear = ANY tracked player inside the
+// trigger's own radius (stock only ever checks the lead; that check is exactly
+// what companions must replicate).
+inline bool triggerShouldFire(bool lumosActive, bool eventLinked,
+                              bool alreadyFired, bool playerNear)
+{
+    return lumosActive && eventLinked && !alreadyFired && playerNear;
+}
+
+// Per-companion wand-light sync decision: while the mod's Lumos state is on,
+// a companion light that is not burning gets the stock TurnOn register.
+inline bool companionLightShouldTurnOn(bool lumosActive, bool lightBurning,
+                                       bool modAlreadyTurnedOn)
+{
+    return lumosActive && !lightBurning && !modAlreadyTurnedOn;
 }
 
 struct State {
