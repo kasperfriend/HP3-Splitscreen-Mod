@@ -135,12 +135,16 @@ int main()
     assert(!isLumosTriggerClassToken("LumosSparklesEmitter"));
     // 10b. Every other within-token substring look-alike rejects too, even
     //    names that v66.3 deliberately accepted: membership by name is closed
-    //    to the two proven stock classes; differently-named subclasses can
-    //    only re-enter through the class-chain pointer proof (dllmain.cpp
-    //    lumosChainProves), exercised via chainContainsAny below.
-    assert(!isLumosTriggerObject("LumosSparkles HP3_InsideHub.LumosSparkles2"));
+    //    to the proven stock classes; differently-named subclasses can only
+    //    re-enter through the class-chain pointer proof (dllmain.cpp
+    //    lumosChainProves, v69: including the Engine.Triggers anchor),
+    //    exercised via chainContainsAny below.
+    //    v69 UPDATE: "LumosSparkles" IS a stock trigger family member -
+    //    Triggers/LumosSparkles.uc in the HP2 decompile HP3 inherits (the
+    //    v66.4 rule rejected the real placed class by name; see section 16).
+    assert(isLumosTriggerObject("LumosSparkles HP3_InsideHub.LumosSparkles2"));
+    assert(isLumosTriggerClassToken("LumosSparkles"));
     assert(!isLumosTriggerObject("LumosTriggerLarge MyLevel.LumosTriggerLarge0"));
-    assert(!isLumosTriggerClassToken("LumosSparkles"));
     assert(!isLumosTriggerClassToken("LumosTriggerLarge"));
     assert(!isLumosTriggerObject("LumosLight HP3_InsideHub.LumosLight0"));
     assert(!isLumosTriggerObject("LumosSparklesTriggerIcon hgame.Um"));
@@ -425,9 +429,45 @@ int main()
     assert(DispatchRetryMs > 0 && DispatchRetryMs <= 5000);
     assert(WallActorNearRadius > 0.0f);
 
+    // 15. v69: the stock Event==Tag linkage is the DEFINITIVE secret-wall
+    //     pairing. LumosTrigger fires TriggerEvent(Event, self, None) and
+    //     the engine dispatches that Event to every actor whose Tag equals
+    //     it - raw 4-byte name-index equality, no distance involved. A
+    //     large wall whose actor centre sits >900 units from its trigger
+    //     failed the v66.5 radius-only pairing and was classified ORDINARY
+    //     (never opened by the SetCollision fallback, silently).
+    assert(wallEventLinksToTrigger(7u, 7u));    // linked
+    assert(!wallEventLinksToTrigger(7u, 8u));   // different names
+    assert(!wallEventLinksToTrigger(0u, 7u));   // wall has no Tag
+    assert(!wallEventLinksToTrigger(7u, 0u));   // trigger has no Event
+    assert(!wallEventLinksToTrigger(0u, 0u));   // neither
+
+    // 16. v69: the exact-token trigger admission gains the decompile's real
+    //     placed sparkles class "LumosSparkles" (Triggers/LumosSparkles.uc -
+    //     the v66.4 rule rejected it by name). The crash-history impostors
+    //     stay rejected: "LumosSparklesEmitter" is an Engine.Emitter
+    //     subclass (second 2026-09-09 GPF receiver), "LumosTriggerLarge"
+    //     joins - if HP3 places it - only through the chain-pointer proof,
+    //     never through a name.
+    assert(isLumosTriggerClassToken("LumosTrigger"));
+    assert(isLumosTriggerClassToken("LumosSparklesTrigger"));
+    assert(isLumosTriggerClassToken("LumosSparkles"));
+    assert(!isLumosTriggerClassToken("LumosSparklesEmitter"));
+    assert(!isLumosTriggerClassToken("LumosTriggerLarge"));
+    assert(!isLumosTriggerClassToken("LumosLight"));
+    assert(!isLumosTriggerClassToken("Trigger"));
+    assert(!isLumosTriggerClassToken(""));
+    // ...and the name-impostor filter in isLumosTriggerObject still rejects
+    // the verbatim v66.3/v66.4 crash receivers.
+    assert(isLumosTriggerObject("LumosSparkles HP3_InsideHub.LumosSparkles0"));
+    assert(!isLumosTriggerObject("LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0"));
+    assert(!isLumosTriggerObject("Texture hgame.LumosTriggerIcon"));
+    assert(!isLumosTriggerObject("Class hgame.LumosTrigger"));
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
               "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
               "v66.5 wall-bits/follow-light, v67 stock-register/"
-              "trigger-fire and v68 proxied-wall/retry assertions passed");
+              "trigger-fire, v68 proxied-wall/retry and v69 Event==Tag "
+              "linkage / LumosSparkles token assertions passed");
     return 0;
 }
