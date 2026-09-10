@@ -371,6 +371,24 @@ inline WallCollisionBits unpackWallBits(unsigned char packed)
     return b;
 }
 
+// v69: THE STOCK TRIGGER->WALL LINKAGE. Stock LumosTrigger fires
+// TriggerEvent(Event, self, None) and the ENGINE dispatches that Event to
+// every live actor whose Tag equals it (Engine.Actor.TriggerEvent walks
+// GObjObjects comparing Name fields). So the DEFINITIVE proof that a wall
+// is the secret wall of a given trigger is the raw name-index equality
+// wall.Tag == trigger.Event - not distance. Both values are plain 4-byte
+// name indexes in this engine (Engine.Actor.Tag / Engine.Actor.Event), so
+// the comparison is two guarded dword reads, no string work. A wall linked
+// by Event is a secret wall no matter how far away its actor Location sits
+// from the trigger (a large wall's centre can sit >900 units out, which
+// silently failed the v66.5 SecretWallPairRadius pairing and left the
+// wall unclassified, hence never opened by the SetCollision fallback).
+// wallTag==0 (NAME_None) never links - an unlinked wall stays ordinary.
+inline bool wallEventLinksToTrigger(unsigned wallTag, unsigned trigEvent)
+{
+    return wallTag != 0 && trigEvent != 0 && wallTag == trigEvent;
+}
+
 // v66.5: the only open condition. secretCandidate=false keeps every
 // ordinary GenericColObj/KWBlockingVolume solid - the v66.x rule opened ANY
 // cached wall within 300 units of ANY player while Lumos was on.
@@ -462,18 +480,23 @@ inline bool tokenEquals(const char* a, const char* b)
     return *a == 0 && *b == 0;
 }
 
-// v66.4: EXACT class-token equality against the two classes the stock game
-// places at secret walls. NO substring anywhere: "LumosSparklesEmitter" (the
+// v69: EXACT class-token equality against the trigger classes the stock
+// games place at secret walls. Ground truth (HP2 decompile, HP3 inherits):
+// Triggers/LumosTrigger.uc and Triggers/LumosSparkles.uc - the sparkles
+// class is named "LumosSparkles", NOT "LumosSparklesTrigger" (the v66.4
+// rule rejected the real placed class if HP3 ships that name, emptying the
+// trigger cache). "LumosSparklesEmitter" (an Engine.Emitter subclass - the
 // second 2026-09-09 GPF receiver), "LumosTriggerLarge", "LumosLight",
-// "LumosSpell" and every other look-alike reject here. A true subclass of
-// LumosTrigger/LumosSparklesTrigger re-enters ONLY via the dllmain.cpp class
-// chain proof (lumosChainProves), which pointer-compares the receiver's
-// UObject::Class -> UStruct::SuperField chain against the resolved family
-// class objects - the one comparison a name can never fake.
+// "LumosSpell" and every other look-alike still reject here. A true
+// subclass of the trigger family re-enters via the dllmain.cpp class-chain
+// proof (lumosChainProves, pointer comparison against the resolved family
+// class objects and the v69 Engine.Triggers family anchor), never through
+// a name.
 inline bool isLumosTriggerClassToken(const char* clsTok)
 {
     return tokenEquals(clsTok, "LumosTrigger") ||
-           tokenEquals(clsTok, "LumosSparklesTrigger");
+           tokenEquals(clsTok, "LumosSparklesTrigger") ||
+           tokenEquals(clsTok, "LumosSparkles");
 }
 
 // Same exact-token rule for the secret walls the Lumos triggers unblock.

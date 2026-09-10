@@ -2046,3 +2046,142 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       the SetCollision fallback must do the work - expect
       "[lumos] v66.5 opened secret wall #k" with the trigger-proxied test.
     * The window ends 30 s after the light: "auto-off after stock 30s".
+
+==========================================================================
+27. V69 - ROUND 3: THE STOCK SCRIPT RUNS THE GLOW; EVENT==TAG WALL
+    LINKAGE; THE EMPTY-WEAPON RIDE KILLER (2026-09-10)
+==========================================================================
+
+- FIELD REPORT (v68, same HP3_InsideHub gargoyle test as v66.5/v67): the
+  lead still gets the native wand glow, P2/P3 wands still never glow and
+  P2/P3 still cannot pass the revealed secret walls.
+
+- METHOD: this round was checked against the ACTUAL HP2 decompile
+  (github.com/metallicafan212/HP2UScriptDecompile master, cloned and read
+  verbatim: HGame/Classes/Misc/LumosLight.uc, HGame/Classes/baseWand.uc,
+  HGame/Classes/Misc/gargoyle.uc, HGame/Classes/Triggers/LumosTrigger.uc,
+  HGame/Classes/Triggers/LumosSparkles.uc, HPParticle/Classes/
+  LumosLightFX.uc). Four defects fell out.
+
+- DEFECT 1 - THE GLOW WAS A CHAIN OF RUNTIME GUESSES (why three builds in
+  a row could all "look right" and still ship dark wands). Stock TurnOn is
+  ONE scripted call that does everything:
+      bLumosOn=True; PlayerHarry.bLumosOn=True; Enable('Tick');
+      TurnDynamicLightOn(); foreach AllActors A.OnLumosOn();
+      Particles = Spawn(Class'LumosLightFX', self,, Location);
+      Particles.EnableEmission(True);
+  v66..v68 replayed it by hand and needed EVERY piece to resolve at
+  runtime: g_clsLumosLightFX (HPParticle.LumosLightFX by exact path), the
+  LumosLight.Particles offset, the ParticleFX.bEmit offset+bitmask, the
+  execSpawn bytecode synthesis - and bLumosOn was gated on the spawned FX
+  being live. ANY single miss = dark wand, dead ride, no log contradiction.
+  FIX (the strategy change): for each companion with a cold own light the
+  mod now calls the light's OWN stock script - ProcessEvent(light,
+  Function hgame.LumosLight.TurnOn) - the exact bytecode that glows P1's
+  wand natively. Zero dependency on the mod resolving any glow piece.
+  The one stock behaviour the call cannot pass by itself is the
+  single-player gate `if (PlayerHarry.bLumosOn) return;` - PlayerHarry is
+  the LIGHT's own var (LumosLight.PreBeginPlay: PlayerHarry = harry(Level.
+  PlayerHarryActor)), i.e. the LEAD, already burning by sync time. The
+  gate dance: mask every driven pawn's bLumosOn bit (read, clear), make
+  the ONE synchronous ProcessEvent call (no other script can run mid-call
+  on the game thread), restore the saved bits; TurnOn re-asserts
+  PlayerHarry.bLumosOn=True itself. The mod then RE-READS the light: if it
+  still reads cold (unreadable gate var -> PlayerHarry None -> script
+  abort, or fn unresolved) the v68 register+spawn replication runs as the
+  automatic fallback. TurnOff gets the same treatment on state expiry
+  (stock teardown INCLUDING the OnLumosOff broadcast the register replay
+  never sent). A stock-lit light observed cold is the stock 30 s auto-off:
+  latched one-shot, never re-timed or re-lit by the mod.
+
+- DEFECT 2 - THE EMPTY-WEAPON RIDE KILLER (a stock-code fact that made
+  every previous glow spawn pointless the moment the ride ran).
+  baseWand.Tick:
+      local Vector WandEndPoint;      <- starts (0,0,0)
+      if ( (Pawn(Owner) != None) && (Pawn(Owner).Weapon == self) ) {
+          ... WandEndPoint = GetWandEndPoint(); ...
+      }
+      if ( TheLumosLight.bLumosOn )
+          TheLumosLight.UpdateLocation(WandEndPoint);   <- SetLocation(light)
+                                                         Particles.SetLocation
+  WandEndPoint is assigned ONLY inside the Weapon==self branch. A
+  companion whose Engine.Pawn.Weapon slot is EMPTY therefore had the stock
+  ride write the UNASSIGNED LOCAL (0,0,0) over the light and its Particles
+  EVERY FRAME - light and glow teleported to the world origin, wand dark,
+  no matter how correctly the mod had spawned and attached the glow.
+  (And UpdateLocation has no None-check on Particles, so a None Particles
+  aborts UpdateLocation after the light's SetLocation - the light fights
+  the (0,0,0) ride alone while the glow is gone entirely.) FIX: while the
+  replication is active, an EMPTY Weapon slot is filled ONCE with the
+  companion's own wand actor (a read-back check; an existing Weapon is
+  never overwritten) so the stock ride target exists - then the stock
+  wand Tick moves light+glow onto the companion's wand tip exactly like
+  stock does for the lead. The 300-unit self-heal stays as the no-ride
+  safety net and now carries the tracked glow with the light.
+
+- DEFECT 3 - SECRET-WALL PAIRING IGNORED THE STOCK LINKAGE. LumosTrigger
+  opens its wall with TriggerEvent(Event, self, None); the engine
+  dispatches that Event to every actor whose Tag EQUALS the Event name -
+  raw 4-byte name-index equality, zero distance involved. The v66.5
+  pairing measured ONLY distance (SecretWallPairRadius = 900 from the
+  trigger): a large wall whose actor centre sits >900 units from its
+  trigger was classified ORDINARY, so the octree-safe SetCollision
+  fallback never even considered it - a silent lockout with no log line.
+  FIX: pairing now FIRST tests wall.Tag == trigger.Event (two guarded
+  dword reads, hp3lumos::wallEventLinksToTrigger, regression-tested); the
+  900-unit radius pairing stays as the secondary heuristic. The scan log
+  line splits the counts ("v69 N by Event==Tag stock linkage, M by
+  proximity").
+
+- DEFECT 4 - THE EXACT-TOKEN TRIGGER CACHE COULD BE EMPTY BY NAME ALONE.
+  The decompile's real placed sparkles class is "LumosSparkles"
+  (Triggers/LumosSparkles.uc) - NOT "LumosSparklesTrigger"; the v66.4
+  exact-name rule rejected the real class, and any HP3-only subclass name
+  (e.g. "LumosTriggerLarge") too. A level whose only Lumos triggers carry
+  such names cached ZERO triggers: no pairing, no fire, no secret walls -
+  again silently. FIX: "LumosSparkles" joins the exact-token list
+  (ground truth from the decompile), and Lumos-named look-alikes can now
+  prove themselves against the Engine.Triggers family anchor
+  (LumosTrigger and LumosSparkles both declare `extends Triggers`) via
+  the chain POINTER proof - a name can never fake a pointer, and the
+  crash-history impostors still reject (LumosSparklesEmitter is an
+  Engine.Emitter subclass, textures/UClasses have no Triggers in their
+  chain, and "LumosLight" never even matches the Lumos-trigger look-alike
+  token filter). The anchor resolves in the DEFERRED table (a one-shot
+  engine-block lookup would repeat the v68 menu-time miss).
+
+- VERIFICATION: tests/run.sh ALL suites pass. The lumos suite gains
+  section 15 (wallEventLinksToTrigger: linked, mismatched, zero-Tag,
+  zero-Event, both-zero) and section 16 (LumosSparkles exact token
+  admitted; LumosSparklesEmitter / LumosTriggerLarge / LumosLight /
+  plain Trigger / empty all rejected; the verbatim v66.3/v66.4 crash
+  receivers still reject in isLumosTriggerObject), and 10b is updated to
+  the decompile-correct rule. tools/hostcheck/check.sh: dllmain.cpp
+  syntax clean (-Wall -Wextra, stub Win32 surface). The Windows DLL could
+  NOT be rebuilt in this sandbox (no i686 MinGW toolchain) - build via CI
+  (build-release.yml) and confirm line 2 of hp3mod.log says build v69.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v69.
+    * "[lumos] v69 level-side fields resolved: ... TurnOn=........
+      TurnOff=........" - TurnOn/TurnOff are the stock script function
+      pointers; if they are 0 the v68 fallback carries the glow instead
+      (the log says which path ran).
+    * The scan line now reads "... v69 N by Event==Tag stock linkage,
+      M by proximity ..." - N+M must be >= 1 in a level with a Lumos
+      secret wall. N=0 AND M=0 means the level's walls never got paired:
+      report that line.
+    * Cast Lumos as P2 at the gargoyle: expect
+      "    -> ProcessEvent LumosLight.TurnOn [stock replication]" then
+      "[lumos] v69 P1.. nothing (stock) / P%d TheLumosLight turned ON via
+      the STOCK TurnOn script ... glow=0x..." - P2/P3 wand tips glow and
+      the glow FOLLOWS each companion's wand (stock ride). If instead the
+      log shows "stock TurnOn did not engage" or "v68 fallback register",
+      the glow is on the fallback path - still glows, but report it.
+    * Walk P2 into the revealed wall: expect either "[lumos] v68
+      TriggerEvent fired (native execTriggerEvent)" / "Tag walk fires
+      <real Trigger>" (stock Mover opens - permanent, like stock), or
+      "[lumos] v66.5 opened secret wall #k" (SetCollision proxy opens
+      while the window burns). P2/P3 pass through.
+    * After 30 s: "[lumos] v69 P%d light went cold on its own (stock Tick
+      auto-off ...)" for stock-lit companions - the window ends stock-side.

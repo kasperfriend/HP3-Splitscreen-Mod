@@ -24,7 +24,67 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v68`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v69`.
+
+### v69 Lumos for P2/P3, round 3: the stock script runs the glow
+
+The v68 field report (same HP3_InsideHub gargoyle test) was unchanged: the
+lead's wand glows natively, P2/P3 wands never glow, P2/P3 cannot pass the
+revealed walls. This round was verified directly against the actual HP2
+decompile (metallicafan212/HP2UScriptDecompile: `LumosLight.uc`,
+`baseWand.uc`, `gargoyle.uc`, `LumosTrigger.uc`, `LumosSparkles.uc`), and it
+exposed why the v66..v68 hand-rolled replication could never be trusted, plus
+two genuine wall-path bugs:
+
+1. **The glow was a chain of runtime guesses; now the stock script runs it.**
+   Stock `TurnOn` is what glows P1's wand: it writes the dynamic-light
+   register, enables the light's own Tick (stock 30 s auto-off, particle
+   scaling, the `OnLumosOn`/`OnLumosOff` broadcasts), and spawns the visible
+   `LumosLightFX` glow into the light's `Particles` property. v66..v68 tried
+   to replay that by hand and needed EVERY piece to resolve at runtime — the
+   `LumosLightFX` class, the `Particles` offset, the `bEmit` bit, a
+   synthesized `Spawn` — and even gated `bLumosOn` on the spawned FX being
+   alive. Any single miss left the companion wand dark. v69 instead calls the
+   light's own stock `Function hgame.LumosLight.TurnOn` on each companion's
+   `TheLumosLight` via `ProcessEvent` — the game's own bytecode does
+   everything, exactly like P1's native glow. The only stock behaviour the
+   call cannot pass by itself is the single-player gate
+   (`if (PlayerHarry.bLumosOn) return;` — `PlayerHarry` is the light's own
+   var, the LEAD, already lit by the gargoyle chain), so the mod masks the
+   lead's `bLumosOn` bit for the one synchronous script call and restores it
+   right after; `TurnOn` re-asserts it stock-side anyway. If the stock call
+   does not engage (verified by re-reading the light), the v68 register
+   replication runs automatically as the fallback.
+2. **The stock wand-Tick ride needs `Pawn.Weapon == wand`.** `baseWand.Tick`
+   only computes `WandEndPoint` — where `UpdateLocation` rides the light AND
+   its glow — inside `if ((Pawn(Owner) != None) && (Pawn(Owner).Weapon ==
+   self))`. A companion with an EMPTY Weapon slot made the stock ride write
+   the unassigned local vector (0,0,0) over the light and glow every frame —
+   the glow parked at the world origin, the wand dark, no matter what the mod
+   spawned. v69 fills an empty Weapon slot with the companion's own wand
+   actor (never overwrites an existing Weapon) so the stock ride has a
+   target.
+3. **Secret walls are now paired by the stock `Event == Tag` linkage.** The
+   stock trigger opens its wall by firing `TriggerEvent(Event, self, None)`,
+   which the engine dispatches to every actor whose `Tag` equals that Event —
+   a raw name-index equality, nothing to do with distance. The v66.5 pairing
+   measured only distance (900 units); a large wall whose actor centre sits
+   farther out was classified ORDINARY and the SetCollision fallback never
+   even considered it. v69 pairs by `wall.Tag == trigger.Event` first,
+   distance second.
+4. **The trigger cache could be empty by name alone.** The decompile's real
+   placed sparkles class is `LumosSparkles` — not `LumosSparklesTrigger` —
+   which the v66.4 exact-name rule rejected, and any HP3-only subclass name
+   would have been rejected too. v69 admits `LumosSparkles` by exact token
+   and chain-proves Lumos-named look-alikes against the `Engine.Triggers`
+   family anchor (both stock trigger classes declare `extends Triggers`) — a
+   pointer proof, so the crash-history impostors (`LumosSparklesEmitter`,
+   textures, the `LumosLight` itself) still reject.
+
+A stock-lit companion light that goes cold on its own is now observed as the
+stock 30 s auto-off (one shot per cast, as stock); state expiry calls the
+stock `TurnOff` script on stock-lit lights, so the `OnLumosOff` broadcast the
+register replay never sent arms the trigger state machines down correctly.
 
 ### v68 Lumos for P2/P3, round 2: why v67 still didn't glow or open walls
 
