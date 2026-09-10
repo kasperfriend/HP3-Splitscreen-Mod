@@ -9,9 +9,24 @@ namespace hp3lumos {
 
 // Default duration for Lumos in milliseconds if not specified by game (typically 20-30s in HP3)
 static const std::uint32_t DefaultLumosDurationMs = 25000;
+// v66.5: while a stock wand light is genuinely burning, the mod's state
+// follows it in short ratchets - refresh() only ever EXTENDS the expiry, so
+// an infinite-Lumos gargoyle keeps secret walls openable for exactly as
+// long as its light burns, and the state dies within a second of the last
+// light instead of DefaultLumosDurationMs after it.
+static const std::uint32_t FollowLightRefreshMs = 1000;
 // Proximity radius (units) to detect and activate Lumos triggers/sparkles around secret walls
 static const float DefaultTriggerRadius = 350.0f;
 static const float DefaultTriggerHeight = 150.0f;
+// v66.5: a cached wall only counts as a SECRET wall if a cached
+// LumosTrigger / LumosSparklesTrigger sits within this radius of it - the
+// stock game places one of those at every wall Lumos reveals (its own
+// InLumosRadius check measures PlayerHarry's distance from THAT actor, HP2
+// default 512, and a large wall's centre can sit a few hundred units past
+// its surface). Every other GenericColObj / KWBlockingVolume in the level
+// is an ordinary collision proxy (railings, camera blockers, invisible
+// bounds - 80 of them cached in HP3_InsideHub) and must never be opened.
+static const float SecretWallPairRadius = 900.0f;
 
 struct LightProperties {
     unsigned char lightType;        // 0 = LT_None, 1 = LT_Steady
@@ -57,7 +72,11 @@ struct State {
     {
         if (active) {
             std::uint32_t newExpire = nowMs + durationMs;
-            if (newExpire > expireTick) {
+            // Wrap-safe "strictly later" test, the same comparison isExpired
+            // uses: a plain > across the 32-bit tick wrap would treat a
+            // refresh from just before the wrap as later than one just after
+            // it and move the expiry BACKWARDS.
+            if (static_cast<std::int32_t>(newExpire - expireTick) > 0) {
                 expireTick = newExpire;
             }
         } else {
@@ -117,9 +136,71 @@ inline bool anyPlayerNearTrigger(const float playerPositions[][3], int numPlayer
     return false;
 }
 
+// v66.1 policy, retained for the regression suite. SUPERSEDED at v66.5 by
+// wallShouldBeOpen below, which adds the secretCandidate gate: proximity to
+// a player alone is no longer enough, the wall must also be paired to a
+// lumos trigger, or it is an ordinary collision proxy.
 inline bool shouldSecretWallBePassable(bool lumosActive, bool playerNear)
 {
     return lumosActive && playerNear;
+}
+
+// ---------------------------------------------------------------------------
+// v66.5 wall lifecycle policy. The v66..v66.4 replication wrote the
+// bCollideActors/bBlockActors/bBlockPlayers BITS directly into cached wall
+// actors. The engine resolves actor collision through the collision OCTREE,
+// and only the native Engine.Actor.SetCollision ever adds or removes an
+// actor from it - so a poked wall kept blocking (the field report: "spell
+// works, but I still can't go through wall"), and when the level was
+// destroyed the octree destructor walked its still-present members and hit
+// the engine's own consistency check on a member whose flag the mod had
+// cleared:
+//   Assertion failed: Actor->bCollideActors [File:UnOctree.cpp] [Line 1598]
+//   FCollisionOctree::RemoveActor <- FOctreeNode::RemoveAllActors <- ...
+//   <- FCollisionOctree::~FCollisionOctree <- ULevel::Destroy
+//   <- ... <- UObject::StaticExit <- appPreExit        (quit-the-game crash)
+// Every wall transition therefore goes through the engine native now, and
+// the policy below only decides WHEN: a wall may open while Lumos is
+// active, the wall is a proven secret wall (paired to a lumos trigger at
+// scan time) and a player is actually at it.
+// ---------------------------------------------------------------------------
+
+// Packed pristine collision bits for one wall, snapshotted once per level
+// at scan time so a close restores exactly what the level loaded with.
+// WallBitsUnknown marks a wall whose bits could not be read (or a
+// non-candidate wall): it is never opened and never written.
+static const unsigned char WallBitsUnknown = 0xFF;
+
+struct WallCollisionBits {
+    bool collideActors;
+    bool blockActors;
+    bool blockPlayers;
+};
+
+inline unsigned char packWallBits(bool collideActors, bool blockActors,
+                                  bool blockPlayers)
+{
+    return (unsigned char)((collideActors  ? 1 : 0) |
+                           (blockActors    ? 2 : 0) |
+                           (blockPlayers   ? 4 : 0));
+}
+
+inline WallCollisionBits unpackWallBits(unsigned char packed)
+{
+    WallCollisionBits b;
+    b.collideActors = (packed & 1) != 0;
+    b.blockActors   = (packed & 2) != 0;
+    b.blockPlayers  = (packed & 4) != 0;
+    return b;
+}
+
+// v66.5: the only open condition. secretCandidate=false keeps every
+// ordinary GenericColObj/KWBlockingVolume solid - the v66.x rule opened ANY
+// cached wall within 300 units of ANY player while Lumos was on.
+inline bool wallShouldBeOpen(bool lumosActive, bool secretCandidate,
+                             bool playerNear)
+{
+    return lumosActive && secretCandidate && playerNear;
 }
 
 // ---------------------------------------------------------------------------

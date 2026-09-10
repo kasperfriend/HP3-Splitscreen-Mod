@@ -50,8 +50,16 @@ jobs:
         env:
           CXX: g++
         run: |
+          set -o pipefail
           sed -i 's/\r$//' build.sh
-          bash build.sh
+          if bash build.sh 2>&1 | tee build.log; then
+            echo "d3d8.dll built"
+          else
+            echo "build failed - surfacing compiler errors as annotations"
+            grep -E "error:|warning:|undefined reference|cannot find" build.log | head -25 | sed 's/^/::error::/' || true
+            echo "::error::Build d3d8.dll failed - see build.log excerpt above"
+            exit 1
+          fi
 
       - name: Assemble release package
         if: github.event_name == 'workflow_dispatch'
