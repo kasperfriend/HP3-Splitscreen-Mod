@@ -32,6 +32,20 @@ static const float DefaultTriggerHeight = 150.0f;
 // is an ordinary collision proxy (railings, camera blockers, invisible
 // bounds - 80 of them cached in HP3_InsideHub) and must never be opened.
 static const float SecretWallPairRadius = 900.0f;
+// v68: the player-near-the-WALL-actor fallback radius/height. A large
+// secret wall's own Location can sit far from the surface a player presses
+// against, so this test alone is unreliable; v68 primarily asks the wall's
+// PAIRED TRIGGER (stock's own radius check) and keeps this as a secondary.
+static const float WallActorNearRadius  = 350.0f;
+static const float WallActorNearHeight  = 150.0f;
+// v68 retry cadences (ms) for the level-side field resolution, the
+// nothing-found-yet level scan, and a trigger dispatch that found no
+// receiver. All replace "one-shot at first call" or "latch the failure
+// forever" semantics that silently disabled the Lumos replication on
+// hardware.
+static const std::uint32_t ResolveRetryMs   = 1000;
+static const std::uint32_t EmptyScanRetryMs = 1000;
+static const std::uint32_t DispatchRetryMs  = 1000;
 
 struct LightProperties {
     unsigned char lightType;        // 0 = LT_None, 1 = LT_Steady
@@ -63,10 +77,13 @@ inline bool isLightActive(bool bHidden, unsigned char lightType, unsigned char l
 //        TurnDynamicLightOn();                    -> the register below
 //        foreach AllActors(Actor, A) A.OnLumosOn();   arms every LumosTrigger
 //        Particles = Spawn(Class'LumosLightFX', self, , Location);  <- THE
-//                                                    visible wand glow
+//           visible wand glow; TurnOn() then Particles.EnableEmission(True)
+//           and stores it in LumosLight.Particles
 //   The wand's own Tick then calls TheLumosLight.UpdateLocation(WandEndPoint)
-//   every frame while TheLumosLight.bLumosOn (light + particles ride the wand
-//   tip), and LumosLight.Tick auto-TurnOff()s after fLumosTimeToTurnOff = 30s
+//   every frame while TheLumosLight.bLumosOn (UpdateLocation SetLocations
+//   BOTH the light and its Particles property - the glow rides the wand tip
+//   through the light's Particles pointer), and LumosLight.Tick auto-TurnOff()s
+//   after fLumosTimeToTurnOff = 30s
 //   (bInfiniteLumos gargoyles never do). TurnOff(): PlayerHarry.bLumosOn =
 //   False, TurnDynamicLightOff(), broadcast OnLumosOff(), Particles.Destroy().
 //
@@ -361,6 +378,20 @@ inline bool wallShouldBeOpen(bool lumosActive, bool secretCandidate,
                              bool playerNear)
 {
     return lumosActive && secretCandidate && playerNear;
+}
+
+// v68: the open condition with STOCK's own proximity key. playerNearTrigger
+// means a tracked player stands inside the wall's PAIRED LumosTrigger radius
+// (the exact stock InLumosRadius check, measured from the trigger, not from
+// the wall actor - a large wall's Location can sit far from the surface a
+// player presses against); playerNearWall is the v66.5 wall-actor proximity
+// fallback. Either proves the player is at the wall the stock trigger would
+// have opened for PlayerHarry.
+inline bool wallShouldOpenProxied(bool lumosActive, bool secretCandidate,
+                                  bool playerNearTrigger, bool playerNearWall)
+{
+    return lumosActive && secretCandidate &&
+           (playerNearTrigger || playerNearWall);
 }
 
 // ---------------------------------------------------------------------------

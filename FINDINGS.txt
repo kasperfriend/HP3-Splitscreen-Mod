@@ -1926,3 +1926,123 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       stuck pawn, live index, frame carve, etc.).
     * dllmain.cpp structurally clean: braces/parens balanced, declaration
       order audited, -Wall -Wextra silent.
+
+==========================================================================
+26. V68 - WHY V67 STILL HAD NO P2/P3 GLOW AND NO WALL PASS: THE MENU-TIME
+    RESOLUTION CACHE, THE UNATTACHED GLOW, THE NO-OP DISPATCH LATCH (2026-09-10)
+==========================================================================
+
+- FIELD REPORT (v67, same HP3_InsideHub gargoyle test as v66.5): the main
+  character still gets the stock wand glow, but P2/P3 wands still never
+  glow and P2/P3 still cannot walk through the revealed secret walls.
+
+- THE THREE DEFECTS (all found by cross-checking the v66.5 hardware log
+  against the v67 code, then verified against the ACTUAL HP2 decompile -
+  metallicafan212/HP2UScriptDecompile master: LumosLight.uc, baseWand.uc,
+  gargoyle.uc, LumosTrigger.uc, LumosSparkles.uc, HPParticle/LumosLightFX.uc):
+
+  1. MENU-TIME ONE-SHOT FIELD RESOLUTION (the session-killer).
+     resolveLumosFields was one-shot (static sResolved), and lumosTick runs
+     every rendered frame INCLUDING THE MAIN MENU (the v66.1 perf finding
+     documented that). The first resolution therefore happened before
+     hgame/HPParticle/KWBlockingVolume were loaded. The v66.5 hardware log
+     shows exactly this state: the family classes logged 3 of 4 NULL (only
+     the menu-loaded KWGame.GenericColObj resolved) and
+     TheLumosLight=+0xFFFFFFFF. Every hgame-side field was then cached
+     NULL/-1 FOR THE WHOLE SESSION:
+       g_clsLumosLightFX=NULL   -> the glow spawn block was dead code;
+       g_offLumosBOn=-1         -> the wand Tick never rode the light;
+       g_offTrig*=-1            -> trigger radii/bFirstEventSent unreachable;
+       family class anchors NULL -> chain-proof admission dead.
+     This alone explains both field symptoms: no replicated glow could ever
+     spawn, and the stock wand Tick (which relocates light AND Particles via
+     UpdateLocation while bLumosOn) never engaged for companions.
+     FIX: engine-side fields (Engine.Actor.*, exports) stay one-shot; every
+     hgame/HPParticle/KWGame-side field and class now resolves through ONE
+     combined table pass (a single GetFullName walk with a per-object path
+     match list, incl. fallback chains - baseWand/HarryWand.TheLumosLight,
+     HPParticle/hgame LumosLightFX, harry/HPawn/HPCharacter.bLumosOn),
+     retried at 1 Hz while anything is pending, with a hardware-log line
+     "[lumos] v68 level-side fields resolved/partial: ..." naming every
+     resolved offset/pointer.
+
+  2. THE GLOW NEVER RODE THE WAND. The decompile shows stock TurnOn:
+       Particles = Spawn(Class'LumosLightFX', self,, Location);
+       Particles.EnableEmission(True);
+     and baseWand.Tick: if (TheLumosLight.bLumosOn)
+       TheLumosLight.UpdateLocation(WandEndPoint)  -> SetLocation(light)
+     + Particles.SetLocation(NewLocation) - the glow rides the wand tip
+     THROUGH the light's Particles pointer. v67 spawned the FX but never
+     stored it in the light's Particles property (and never wrote bEmit),
+     so the stock ride could never move the mod's glow and the emission
+     state was left to chance.
+     FIX: the replicated TurnOn now replays the stock sequence exactly:
+     TurnDynamicLightOn register -> nativeSetLocation seed near the owner ->
+     Spawn LumosLightFX owned by the light -> bEmit=True (property write,
+     the StartGlowingWand-approved path) -> write the FX into the light's
+     Particles -> ONLY THEN bLumosOn=True. bLumosOn is re-asserted every
+     frame while the mod owns the light AND a live glow is attached (the
+     bit is gated on the glow because the wand Tick dereferences Particles
+     every frame while the bit reads True). TurnOff / 30s auto-off reverse
+     the order: bLumosOn=False first, destroy the glow, null Particles. The
+     300-unit self-heal stays as the safety net when the ride is unavailable.
+
+  3. THE WALL DISPATCH COULD NO-OP AND LATCH. v67's lumosFireTriggerEvent
+     ran the manual Tag walk FIRST. When a receiver's most-derived Trigger
+     resolved to the empty Engine.Actor base event (the KWGame lineage
+     walls - GenericColObj/KWBlockingVolume have empty Trigger overrides -
+     and any state-declared Trigger the class-level lookup cannot see, e.g.
+     a UE2 Mover's TriggerToggle.Trigger), the walk still counted it as a
+     fire, LATCHED the once-per-level flag, logged "TriggerEvent fired ...
+     wall opens" and suppressed the engine native forever. The wall stayed
+     solid while the log claimed success.
+     FIX: dispatch is now NATIVE execTriggerEvent first (the exact stock
+     call, which resolves the operative Trigger including state-declared
+     ones); the manual Tag walk is the fallback and now (a) skips receivers
+     whose own chain declares no Trigger (no more counted no-ops), (b) finds
+     state-declared Trigger functions (Pkg.Class.State.Trigger, most-derived
+     declaring class wins), (c) logs the exact function path it runs. A
+     failed fire no longer latches: it retries at 1 Hz
+     (g_lumosTrigNextTryAt), so a linkage that appears late is not lost.
+
+- TWO SECONDARY V68 HARDENINGS (both from the same audit):
+  * The SetCollision wall fallback's player-near test measured from the
+    WALL ACTOR's Location (300 uu). A large wall's Location can sit far
+    past the surface a player presses against, so the open could never
+    trigger even with the state engaged. The test now measures from the
+    wall's PAIRED TRIGGER with the trigger's own fDistanceCheck /
+    fZDistanceCheck (the stock InLumosRadius condition the level designer
+    tuned), plus the wall-actor proximity as a secondary
+    (hp3lumos::wallShouldOpenProxied, regression-tested; pair index stored
+    at scan time in g_lumosWallTrig).
+  * A level scan that found nothing (the menu case) was final - if no
+    camera-package invalidation fired before the first level, the first
+    level's walls were never cached. An empty result now re-scans quietly
+    at 1 Hz until the level's actors appear.
+
+- VERIFICATION: tests/run.sh ALL suites pass (lumos suite gains section 13:
+  the wallShouldOpenProxied truth table, and section 14: the v68 retry
+  cadence constants). tools/hostcheck/check.sh: dllmain.cpp syntax clean
+  (-Wall -Wextra, stub Win32 surface). The Windows DLL could NOT be rebuilt
+  in this sandbox (no i686 MinGW toolchain) - build via CI
+  (build-release.yml) and confirm line 2 of hp3mod.log says build v68.
+
+  HARDWARE CHECK LIST for the user:
+    * Log line 2 says build v68.
+    * "[lumos] v68 level-side fields resolved: Wand=+0x.. TheLumosLight=
+      +0x.. LumosLight.Particles=+0x.. LumosLight.bLumosOn=+0x..(0x..)
+      Trig.fDistanceCheck=+0x.. execTriggerEvent=........ GlowFX=........"
+      prints NON-trivial values (v67's failure mode was all of these
+      unresolved, cached from the menu). If it says PARTIAL, tell us which.
+    * Cast Lumos as P2 at the gargoyle: expect
+      "[lumos] v68 P1.. (stock)" nothing / "[lumos] v68 P%d TheLumosLight
+      turned ON", then "[lumos] v68 P%d wand glow spawned + attached ..." -
+      the wand tip now glows visibly and the glow FOLLOWS the wand.
+    * Walk P2 into the revealed wall: expect either
+      "[lumos] v68 TriggerEvent fired (native execTriggerEvent): ... event=
+      0x.." or (no exec export) "[lumos] v68 Tag walk fires <real Trigger>
+      on <wall> via own Trigger". If the log instead shows "no TriggerEvent
+      dispatch yet ... retrying at 1 Hz", the wall has no Event linkage and
+      the SetCollision fallback must do the work - expect
+      "[lumos] v66.5 opened secret wall #k" with the trigger-proxied test.
+    * The window ends 30 s after the light: "auto-off after stock 30s".
