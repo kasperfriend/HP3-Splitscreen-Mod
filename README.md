@@ -24,7 +24,48 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v67`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v68`.
+
+### v68 Lumos for P2/P3, round 2: why v67 still didn't glow or open walls
+
+The v67 field report (same HP3_InsideHub gargoyle test) was: the lead gets
+the stock glow, but P2/P3 wands still never glow and they still cannot walk
+through the revealed walls. Three concrete defects explain it, all verified
+against the actual HP2 decompile (metallicafan212/HP2UScriptDecompile):
+
+1. **Menu-time one-shot field resolution.** `resolveLumosFields` resolved
+   everything exactly once, and `lumosTick` runs every rendered frame —
+   including the main menu — so the first resolution happened before
+   `hgame`/`HPParticle`/`KWBlockingVolume` were loaded. The v66.5 hardware
+   log already showed it: the family classes logged 3 of 4 `NULL` and
+   `TheLumosLight=+0xFFFFFFFF`. Every hgame-side field was then cached
+   `NULL`/`-1` **forever**: no `LumosLightFX` class (no glow particles,
+   ever), no `bLumosOn` bit, no `Particles` pointer, no trigger radii.
+   v68 defers all level-side fields to one combined table pass retried at
+   1 Hz until they resolve (engine-side fields stay one-shot).
+2. **The glow never rode the wand.** Stock `TurnOn` spawns `LumosLightFX`,
+   stores it in the light's own `Particles` property and calls
+   `EnableEmission(True)`; the wand's Tick then calls
+   `TheLumosLight.UpdateLocation(WandEndPoint)` every frame while
+   `bLumosOn`, which moves **both** the light and its Particles. v67
+   spawned the FX but never stored it, so the stock ride could never move
+   it. v68 replays the sequence exactly: register → seed location → spawn
+   → `bEmit=True` → `Particles = glow` → and only then `bLumosOn=True`
+   (turn-off reverses it), so P2/P3's glow rides the wand tip through the
+   stock script itself.
+3. **The wall-open dispatch could no-op and latch.** v67 ran its manual
+   Tag walk first; when a receiver's most-derived Trigger resolved to the
+   empty `Engine.Actor` base event (or a state-declared Trigger the
+   class-level lookup cannot see), the walk still counted a fire, latched
+   the once-per-level flag and suppressed the engine native. v68 fires the
+   engine's own `execTriggerEvent` first (the stock call), makes the
+   fallback walk skip no-op receivers and find state-declared Triggers,
+   and a failed fire retries at 1 Hz instead of latching. The octree-safe
+   SetCollision fallback now also opens a wall when any player stands
+   inside the wall's **paired trigger's** own radius — the stock
+   `InLumosRadius` check — because a large wall's actor Location can sit
+   far past the surface a player presses against. A scan that found
+   nothing re-runs at 1 Hz instead of locking the level out.
 
 ### v67 Lumos as P2/P3: the real state, replicated from the stock chain
 

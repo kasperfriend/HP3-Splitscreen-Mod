@@ -402,10 +402,32 @@ int main()
         assert(!s.isExpired(29999));
         assert(s.isExpired(30000));
     }
+    // 13. v68: wallShouldOpenProxied - the open condition keyed on the
+    //     PAIRED TRIGGER's radius (stock's own check) with the wall-actor
+    //     proximity as the secondary. The v66.5 wall-actor-only test never
+    //     fired for a large wall whose Location sits far past the surface
+    //     the player presses against.
+    {
+        // Lumos on, secret wall, player inside the paired trigger radius:
+        // opens even when the wall actor itself is far away.
+        assert(wallShouldOpenProxied(true, true, true, false));
+        assert(wallShouldOpenProxied(true, true, false, true));   // near wall
+        assert(wallShouldOpenProxied(true, true, true, true));    // both
+        assert(!wallShouldOpenProxied(true, true, false, false)); // neither
+        assert(!wallShouldOpenProxied(false, true, true, true));  // Lumos off
+        assert(!wallShouldOpenProxied(true, false, true, true));  // not secret
+    }
+    // 14. v68: retry cadences - resolution / empty-scan / failed-dispatch
+    //     retries are all finite and positive (the "one-shot at menu time"
+    //     and "latch the failure forever" semantics are gone).
+    assert(ResolveRetryMs > 0 && ResolveRetryMs <= 5000);
+    assert(EmptyScanRetryMs > 0 && EmptyScanRetryMs <= 5000);
+    assert(DispatchRetryMs > 0 && DispatchRetryMs <= 5000);
+    assert(WallActorNearRadius > 0.0f);
 
     std::puts("lumos sync: state, timer, light, proximity, passability, "
               "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
-              "v66.5 wall-bits/follow-light and v67 stock-register/"
-              "trigger-fire assertions passed");
+              "v66.5 wall-bits/follow-light, v67 stock-register/"
+              "trigger-fire and v68 proxied-wall/retry assertions passed");
     return 0;
 }
