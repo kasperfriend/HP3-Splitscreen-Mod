@@ -24,7 +24,39 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v65`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v67`.
+
+### v67 Lumos as P2/P3: the real state, replicated from the stock chain
+
+Decompiling the HP2-lineage scripts (which HP3 inherits verbatim) showed
+exactly what Lumos does to the main character — and why no companion ever
+got it. The whole chain hardcodes `PlayerHarry`:
+
+- `gargoyle.HandleSpellLumos` runs `baseWand(PlayerHarry.Weapon).LumosTurnOn()` —
+  the **lead's** wand lights even when P2 casts;
+- `LumosLight.TurnOn()` (after its `if (PlayerHarry.bLumosOn) return` gate)
+  sets `PlayerHarry.bLumosOn`, writes the `TurnDynamicLightOn` register
+  (LT_Steady, LE_NonIncidence, brightness 400, hue 32, saturation 72,
+  radius 15, radiusInner 5), broadcasts `OnLumosOn()` to every actor, and
+  **spawns the `LumosLightFX` particles that are the visible wand glow** —
+  the lead's wand tick then rides the light on the wand tip for 30 s;
+- `LumosTrigger` (one per secret wall) fires `TriggerEvent(Event, self,
+  None)` **once per level** when `PlayerHarry` comes within its own
+  `fDistanceCheck` (512) — that event opens the wall, which in the stock
+  lineage is a **Mover** (TriggerToggle, MoveTime=0). P2 standing at the
+  wall satisfies nothing, and no amount of collision poking opens a Mover.
+
+v67 replays each step for every driven player: each player's own
+`TheLumosLight` gets the stock register + `bLumosOn` for the stock 30 s
+window (brightness written byte-255 or float-400 by a class-layout tell —
+a float engine read the old byte write/detection as "off"), the stock glow
+particles spawn at each wand, and each secret-wall trigger's own event
+fires when **any** player stands inside the trigger's own radius — once
+per level per trigger, honoring and writing stock's `bFirstEventSent` so
+the wall can never be toggled back closed. `[lumos] TriggerEvents=1` and
+`GlowFX=1` in `hp3mod.ini` toggle the two behaviors. The v66.5
+octree-safe SetCollision path remains as the fallback for collision-proxy
+walls.
 
 ## Player 2 controls
 

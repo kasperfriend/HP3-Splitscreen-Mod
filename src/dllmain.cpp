@@ -163,8 +163,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v66.5"
-#define MOD_STAMP "build v66.5 - 2026-09-09 - LUMOS-AS-P2 WALLS REALLY OPEN (OCTREE-SAFE SetCollision), QUIT-CRASH FIXED, P2 WAND STAYS OUT, WAND LIGHTS REALLY SYNC. FIELD REPORT (v66.4, HP3_InsideHub gargoyle): casting Lumos as Player 2 worked (gargoyle lit, spell delivered, mod state engaged for 25s) but (a) P2's wand mesh vanished for the whole window, (b) the revealed secret wall stayed solid (\"it doesn't seem to apply correct state\"), and (c) quitting the game crashed with 'Assertion failed: Actor->bCollideActors [File:UnOctree.cpp] [Line: 1598]' - FCollisionOctree::RemoveActor <- FOctreeNode::RemoveAllActors (recursive) <- FCollisionOctree::~FCollisionOctree <- ULevel::Destroy <- UObject::ConditionalDestroy <- DispatchDestroy <- PurgeGarbage <- StaticExit <- appPreExit: the collision octree's destructor found one of its members with bCollideActors cleared. ROOT CAUSE, one defect behind (b) and (c): the wall replication wrote the bCollideActors/bBlockActors/bBlockPlayers BITS straight into cached GenericColObj/KWBlockingVolume actors. Actor collision in this engine is resolved through the collision OCTREE, and only the native Engine.Actor.SetCollision ever adds/removes an actor from it - a poked bit changes the flag, not the collision. So (b) the \"opened\" wall stayed in the octree and kept blocking every pawn that walked into it, and (c) at level destroy the octree walked its still-present members and tripped check(Actor->bCollideActors) on a member whose flag the mod had cleared - the exact quit crash. (a) was separate: the [lumos] sync called hgame.HPCharacter.ShowWeapon on EVERY pawn EVERY frame through callFn's ZEROED parms block; in the HP2 lineage ShowWeapon/HideWeapon are the cutscene commands 'Weapon.bHidden = False/True' (harry.uc), so a ShowWeapon(bool) handed zeros is a HIDE - the mod was hiding P2's freshly cast wand every frame (the same call at cast-begin is harmless because StartCasting/SwitchToFightStanceAnims re-show the wand immediately after). FIXES: (1) every secret-wall open/close now goes through the ENGINE's own native: execSetCollision is resolved from Engine.dll exports exactly like execSpawn/execSetPhysics/execSetLocation and driven with synthesized OP_TRUE/OP_FALSE bytecode tokens (the pattern the DrawPortal call already uses for its bool parm); an opened wall is genuinely REMOVED from the collision octree - passable for real, for every player - and the octree/flag pair stays consistent at every instant, which is what removes the quit crash even if the game is closed mid-spell. Pristine per-wall collision bits are snapshotted once per level at scan time and restored EXACTLY on close (and on level travel through lumosInvalidate -> lumosRestoreAllWalls). (2) If execSetCollision is not exported the wall feature disables itself and logs once - a wall that cannot be opened properly stays solid; collision bits are never poked again, anywhere. (3) The ShowWeapon spam is gone: while Lumos is active the mod writes bHidden=false directly on each pawn's Wand actor (the stock ShowWeapon command's exact effect - one dword write, idempotent, signature-independent), so the driven companion visibly carries the lit wand. (4) The per-wand light replication actually finds lights now: stock baseWand.PostBeginPlay spawns TheLumosLight as Spawn(Class'LumosLight', self /*the wand*/, Location) - the wand is the light's OWNER - and the wand's Tick only SetLocation()s it to the wand end point (PHYS_None, never SetBase), so the v66.x fallback that matched Base==wand could NEVER match; with the TheLumosLight property offset unresolved on HP3 (log: TheLumosLight=+0xFFFFFFFF) the entire light sync was a silent no-op, which is why the state \"didn't apply\". The fallback now takes the exact-class LumosLight actor whose Engine.Actor.Owner equals the wand (pointer compare, no GetFullName), applies the stock TurnDynamicLightOn values (LT_Steady, brightness 255, radius 15, hue 32, saturation 72), and never touches the light's own collision (stock spawns it SetCollision(False,False,False) - LumosLight.PreBeginPlay - and its Touch is an empty singular no-op). (5) While any wand light is genuinely burning the mod's timer follows it in 1-second ratchets (State::refresh only ever extends), so an infinite-Lumos gargoyle keeps secret walls openable for as long as its light burns and the state expires within a second of the last light. (6) Only walls PAIRED to a cached LumosTrigger/LumosSparklesTrigger (within SecretWallPairRadius=900 units, counted and logged at scan time) are ever opened - v66.x opened ANY GenericColObj/KWBlockingVolume within 300 units of ANY player while Lumos was on (all 80 cached in the hub), which could unblock ordinary invisible collision proxies; ordinary walls are now untouchable by design. (7) The dead Trigger() fire loop on LumosTrigger actors is removed: the hardware pelog proved their most-derived Trigger is Engine.Actor.Trigger - the empty base event (in the HP2 lineage LumosTrigger/LumosSparkles are OnLumosOn()/OnLumosOff() state machines that the stock LumosLight.TurnOn AllActors broadcast already arms when the gargoyle lights) - so firing it was a verified no-op; the stock chain stays untouched and the mod's any-player replication is the octree-safe SetCollision. v66.4 CRASH: with v66.3 running, casting Lumos as Player 2 (same HP3_InsideHub gargoyle) GPF'd inside UGameEngine::Draw, history: UObject::ProcessEvent <- (LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render, and the mod's own pelog shows '-> ProcessEvent LumosTrigger.Trigger' firing straight into the detach. Two defects cooperated: (a) the v66.3 class-token gate still substring-matched WITHIN the class token (strstr 'LumosSparkles'), so the placed secret-wall sparkles actor class 'LumosSparklesEmitter' still entered the trigger cache (21 'triggers' in the hub scan), and the fire-time chain re-verify reused the same substring behind an isActor gate that an Emitter trivially passes; (b) deeper: the fire site called ONE globally resolved function (g_fnTrigger = KWGame.KWPawn.Trigger) on whatever the cache held, so any admitted non-pawn executed pawn bytecode as 'this'. FIX, three layers: (1) name membership is now EXACT class-token equality (src/lumos_sync.h: triggers 'LumosTrigger'/'LumosSparklesTrigger', walls 'GenericColObj'/'KWBlockingVolume', no substring anywhere, regression-tested with the exact crash names in tests/lumos_sync_test.cpp); (2) a differently-named SUBCLASS of one of those classes - the only reason the old substring existed - is admitted exclusively by chain pointer proof: lumosChainProves walks the receiver's calibrated UObject::Class -> UStruct::SuperField chain and pointer-compares it with the family class objects resolved by path (guarded dword reads only, no GetFullName), at scan admission AND inside lumosClassVerified at every fire/write; (3) the Trigger() fire site never replays a function found on a DIFFERENT class again: with the chain verified it fires the most-derived Trigger declaration in the RECEIVER's own chain (CgClass::fnTrigger from the castgame index), falling back to Engine.Actor.Trigger (the event every actor owns), and skips + logs '[lumos] v66.4 BLOCKED Trigger()' when neither can be proven - even a future admission bug can no longer run foreign bytecode on a live object. The receiver-resolved fire also matches what the engine's own touch path dispatches, so stock LumosTrigger behaviour is unchanged. v66.3 LUMOS-AS-P2 TEXTURE TRIGGER CRASH FIXED. (1) CRASH: casting Lumos (reported as Player 2 on a gargoyle in HP3_InsideHub) GPF'd inside UGameEngine::Draw with the crash history naming the receiver: UObject::ProcessEvent <- (Texture hgame.LumosTriggerIcon, Function KWGame.KWPawn.Trigger). The per-level Lumos scan admitted ANY object whose full GetFullName string contained the token - the placed trigger actors, but also the UClass entries (Class hgame.LumosTrigger) and the spell's HUD asset Texture hgame.LumosTriggerIcon that the engine loads alongside Lumos. A cached Texture is a live UObject (cgLiveObject passes) and the Location/CollisionRadius reads at actor offsets land in the shared UObject allocator arena (IsBadReadPtr passes), so garbage floats could pass the proximity test and the mod ran pawn Trigger() bytecode with a Texture as 'this'. Scan membership is now decided by the CLASS TOKEN only (hp3lumos class-token helpers in src/lumos_sync.h, regression-tested in tests/lumos_sync_test.cpp with the exact crash names), look-alike rejections are counted and logged per scan, and - defense in depth against a cached pointer being recycled into a different object mid-level - the Trigger() fire site and the secret-wall collision writes re-verify the receiver's class through the calibrated UObject::Class chain (guarded dword reads only, no GetFullName) before running or writing anything; a proven impostor is skipped and logged once. (2) The same class-token rule now guards the GenericColObj/KWBlockingVolume wall cache, which previously also cached the class objects themselves and wrote actor collision bits into them. v66.2 STUCK COMPANION ACTUALLY UNSTICKS & REAL FPS FIXES: (1) STUCK PAWN: the v66.1 physrecover repair could never run on the pawn that needed it - it was gated on the standing-jump latch being clear, and that latch only clears once the pawn LEAVES PHYS_Falling, which a pawn parked by the Hogwarts door transition never does. Result was 15 identical stranded Falling->Walking lines over 20s at HP3_InsideHub loc=(1004 1050 Z=137) and a permanently dead jump button. The recovery is now a bounded escalation in src/stuck_pawn.h (clear the leaked latch, then lift x3, then re-seat beside the lead character x2, then back off), verified by tests/stuck_pawn_test.cpp which replays that exact field signature; new [recovery] ini section, Unstick=0 disables it. (2) PERF: object liveness went from a full walk of GObjObjects (8820 entries in the hub) plus an IsBadReadPtr over the whole table on EVERY call, to an O(1) hash snapshot rebuilt at most once per 16ms - src/live_index.h, tests/live_index_test.cpp. getPawn is resolved once per frame instead of four times, actorInCurrentLevel no longer re-derives the camera name per call, the castable scan filters on the cached class before it builds any full name, and Lumos stops touching every secret wall every frame when it is off. v66.1 SPONGIFY AIR YAW ROTATION UNLOCK & LUMOS SECRET WALL PASSABILITY REPLICATION, plus v66.1 PERF & STUCK-PAWN fixes: (1) Standing jump / Spongify air physics now preserves full 360-degree horizontal view and camera yaw rotation by removing the g_viewYaw[i] = g_jumpYawLock[i] lock in driveePawn, keeping DesiredRotation aligned with viewYaw so the character freely turns and aims in mid-air just like vertical pitch; (2) Lumos state, wand light (TheLumosLight), and trigger passability are replicated across all companion pawns: casting Lumos on a gargoyle or carrying an active LumosLight synchronizes TheLumosLight across all players, fires nearby LumosSparklesTrigger / LumosTrigger, and unblocks GenericColObj / KWBlockingVolume secret walls so any player can walk through revealed walls seamlessly. v66.1 caches the Lumos trigger/wall/wand-light scans (they ran GetFullName over every object every rendered frame, tanking FPS even in the menu) and recovers a driven companion stranded in PHYS_Falling with no real fall after the Hogwarts door transition. v65 exact per-hero gesture placement, v64 stock motion, v63 8-second arm, v62 holder-origin virtual-trio launch, v61 distinct-Instigator virtual trio and split-OFF delivery tick, state-aware companion movement guard, v58 level-travel safety and cooperative-family gate, native wet SpellGesture icon, and 770-unit aim retained."
+#define MOD_BUILD  "v67"
+#define MOD_STAMP "build v67 - 2026-09-10 - P2/P3 GET THE REAL LUMOS STATE: STOCK-FAITHFUL WAND LIGHT + GLOW PARTICLES + TRIGGER-EVENT WALL OPENING. FIELD REPORT (v66.5, HP3_InsideHub gargoyle): Lumos as Player 2 no longer crashes and the gargoyle lights, but P2/P3 wands never glow and they still cannot walk through the revealed secret walls - 'the game doesn't seem to give them that state'. ROOT CAUSE (decompiled HP2-lineage scripts, which HP3 inherits verbatim - the HP3 save chain harry.Wand -> HarryWand.TheLumosLight -> LumosLight proves the layout): the stock chain hardcodes PlayerHarry at every step. gargoyle.HandleSpellLumos runs baseWand(PlayerHarry.Weapon).LumosTurnOn() - the LEAD's wand light turns on even when P2 casts. LumosLight.TurnOn() (after its if (PlayerHarry.bLumosOn) return gate) sets PlayerHarry.bLumosOn, TurnDynamicLightOn (LT_Steady, LE_NonIncidence, brightness 400, hue 32, sat 72, radius 15, radiusInner 5), broadcasts OnLumosOn() to EVERY actor (arms all LumosTriggers) and spawns the LumosLightFX particles that ARE the visible wand glow; the wand's own Tick then rides the light on WandEndPoint and LumosLight.Tick auto-offs it after 30 s. LumosTrigger arms on OnLumosOn and fires TriggerEvent(Event, self, None) EXACTLY ONCE (bFirstEventSent never resets) once PlayerHarry comes within fDistanceCheck=512 - THAT event opens the wall (stock secret walls are Movers: TriggerToggle, MoveTime=0), and no second player exists in that check. So stock never lights a companion's wand, and P2 standing at the wall never opens it - the v66.x SetCollision fallback only covered GenericColObj/KWBlockingVolume and never fired the trigger's Event, so a Mover wall stayed solid. FIXES: (1) per-companion light sync is now the stock TurnOn register, not a guess: the mod finds each player's own TheLumosLight (dynamically resolved <wandClass>.TheLumosLight property, walking the wand's class chain - plus the exact-class Owner==wand fallback, which now also accepts chain-proven subclasses), writes bLumosOn=True + the TurnDynamicLightOn register (LightEffect=13 and LightRadiusInner=5 added; brightness written byte-255 or float-400 according to the class layout tell delta(LightHue-LightBrightness), which also fixes the v66.5 detection that could read a burning float light as 0x00 and never see it), spawns the stock HPParticle.LumosLightFX glow owned by the light (the visible glow), lets the STOCK wand Tick relocate the light (self-heals to the pawn if the light drifts >300 units away), and auto-offs each replicated light after the stock 30 s so the window cannot deadlock open. bLumosOn is written on every driven pawn while active (stock keeps it on PlayerHarry). (2) The wall's real open path is replicated: when the Lumos state is on and ANY tracked player stands inside a cached LumosTrigger/LumosSparklesTrigger's OWN radius (its fDistanceCheck/fZDistanceCheck read from the actor, stock defaults 512/64), the mod fires the stock dispatch - Engine.Actor.TriggerEvent(event, trigger, instigatorPawn) through its native exec thunk, falling back to a manual Tag==Event walk that calls each linked actor's most-derived Trigger (chain-resolved, never a foreign-class function). It fires ONCE per trigger per level exactly like stock's bFirstEventSent: stock's own flag is honored (already-fired triggers are skipped so P1's later pass cannot toggle a TriggerToggle wall closed), and the mod sets bFirstEventSent on triggers IT fired for the same reason. The v66.5 octree-safe SetCollision wall path stays as the fallback for collision-proxy walls. (3) [lumos] TriggerEvents=1 / GlowFX=1 in hp3mod.ini toggle the two new behaviors. v66.5 OCTREE-SAFE SETCOLLISION WALLS, P2 WAND STAYS OUT, OWNER-MATCHED WAND-LIGHT SYNC, 1s LIGHT RATCHETS, PAIRED SECRET WALLS ONLY RETAINED. v66.4 EXACT CLASS-TOKEN + CHAIN-PROOF TRIGGER/WALL MEMBERSHIP RETAINED."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -822,6 +822,34 @@ static BOOL nativeSetCollision(void *actor, BOOL collide, BOOL blockActors,
     st.Object = actor; st.Code = bc;
     DWORD result = 0;
     g_execSetCollision(actor, NULL, &st, &result);
+    return TRUE;
+}
+
+// v67: Engine.Actor.TriggerEvent(Name EventName, Actor Other, Actor Instigator)
+// is the engine's own event dispatch - what stock LumosTrigger's state machine
+// calls to open a secret wall (TriggerEvent walks every actor whose Tag equals
+// the event and calls its Trigger). Natives consume FFrame bytecode like every
+// other exec thunk: NAME token (the 4-byte name index this engine uses - the
+// runtime Spawn layout proves it), then two OBJ tokens. Resolved lazily by
+// resolveLumosFields; absent on engines without the UE2 event helpers - the
+// caller falls back to the manual Tag walk (lumosDispatchByTag).
+static PFN_execActorFn g_execTriggerEvent = NULL;
+
+static BOOL nativeTriggerEvent(void *actor, DWORD nameIdx, void *other,
+                               void *instigator)
+{
+    if (!actor || !g_opsOK || g_opNameConst < 0 || !g_execTriggerEvent)
+        return FALSE;
+    BYTE bc[32]; int p = 0;
+    bc[p++] = (BYTE)g_opNameConst;     *(DWORD *)(bc + p) = nameIdx; p += 4;
+    bc[p++] = (BYTE)g_ops[OP_OBJ].op;  *(void **)(bc + p) = other; p += 4;
+    bc[p++] = (BYTE)g_ops[OP_OBJ].op;  *(void **)(bc + p) = instigator; p += 4;
+    bc[p++] = (BYTE)g_ops[OP_END].op;
+    bc[p++] = (BYTE)g_ops[OP_END].op;   // guard
+    FFrameLite st; memset(&st, 0, sizeof(st));
+    st.Object = actor; st.Code = bc;
+    DWORD result = 0;
+    g_execTriggerEvent(actor, NULL, &st, &result);
     return TRUE;
 }
 
@@ -7693,7 +7721,6 @@ static void readPad(int i, PadState *out)
         static BOOL  sMapped[8] = { FALSE };
         static DWORD sScanAt[8] = { 0 };
         static DWORD sPrevAx[8][16][6];
-        static DWORD sPrevBtn[8][16];
         DWORD nowJ = GetTickCount();
         if (!sMapped[i]) {
             sMapped[i] = TRUE;
@@ -7731,7 +7758,6 @@ static void readPad(int i, PadState *out)
                     if (dv > 600) live = TRUE;
                 }
                 memcpy(sPrevAx[i][d2], ax, sizeof(ax));
-                sPrevBtn[i][d2] = j2i.dwButtons;
                 if (live) {
                     joyLock[i] = (int)d2;
                     padProf[i] = 0;               // re-profile the new device
@@ -8631,6 +8657,29 @@ static int g_offColHeight         = -2;
 // the TheLumosLight property offset does not resolve (HP3 log: +0xFFFFFFFF).
 static int g_offOwner             = -2;
 
+// v67: defined below (after readLumosCollisionBits); getWandLumosLight's
+// subclass acceptance needs it earlier in the file.
+static BOOL lumosChainContainsClass(void *obj, void *want);
+// ---------------------------------------------------------------------------
+// v67: the rest of the stock Lumos register and the LumosTrigger state
+// machine, resolved by name like every other script field. See the stock
+// chain write-up in src/lumos_sync.h.
+// ---------------------------------------------------------------------------
+static int   g_offLightRadiusInner    = -2;        // Engine.Actor.LightRadiusInner
+static BOOL  g_lightBrightIsFloat     = FALSE;     // layout tell: hue-brightness delta
+static BOOL  g_lightRadiusInnerIsFloat= FALSE;     // adjacency to float LightRadius
+static int   g_offLumosBOn            = -2;        // hgame.LumosLight.bLumosOn
+static DWORD g_maskLumosBOn           = 0;
+static int   g_offPawnLumosOn         = -2;        // PlayerHarry.bLumosOn (hgame.harry lineage)
+static DWORD g_maskPawnLumosOn        = 0;
+static int   g_offTrigFirstSent       = -2;        // hgame.LumosTrigger.bFirstEventSent
+static DWORD g_maskTrigFirstSent      = 0;
+static int   g_offTrigDist            = -2;        // hgame.LumosTrigger.fDistanceCheck (float)
+static int   g_offTrigUseZ            = -2;        // hgame.LumosTrigger.bUseZDistanceCheck
+static DWORD g_maskTrigUseZ           = 0;
+static int   g_offTrigZDist           = -2;        // hgame.LumosTrigger.fZDistanceCheck (float)
+static void *g_clsLumosLightFX        = NULL;      // HPParticle.LumosLightFX - the wand-glow particles
+
 static void resolveLumosFields(void)
 {
     static BOOL sResolved = FALSE;
@@ -8674,6 +8723,50 @@ static void resolveLumosFields(void)
     g_maskbHiddenLumos   = nativeBoolBitMask("Engine.Actor.bHidden");
     if (!g_maskbHiddenLumos) g_maskbHiddenLumos = boolBitMask("Engine.Actor.bHidden");
 
+    // v67: the rest of the stock Lumos register + trigger state machine.
+    g_offLightEffect     = propOffset("Engine.Actor.LightEffect");
+    g_offLightRadiusInner= propOffset("Engine.Actor.LightRadiusInner");
+    g_lightBrightIsFloat = hp3lumos::brightnessIsFloatByLayout(g_offLightBrightness,
+                                                               g_offLightHue);
+    g_lightRadiusInnerIsFloat = hp3lumos::radiusInnerIsFloatByLayout(
+                                                               g_offLightRadius,
+                                                               g_offLightRadiusInner);
+    g_offLumosBOn        = propOffset("hgame.LumosLight.bLumosOn");
+    g_maskLumosBOn       = nativeBoolBitMask("hgame.LumosLight.bLumosOn");
+    if (!g_maskLumosBOn) g_maskLumosBOn = boolBitMask("hgame.LumosLight.bLumosOn");
+    g_offPawnLumosOn     = propOffset("hgame.harry.bLumosOn");
+    g_maskPawnLumosOn    = nativeBoolBitMask("hgame.harry.bLumosOn");
+    if (g_offPawnLumosOn < 0)
+        g_offPawnLumosOn = propOffset("hgame.HPawn.bLumosOn");
+    if (g_offPawnLumosOn < 0)
+        g_offPawnLumosOn = propOffset("hgame.HPCharacter.bLumosOn");
+    if (!g_maskPawnLumosOn)
+        g_maskPawnLumosOn = boolBitMask("hgame.harry.bLumosOn");
+    g_offTrigFirstSent   = propOffset("hgame.LumosTrigger.bFirstEventSent");
+    g_maskTrigFirstSent  = nativeBoolBitMask("hgame.LumosTrigger.bFirstEventSent");
+    if (!g_maskTrigFirstSent)
+        g_maskTrigFirstSent = boolBitMask("hgame.LumosTrigger.bFirstEventSent");
+    g_offTrigDist        = propOffset("hgame.LumosTrigger.fDistanceCheck");
+    g_offTrigUseZ        = propOffset("hgame.LumosTrigger.bUseZDistanceCheck");
+    g_maskTrigUseZ       = nativeBoolBitMask("hgame.LumosTrigger.bUseZDistanceCheck");
+    if (!g_maskTrigUseZ) g_maskTrigUseZ = boolBitMask("hgame.LumosTrigger.bUseZDistanceCheck");
+    g_offTrigZDist       = propOffset("hgame.LumosTrigger.fZDistanceCheck");
+    // The stock wand-glow particles LumosLight.TurnOn spawns
+    // (Spawn(Class'LumosLightFX', self, , Location)). HP2 declares them in
+    // HPParticle; accept an hgame-local copy too.
+    g_clsLumosLightFX    = findObjectByPath("HPParticle.LumosLightFX");
+    if (!g_clsLumosLightFX) g_clsLumosLightFX = findObjectByPath("hgame.LumosLightFX");
+    // v67: the engine's own event dispatch (stock LumosTrigger opens walls
+    // with it). UE2-style engines export the exec thunk; if this hybrid does
+    // not, lumosDispatchByTag is the fallback dispatcher.
+    if (!g_execTriggerEvent) {
+        g_execTriggerEvent = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+            g_engine, "?execTriggerEvent@AActor@@QAEXAAUFFrame@@QAX@Z"));
+        if (!g_execTriggerEvent)
+            g_execTriggerEvent = (PFN_execActorFn)resolveThunk((BYTE *)GetProcAddress(
+                g_engine, "?execTriggerEvent@AActor@@UAEXAAUFFrame@@QAX@Z"));
+    }
+
     g_offTag             = propOffset("Engine.Actor.Tag");
     g_offEvent           = propOffset("Engine.Actor.Event");
     g_offColRadius       = propOffset("Engine.Actor.CollisionRadius");
@@ -8686,6 +8779,20 @@ static void resolveLumosFields(void)
           g_offWand, g_offTheLumosLight, g_offLightType, g_offLightBrightness,
           g_offbCollideActors, (unsigned long)g_maskbCollideActors,
           g_offbHiddenLumos, (unsigned long)g_maskbHiddenLumos, g_offOwner);
+    // v67: the stock register + trigger machine resolution, one line for the
+    // hardware log so a field report shows immediately what is reachable.
+    logf_("[lumos] v67: LightEffect=+0x%X LightRadiusInner=+0x%X "
+          "brightnessIsFloat=%d radiusInnerIsFloat=%d LumosLight.bLumosOn="
+          "+0x%X(0x%lX) Pawn.bLumosOn=+0x%X(0x%lX) Trig.bFirstEventSent="
+          "+0x%X(0x%lX) Trig.fDistanceCheck=+0x%X Trig.bUseZ=+0x%X(0x%lX) "
+          "Trig.fZDistanceCheck=+0x%X execTriggerEvent=%p GlowFX=%p",
+          g_offLightEffect, g_offLightRadiusInner,
+          g_lightBrightIsFloat ? 1 : 0, g_lightRadiusInnerIsFloat ? 1 : 0,
+          g_offLumosBOn, (unsigned long)g_maskLumosBOn,
+          g_offPawnLumosOn, (unsigned long)g_maskPawnLumosOn,
+          g_offTrigFirstSent, (unsigned long)g_maskTrigFirstSent,
+          g_offTrigDist, g_offTrigUseZ, (unsigned long)g_maskTrigUseZ,
+          g_offTrigZDist, g_execTriggerEvent, g_clsLumosLightFX);
     // v66.4: the family class anchor pointers the exact/chain membership
     // proofs compare against - visible in the log so a hardware dump shows
     // immediately whether subclass proofs were even possible this session.
@@ -8741,7 +8848,9 @@ static void *getWandLumosLight(void *wand)
             for (int k = 0; k < n; k++) {
                 void *o = g_objArray->Data[k];
                 if (!o || IsBadReadPtr(o, 0x100)) continue;
-                if (cgClassOf(o) != g_clsLumosLight) continue;
+                // v67: exact class, or a chain-proven LumosLight subclass.
+                if (cgClassOf(o) != g_clsLumosLight &&
+                    !lumosChainContainsClass(o, g_clsLumosLight)) continue;
                 if (IsBadReadPtr((BYTE *)o + g_offOwner, 4)) continue;
                 if (*(void **)((BYTE *)o + g_offOwner) == wand) return o;
             }
@@ -8759,12 +8868,9 @@ static void setLumosActorHidden(void *actor, BOOL hidden)
     else        *p &= ~g_maskbHiddenLumos;
 }
 
-static BOOL isLumosActorHidden(void *actor)
-{
-    if (!actor || g_offbHiddenLumos < 0 || !g_maskbHiddenLumos ||
-        IsBadReadPtr((BYTE *)actor + (g_offbHiddenLumos & ~3), 4)) return FALSE;
-    return (*(DWORD *)((BYTE *)actor + (g_offbHiddenLumos & ~3)) & g_maskbHiddenLumos) != 0;
-}
+// v67: the old isLumosActorHidden() reader is gone with its only caller -
+// the v66.5 inactive branch that hid companion lights. Lights the mod turned
+// on now get the exact stock TurnOff register instead of a hide.
 
 // v66.5: READ an actor's three collision bools through the calibrated
 // property offsets. Used to snapshot a secret wall's PRISTINE bits at scan
@@ -8804,6 +8910,269 @@ static BOOL readLumosCollisionBits(void *actor, BOOL *collide,
     return any;
 }
 
+#define LUMOS_MAX_ACTORS 1024   // v67: hoisted above the per-player state
+
+// ---------------------------------------------------------------------------
+// v67: stock-faithful per-player Lumos replication helpers. Everything here
+// replays a concrete stock-script effect (see the stock chain write-up in
+// src/lumos_sync.h); nothing invents behaviour the game does not have.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// v67 per-player replication state. Stock gives the Lumos state ONLY to
+// PlayerHarry; these carry the replicated copy for every driven player.
+// ---------------------------------------------------------------------------
+// TRUE while the mod has applied the stock TurnOn register to that player's
+// own TheLumosLight. Only lights with this latch are ever turned off by the
+// mod - a stock-burning light (PlayerHarry's, or an infinite gargoyle's)
+// stays in the game's hands.
+static BOOL   g_lumosLightOn[8]   = { FALSE };
+// GetTickCount() when the mod turned the light on; the stock LumosLight.Tick
+// auto-offs after 30 s (fLumosTimeToTurnOff) - the mod replays that here,
+// otherwise the mod's own light-follow ratchet would keep the window open
+// forever (the mod keeps the light burning while the state is active).
+static DWORD  g_lumosLightOnAt[8] = { 0 };
+// The LumosLightFX particles we spawned for that player - the visible wand
+// glow. Stock spawns them inside TurnOn and destroys them in TurnOff.
+static void  *g_lumosGlow[8]      = { NULL };
+// Once-per-level latch per cached trigger: 1 = its Event was fired (by us or
+// by stock - bFirstEventSent). Stock secret walls open exactly once per
+// level; a second TriggerEvent on a TriggerToggle Mover would CLOSE it.
+static signed char g_lumosTrigFired[LUMOS_MAX_ACTORS];
+// ini [lumos] TriggerEvents / GlowFX.
+static int    g_lumosTriggerEvents = 1;
+static int    g_lumosGlowFX        = 1;
+static BOOL   g_lumosTrigWarned    = FALSE;
+// Per-wand-class TheLumosLight property offset cache (wand class -> offset).
+static struct { void *cls; int off; } g_wandLightProp[8] = {};
+
+static float lumosReadFloat(void *base, int off, float def)
+{
+    if (!base || off <= 0 || IsBadReadPtr((BYTE *)base + off, 4)) return def;
+    return *(float *)((BYTE *)base + off);
+}
+
+static unsigned char lumosReadByte(void *base, int off, unsigned char def)
+{
+    if (!base || off <= 0 || IsBadReadPtr((BYTE *)base + off, 1)) return def;
+    return *(BYTE *)((BYTE *)base + off);
+}
+
+static BOOL lumosReadBit(void *base, int off, DWORD mask, BOOL def)
+{
+    if (!base || off <= 0 || !mask || IsBadReadPtr((BYTE *)base + (off & ~3), 4))
+        return def;
+    return (*(DWORD *)((BYTE *)base + (off & ~3)) & mask) != 0;
+}
+
+static BOOL lumosWriteBit(void *base, int off, DWORD mask, BOOL on)
+{
+    if (!base || off <= 0 || !mask || IsBadWritePtr((BYTE *)base + (off & ~3), 4))
+        return FALSE;
+    DWORD *p = (DWORD *)((BYTE *)base + (off & ~3));
+    if (on) *p |= mask;
+    else    *p &= ~mask;
+    return TRUE;
+}
+
+// Type-aware brightness read: a float-brightness engine read as a byte shows
+// 0x00 for a burning 400.0f light (the v66.5 detection blindness).
+static float lumosBrightnessOf(void *light)
+{
+    if (!light || g_offLightBrightness <= 0) return 0.0f;
+    if (g_lightBrightIsFloat)
+        return lumosReadFloat(light, g_offLightBrightness, 0.0f);
+    return (float)lumosReadByte(light, g_offLightBrightness, 0);
+}
+
+// "Is this wand light genuinely burning" - the stock bLumosOn flag when it is
+// reachable, else the dynamic-light register the stock TurnOn/Off writes.
+static BOOL lumosLightBurning(void *light)
+{
+    if (!light) return FALSE;
+    if (g_offLumosBOn > 0 && g_maskLumosBOn)
+        return lumosReadBit(light, g_offLumosBOn, g_maskLumosBOn, FALSE);
+    BYTE lt = lumosReadByte(light, g_offLightType, 0);
+    return hp3lumos::isLightActiveF(FALSE, lt, lumosBrightnessOf(light)) ? TRUE : FALSE;
+}
+
+// Write the exact stock LumosLight.TurnDynamicLightOn/TurnDynamicLightOff
+// register (plus the bLumosOn flag the stock TurnOn/TurnOff maintain). The
+// caller never touches the light's collision - stock spawns it
+// SetCollision(False,False,False) and its Touch is an empty singular.
+static void lumosApplyLightRegister(void *light,
+                                    const hp3lumos::LumosLightRegister &r,
+                                    BOOL brightnessIsFloat,
+                                    BOOL radiusInnerIsFloat, BOOL on)
+{
+    if (!light) return;
+    if (g_offLightType > 0 && !IsBadWritePtr((BYTE *)light + g_offLightType, 1))
+        *(BYTE *)((BYTE *)light + g_offLightType) = r.lightType;
+    if (g_offLightEffect > 0 && !IsBadWritePtr((BYTE *)light + g_offLightEffect, 1))
+        *(BYTE *)((BYTE *)light + g_offLightEffect) = r.lightEffect;
+    if (g_offLightBrightness > 0) {
+        if (brightnessIsFloat) {
+            if (!IsBadWritePtr((BYTE *)light + g_offLightBrightness, 4))
+                *(float *)((BYTE *)light + g_offLightBrightness) = r.brightnessFloat;
+        } else if (!IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1)) {
+            *(BYTE *)((BYTE *)light + g_offLightBrightness) = r.brightnessByte;
+        }
+    }
+    if (g_offLightHue > 0 && !IsBadWritePtr((BYTE *)light + g_offLightHue, 1))
+        *(BYTE *)((BYTE *)light + g_offLightHue) = r.hue;
+    if (g_offLightSaturation > 0 && !IsBadWritePtr((BYTE *)light + g_offLightSaturation, 1))
+        *(BYTE *)((BYTE *)light + g_offLightSaturation) = r.saturation;
+    if (g_offLightRadius > 0 && !IsBadWritePtr((BYTE *)light + g_offLightRadius, 4))
+        *(float *)((BYTE *)light + g_offLightRadius) = r.radius;
+    if (radiusInnerIsFloat && g_offLightRadiusInner > 0 &&
+        !IsBadWritePtr((BYTE *)light + g_offLightRadiusInner, 4))
+        *(float *)((BYTE *)light + g_offLightRadiusInner) = r.radiusInner;
+    if (g_offLumosBOn > 0 && g_maskLumosBOn)
+        lumosWriteBit(light, g_offLumosBOn, g_maskLumosBOn, on);
+}
+
+// The TheLumosLight property is declared on the wand's class (HP3 save chain:
+// "Class hgame HarryWand TheLumosLight[0]"), so resolve it from the wand's own
+// class token and walk up the chain for the declaring ancestor. The fixed
+// "hgame.baseWand/hgame.HarryWand" attempts both missed on hardware
+// (log: TheLumosLight=+0xFFFFFFFF). Cached per wand class.
+static int lumosLightPropOffForWand(void *wand)
+{
+    if (!wand) return -1;
+    void *cls = cgClassOf(wand);
+    if (!cls) return -1;
+    for (int k = 0; k < 8; k++)
+        if (g_wandLightProp[k].cls == cls) return g_wandLightProp[k].off;
+    char cbuf[160];
+    int off = -1;
+    void *c = cls;
+    for (int d = 0; c && d < 8 && off < 0; d++, c = cgSuper(c)) {
+        objName(c, cbuf, sizeof(cbuf));
+        const char *sp = strchr(cbuf, ' ');
+        if (!sp) break;
+        char path[192];
+        sprintf(path, "%s.TheLumosLight", sp + 1);
+        off = propOffset(path);
+        if (off > 0)
+            logf_("[lumos] v67 TheLumosLight property found on %s = +0x%X",
+                  sp + 1, off);
+    }
+    for (int k = 0; k < 8; k++) {
+        if (!g_wandLightProp[k].cls) {
+            g_wandLightProp[k].cls = cls;
+            g_wandLightProp[k].off = off;
+            break;
+        }
+    }
+    return off;
+}
+
+// Does the receiver's class chain contain the given class object? Same
+// guarded chain walk lumosChainProves uses, for one reference.
+static BOOL lumosChainContainsClass(void *obj, void *want)
+{
+    if (!obj || !want || !g_cgChainOK) return FALSE;
+    for (void *c = cgClassOf(obj); c; c = cgSuper(c))
+        if (c == want) return TRUE;
+    return FALSE;
+}
+
+// Does the receiver's class chain reach Engine.Actor? (Never run Trigger or
+// hand actor fields to anything that cannot prove this.)
+static BOOL lumosChainHasActor(void *obj)
+{
+    return obj && g_clsActor ? lumosChainContainsClass(obj, g_clsActor) : FALSE;
+}
+
+// The most-derived Trigger declaration in the receiver's OWN class chain -
+// what the engine's event dispatch would run for this receiver. Never a
+// foreign-class function (the v66.4 lesson).
+static void *lumosTriggerFnFor(void *obj)
+{
+    if (!obj) return NULL;
+    char cbuf[160];
+    void *c = cgClassOf(obj);
+    for (int d = 0; c && d < 12; d++, c = cgSuper(c)) {
+        objName(c, cbuf, sizeof(cbuf));
+        const char *sp = strchr(cbuf, ' ');
+        if (!sp) break;
+        char path[192];
+        sprintf(path, "%s.Trigger", sp + 1);
+        void *fn = findObjectByPath(path);
+        if (fn) return fn;
+    }
+    return NULL;
+}
+
+// The stock event dispatch, done by hand: every live actor whose Tag equals
+// the trigger's Event gets its own Trigger(Other, Instigator). This is exactly
+// what Engine.Actor.TriggerEvent does - the fallback for engines without the
+// exec export. Edge-triggered (once per level per trigger), so the full-table
+// walk is fine here; it never runs while Lumos is off.
+static BOOL lumosDispatchByTag(DWORD ev, void *other, void *instigator)
+{
+    if (!g_objArray || !g_objArray->Data || g_offTag <= 0 || !ev) return FALSE;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return FALSE;
+    int fired = 0;
+    for (int k = 0; k < n; k++) {
+        void *o = g_objArray->Data[k];
+        if (!o || IsBadReadPtr(o, 0x100)) continue;
+        if (IsBadReadPtr((BYTE *)o + g_offTag, 4)) continue;
+        if (*(DWORD *)((BYTE *)o + g_offTag) != ev) continue;
+        if (!lumosChainHasActor(o)) continue;      // never a Texture/UClass/Function
+        void *fn = lumosTriggerFnFor(o);
+        if (!fn && g_fnActorTrigger) fn = g_fnActorTrigger;
+        if (!fn) continue;
+        BYTE p[16]; memset(p, 0, sizeof(p));
+        *(void **)(p + 0) = other;
+        *(void **)(p + 4) = instigator;
+        callFnP(o, fn, p, 8, "Trigger(Event)");
+        fired++;
+    }
+    return fired > 0;
+}
+
+// Fire one cached LumosTrigger's Event the way stock's StateLumosOn does,
+// once per level, honoring the stock bFirstEventSent latch both ways.
+static void lumosFireTriggerEvent(int slot, void *tr, void *instigator)
+{
+    if (!tr || slot < 0 || slot >= LUMOS_MAX_ACTORS) return;
+    if (g_lumosTrigFired[slot] == 1) return;
+    DWORD ev = (g_offEvent > 0 && !IsBadReadPtr((BYTE *)tr + g_offEvent, 4))
+             ? *(DWORD *)((BYTE *)tr + g_offEvent) : 0;
+    if (!ev) { g_lumosTrigFired[slot] = 1; return; }   // nothing linked
+    BOOL sent = FALSE;
+    // Dispatch preference: the manual Tag walk first - every parm is exact
+    // (the receiver's own most-derived Trigger through ProcessEvent, the
+    // proven-safe fire shape) and the receivers are resolved by the engine's
+    // own Tag==Event rule. The engine native is the fallback for linked
+    // actors the walk cannot fire (native-only Trigger receivers).
+    sent = lumosDispatchByTag(ev, tr, instigator);
+    if (!sent && g_execTriggerEvent)
+        sent = nativeTriggerEvent(tr, ev, tr, instigator);
+    if (sent) {
+        g_lumosTrigFired[slot] = 1;
+        // Stock sets bFirstEventSent so its own state machine never fires the
+        // same event again - a second fire on a TriggerToggle Mover wall
+        // would toggle it CLOSED. Mark it for the same reason.
+        lumosWriteBit(tr, g_offTrigFirstSent, g_maskTrigFirstSent, TRUE);
+        char tn[160]; objName(tr, tn, sizeof(tn));
+        char in[96] = "?";
+        if (instigator) objName(instigator, in, sizeof(in));
+        logf_("  [lumos] v67 TriggerEvent fired: %s event=0x%X instigator=%s "
+              "(wall opens - stock fires this once per level)", tn, ev, in);
+    } else {
+        g_lumosTrigFired[slot] = 1;   // no dispatch path: never retry-spam
+        if (!g_lumosTrigWarned) {
+            g_lumosTrigWarned = TRUE;
+            logf_("  [lumos] v67 no TriggerEvent dispatch path available "
+                  "(execTriggerEvent=%p, Tag walk failed) - wall event skipped",
+                  g_execTriggerEvent);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // v66.1 PERF FIX: the v66 Lumos replication did a full GObjObjects scan with
 // GetFullName on EVERY object, EVERY rendered frame (multiple scans per
@@ -8814,8 +9183,6 @@ static BOOL readLumosCollisionBits(void *actor, BOOL *collide,
 // run once per level (re-armed only when a cached pointer stops being live),
 // and the wand-light fallback scan is throttled to once per second.
 // ---------------------------------------------------------------------------
-#define LUMOS_MAX_ACTORS 1024
-
 static void *g_lumosTriggers[LUMOS_MAX_ACTORS];  // LumosSparkles/LumosTrigger actors
 static int   g_lumosTriggersN = 0;
 static void *g_lumosWalls[LUMOS_MAX_ACTORS];     // GenericColObj / KWBlockingVolume
@@ -8845,6 +9212,7 @@ static BOOL  g_lumosWallSecret[LUMOS_MAX_ACTORS];
 // close restores exactly what the level loaded with. WallBitsUnknown = not
 // a candidate / not readable -> the wall is never opened, never written.
 static BYTE  g_lumosWallOrig[LUMOS_MAX_ACTORS];
+
 
 // Defined further down; needed by lumosRestoreAllWalls.
 static BOOL lumosClassVerified(void *obj, BOOL wantWall);
@@ -8882,9 +9250,16 @@ static void lumosInvalidate(void)
     memset(g_lumosWallColl, -1, sizeof(g_lumosWallColl));
     memset(g_lumosWallSecret, 0, sizeof(g_lumosWallSecret));
     memset(g_lumosWallOrig, hp3lumos::WallBitsUnknown, sizeof(g_lumosWallOrig));
+    memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));
+    // v67: drop the per-player replication state. The level is (being)
+    // destroyed, so any glow particles are going with it - never touch them
+    // here; a dead pointer is dropped via the liveness check in lumosTick.
     for (int p = 0; p < 8; p++) {
         g_lumosWand[p] = NULL;
         g_lumosLight[p] = NULL;
+        g_lumosLightOn[p] = FALSE;
+        g_lumosLightOnAt[p] = 0;
+        g_lumosGlow[p] = NULL;
     }
 }
 
@@ -8914,6 +9289,7 @@ static void lumosScanActors(void)
 {
     g_lumosTriggersN = 0;
     g_lumosWallsN = 0;
+    memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));   // v67: fresh level, fresh latches
     if (!g_objArray || !g_objArray->Data) { g_lumosScanDone = FALSE; return; }
     int n = g_objArray->Num;
     if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) {
@@ -9080,6 +9456,16 @@ static void *lumosLightOf(int p, void *pawn)
         *(void **)((BYTE *)g_lumosLight[p] + g_offOwner) == wand)
         return g_lumosLight[p];
     if (g_lumosLight[p] && !cgLiveObject(g_lumosLight[p])) g_lumosLight[p] = NULL;
+    // v67: TheLumosLight resolved on the wand's OWN class (chain-walked by
+    // lumosLightPropOffForWand) - the exact stock field the wand's Tick reads.
+    int offDyn = lumosLightPropOffForWand(wand);
+    if (offDyn > 0 && !IsBadReadPtr((BYTE *)wand + offDyn, 4)) {
+        void *l = *(void **)((BYTE *)wand + offDyn);
+        if (l && !IsBadReadPtr(l, 0x100) && cgLiveObject(l)) {
+            g_lumosLight[p] = l;
+            return l;
+        }
+    }
     // Direct TheLumosLight property read when that offset ever resolves.
     if (g_offTheLumosLight > 0 &&
         !IsBadReadPtr((BYTE *)wand + g_offTheLumosLight, 4)) {
@@ -9141,19 +9527,19 @@ static void lumosTick(void)
     // the expiry, so an infinite-Lumos gargoyle keeps secret walls openable
     // for exactly as long as its light burns, and the state dies within a
     // second of the last light instead of DefaultLumosDurationMs after it.
+    // v67: the brightness read is type-aware - on a float-brightness engine
+    // the old byte read saw 0x00 inside 400.0f and never engaged.
     for (int p = 0; p < numP; p++) {
         void *pawn = pw[p];
         if (!pawn) continue;
         void *light = lumosLightOf(p, pawn);
         if (!light) continue;
-        BYTE lt = (g_offLightType > 0 && !IsBadReadPtr((BYTE *)light + g_offLightType, 1))
-                ? *(BYTE *)((BYTE *)light + g_offLightType) : 1;
-        BYTE br = (g_offLightBrightness > 0 && !IsBadReadPtr((BYTE *)light + g_offLightBrightness, 1))
-                ? *(BYTE *)((BYTE *)light + g_offLightBrightness) : 255;
-        if (hp3lumos::isLightActive(false, lt, br)) {
+        BYTE lt = lumosReadByte(light, g_offLightType, 1);
+        float br = lumosBrightnessOf(light);
+        if (hp3lumos::isLightActiveF(false, lt, br)) {
             if (!g_lumosState.active) {
                 g_lumosState.activate(p, now, hp3lumos::DefaultLumosDurationMs);
-                logf_("  [lumos] active light found on P%d - state engaged (25s)", p);
+                logf_("  [lumos] active light found on P%d - state engaged (30s)", p);
             } else {
                 g_lumosState.refresh(now, hp3lumos::FollowLightRefreshMs);
             }
@@ -9180,40 +9566,123 @@ static void lumosTick(void)
             void *wand = lumosWandOf(p, pawn);
             if (wand) setLumosActorHidden(wand, FALSE);
             void *light = lumosLightOf(p, pawn);
-            if (light) {
-                setLumosActorHidden(light, FALSE);
-                // Stock LumosLight.TurnDynamicLightOn() values (HP2
-                // LumosLight.uc): LT_Steady, radius 15, hue 32, saturation
-                // 72, full brightness.
-                if (g_offLightType > 0 && !IsBadWritePtr((BYTE *)light + g_offLightType, 1))
-                    *(BYTE *)((BYTE *)light + g_offLightType) = 1; // LT_Steady
-                if (g_offLightBrightness > 0 && !IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1))
-                    *(BYTE *)((BYTE *)light + g_offLightBrightness) = 255;
-                if (g_offLightRadius > 0 && !IsBadWritePtr((BYTE *)light + g_offLightRadius, 4))
-                    *(float *)((BYTE *)light + g_offLightRadius) = 15.0f;
-                if (g_offLightHue > 0 && !IsBadWritePtr((BYTE *)light + g_offLightHue, 1))
-                    *(BYTE *)((BYTE *)light + g_offLightHue) = 32;
-                if (g_offLightSaturation > 0 && !IsBadWritePtr((BYTE *)light + g_offLightSaturation, 1))
-                    *(BYTE *)((BYTE *)light + g_offLightSaturation) = 72;
-                // v66.5: the light's collision is deliberately NOT touched.
-                // Stock spawns it SetCollision(False,False,False)
-                // (LumosLight.PreBeginPlay) - its Touch is an empty singular
-                // no-op and it must never block anything. The v66.x
-                // setLumosActorCollision(light, TRUE) poke set
-                // bCollideActors/bBlockActors/bBlockPlayers on an actor that
-                // is not even in the collision octree.
+            // v67: the literal character state stock writes on TurnOn -
+            // PlayerHarry.bLumosOn = True (here: every driven player).
+            if (g_offPawnLumosOn > 0 && g_maskPawnLumosOn)
+                lumosWriteBit(pawn, g_offPawnLumosOn, g_maskPawnLumosOn, TRUE);
+            if (!light) continue;
+            // Keep the light actor itself visible (v66.5 compensation, kept:
+            // idempotent, and the stock chain never hides these lights).
+            setLumosActorHidden(light, FALSE);
+
+            BOOL burning = lumosLightBurning(light);
+            if (hp3lumos::companionLightShouldTurnOn(lumosActive != FALSE,
+                                                     burning != FALSE,
+                                                     g_lumosLightOn[p] != FALSE)) {
+                // v67: replicate LumosLight.TurnOn() WITHOUT the stock
+                // single-player gate (if (PlayerHarry.bLumosOn) return -
+                // by the time we sync, the gargoyle already lit the LEAD's
+                // light stock-side, so a script TurnOn call would early
+                // out). The exact stock register instead:
+                // bLumosOn=True + TurnDynamicLightOn (LT_Steady,
+                // LE_NonIncidence, brightness, hue 32, sat 72, radius 15,
+                // radiusInner 5). The light's collision is deliberately
+                // NOT touched (stock spawns it SetCollision(False,False,
+                // False), Touch is an empty singular).
+                lumosApplyLightRegister(light, hp3lumos::stockLumosLightOn(),
+                                        g_lightBrightIsFloat,
+                                        g_lightRadiusInnerIsFloat, TRUE);
+                g_lumosLightOn[p] = TRUE;
+                g_lumosLightOnAt[p] = now;
+                // Stock TurnOn spawns the glow at the light's location and
+                // the wand's Tick then relocates the light onto the wand
+                // tip; a light found cold may still sit at its long-dead
+                // spawn point, so seed it near its owner first.
+                if (F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12) &&
+                    g_execSetLocation) {
+                    float pl[3], dst[3];
+                    memcpy(pl, (BYTE *)pawn + F.Location, 12);
+                    dst[0] = pl[0]; dst[1] = pl[1]; dst[2] = pl[2] + 48.0f;
+                    nativeSetLocation(light, dst);
+                }
+                logf_("  [lumos] v67 P%d TheLumosLight turned ON (stock "
+                      "TurnDynamicLightOn register + bLumosOn)", p);
+            }
+            if (!g_lumosLightOn[p]) continue;
+
+            // v67: stock LumosLight.Tick auto-offs after 30 s. The mod's
+            // light-follow ratchet would otherwise never let the window
+            // close (the mod keeps this light burning while the state is
+            // active). Replay the stock timeout per replicated light.
+            if (now - g_lumosLightOnAt[p] >= hp3lumos::StockLumosDurationMs) {
+                lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
+                                        g_lightBrightIsFloat,
+                                        g_lightRadiusInnerIsFloat, FALSE);
+                g_lumosLightOn[p] = FALSE;
+                if (g_lumosGlow[p]) {
+                    if (cgLiveObject(g_lumosGlow[p])) destroyActorFX(g_lumosGlow[p]);
+                    g_lumosGlow[p] = NULL;
+                }
+                logf_("  [lumos] v67 P%d TheLumosLight auto-off after stock "
+                      "30s (TurnDynamicLightOff + particles destroyed)", p);
+                continue;
+            }
+
+            // v67: the visible wand glow - stock TurnOn spawns
+            // LumosLightFX owned by the light; keep one alive per player
+            // while the replicated light burns.
+            if (g_lumosGlowFX && g_clsLumosLightFX && g_execSpawn &&
+                (!g_lumosGlow[p] || !cgLiveObject(g_lumosGlow[p]))) {
+                float ll[3];
+                if (F.Location > 0 && !IsBadReadPtr((BYTE *)light + F.Location, 12)) {
+                    memcpy(ll, (BYTE *)light + F.Location, 12);
+                    int rot0[3] = { 0, 0, 0 };
+                    g_lumosGlow[p] = spawnFX(light, g_clsLumosLightFX, light,
+                                             ll, rot0);
+                    logf_("  [lumos] v67 P%d wand glow spawned (%s) -> %p",
+                          p, "stock LumosLightFX, owned by the light",
+                          g_lumosGlow[p]);
+                }
+            }
+            // The stock wand Tick relocates the light every frame via
+            // TheLumosLight.UpdateLocation(WandEndPoint) while bLumosOn.
+            // Self-heal only if it drifted away (property ever mismatched):
+            // stock follow works, this never fires.
+            if (F.Location > 0 &&
+                !IsBadReadPtr((BYTE *)light + F.Location, 12) &&
+                !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
+                float *ll = (float *)((BYTE *)light + F.Location);
+                float *pl = (float *)((BYTE *)pawn + F.Location);
+                float dx = ll[0] - pl[0], dy = ll[1] - pl[1], dz = ll[2] - pl[2];
+                if (dx * dx + dy * dy + dz * dz > 300.0f * 300.0f && g_execSetLocation) {
+                    float dst[3] = { pl[0], pl[1], pl[2] + 48.0f };
+                    nativeSetLocation(light, dst);
+                }
             }
         }
     } else {
-        for (int p = 1; p < numP; p++) {
+        // v67: only lights the MOD turned on are turned off, with the exact
+        // stock TurnOff register (stock TurnOff also destroys the particles
+        // and writes PlayerHarry.bLumosOn = False). A stock-burning light
+        // (the lead's, or an infinite gargoyle's) stays in the game's hands.
+        for (int p = 0; p < numP; p++) {
             void *pawn = pw[p];
-            if (!pawn) continue;
+            if (pawn && g_offPawnLumosOn > 0 && g_maskPawnLumosOn)
+                lumosWriteBit(pawn, g_offPawnLumosOn, g_maskPawnLumosOn, FALSE);
+            if (!g_lumosLightOn[p]) continue;
             void *light = lumosLightOf(p, pawn);
-            if (light && !isLumosActorHidden(light)) {
-                setLumosActorHidden(light, TRUE);
-                if (g_offLightBrightness > 0 && !IsBadWritePtr((BYTE *)light + g_offLightBrightness, 1))
-                    *(BYTE *)((BYTE *)light + g_offLightBrightness) = 0;
+            if (light) {
+                lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
+                                        g_lightBrightIsFloat,
+                                        g_lightRadiusInnerIsFloat, FALSE);
             }
+            g_lumosLightOn[p] = FALSE;
+            if (g_lumosGlow[p]) {
+                if (cgLiveObject(g_lumosGlow[p])) destroyActorFX(g_lumosGlow[p]);
+                g_lumosGlow[p] = NULL;
+            }
+            logf_("  [lumos] v67 P%d replicated light turned off (state "
+                  "expired - stock TurnOff register replayed)", p);
         }
     }
 
@@ -9228,26 +9697,83 @@ static void lumosTick(void)
     if (!lumosActive && !wallsDirty) return;
 
     float playerPos[8][3];
+    int posSlot[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // v67: player p -> playerPos slot
     int validPlayers = 0;
     for (int p = 0; p < numP; p++) {
         void *pawn = pw[p];
         if (pawn && F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
             memcpy(playerPos[validPlayers], (BYTE *)pawn + F.Location, 12);
+            posSlot[p] = validPlayers;
             validPlayers++;
         }
     }
     if (validPlayers == 0) return;
 
-    // v66.5: the per-trigger fire loop is GONE. The hardware pelog of the
-    // v66.4 field report shows the most-derived Trigger on a placed
-    // LumosTrigger is Engine.Actor.Trigger - the empty base event (in the
-    // HP2 lineage LumosTrigger and LumosSparkles are OnLumosOn()/OnLumosOff()
-    // state machines, armed by the stock LumosLight.TurnOn AllActors
-    // broadcast that already ran when the gargoyle lit) - so firing
-    // Trigger() on them was a verified no-op. The stock chain stays
-    // untouched; the mod's "any player may pass" replication is the
-    // octree-safe SetCollision loop below. The trigger cache itself stays:
-    // it marks which walls are secret walls (pairing done at scan time).
+    // -----------------------------------------------------------------------
+    // v67: THE WALL-OPEN PATH STOCK ACTUALLY USES. Stock LumosTrigger arms on
+    // the OnLumosOn broadcast (which the game runs stock-side whenever any
+    // player's Lumos lights a gargoyle - HandleSpellLumos hardcodes
+    // PlayerHarry's wand), then fires TriggerEvent(Event, self, None) ONCE
+    // when PlayerHarry comes within its own fDistanceCheck. That check is the
+    // only thing a companion cannot satisfy - so the mod replicates exactly
+    // it: Lumos on, trigger's own Event non-empty, nobody has fired it yet
+    // (stock bFirstEventSent or the mod's once-per-level latch), and ANY
+    // tracked player inside the trigger's own radius (fDistanceCheck /
+    // optional fZDistanceCheck, read from the actor, stock defaults 512/64).
+    // The fire goes through the engine's own TriggerEvent native (falls back
+    // to the manual Tag walk) - that opens whatever the level linked to the
+    // trigger, including the Movers the stock secret walls are built from,
+    // which the GenericColObj/KWBlockingVolume SetCollision path below never
+    // touched. Fires once per level per trigger, exactly like stock's
+    // bFirstEventSent which is never reset.
+    // -----------------------------------------------------------------------
+    if (lumosActive && g_lumosTriggerEvents && g_lumosTriggersN > 0) {
+        for (int t = 0; t < g_lumosTriggersN && t < LUMOS_MAX_ACTORS; t++) {
+            if (g_lumosTrigFired[t] == 1) continue;
+            void *tr = g_lumosTriggers[t];
+            if (!tr || !cgLiveObject(tr) || cgDeleted(tr)) continue;
+            if (!lumosClassVerified(tr, FALSE)) continue;
+            if (F.Location <= 0 || IsBadReadPtr((BYTE *)tr + F.Location, 12)) continue;
+            if (g_offEvent <= 0 || IsBadReadPtr((BYTE *)tr + g_offEvent, 4)) continue;
+            DWORD ev = *(DWORD *)((BYTE *)tr + g_offEvent);
+            if (!ev) { g_lumosTrigFired[t] = 1; continue; }   // nothing linked
+            // Stock already fired this one (P1's path ran first): never fire
+            // again - a TriggerToggle Mover wall would toggle CLOSED.
+            if (lumosReadBit(tr, g_offTrigFirstSent, g_maskTrigFirstSent, FALSE)) {
+                g_lumosTrigFired[t] = 1;
+                continue;
+            }
+            float *tl = (float *)((BYTE *)tr + F.Location);
+            float rdist = lumosReadFloat(tr, g_offTrigDist,
+                                         hp3lumos::StockTriggerDistanceCheck);
+            BOOL useZ = lumosReadBit(tr, g_offTrigUseZ, g_maskTrigUseZ, FALSE);
+            float zdist = lumosReadFloat(tr, g_offTrigZDist,
+                                         hp3lumos::StockTriggerZDistanceCheck);
+            int nearP = -1;
+            for (int p = 0; p < numP && nearP < 0; p++) {
+                if (posSlot[p] < 0) continue;
+                if (hp3lumos::stockTriggerInRadius(tl, playerPos[posSlot[p]],
+                                                   rdist, useZ != FALSE, zdist))
+                    nearP = p;
+            }
+            if (nearP < 0) continue;
+            lumosFireTriggerEvent(t, tr, pw[nearP]);
+        }
+    }
+
+    // v67 history note: v66 fired Trigger() ON the LumosTrigger actors - the
+    // hardware pelog of the v66.4 field report showed the most-derived
+    // Trigger on a placed LumosTrigger is Engine.Actor.Trigger, the empty
+    // base event, so that was a verified no-op AND a crash risk, and v66.5
+    // removed it. v67 does not fire Trigger on the trigger either: it fires
+    // the trigger's Event the way stock's own state machine does (the
+    // TriggerEvent dispatch above), which is a different, safe call - the
+    // receiver of each Trigger is the event-LINKED actor found through the
+    // engine's own Tag dispatch, never the trigger and never a guessed
+    // class. The stock chain stays untouched otherwise; the octree-safe
+    // SetCollision loop below remains the fallback for collision-proxy
+    // walls. The trigger cache also marks which walls are secret walls
+    // (pairing done at scan time).
 
     // v66.2: only touch a wall when the wanted state differs from what we
     // last applied, and re-assert on a 250ms cadence while Lumos is on so
@@ -10233,6 +10759,12 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
               g_stuckCfg.liftHeight, hp3stuck::kMaxLifts,
               g_stuckCfg.rescueMaxDist, g_stuckCfg.maxRescues,
               g_stuckCfg.cooldownMs, g_stuckCfg.jumpMaxFlightMs);
+
+        // v67: Lumos replication toggles.
+        g_lumosTriggerEvents = GetPrivateProfileIntA("lumos", "TriggerEvents", 1, ini);
+        g_lumosGlowFX        = GetPrivateProfileIntA("lumos", "GlowFX", 1, ini);
+        logf_("hp3mod.ini: lumos TriggerEvents=%d GlowFX=%d",
+              g_lumosTriggerEvents, g_lumosGlowFX);
 
         char sys[MAX_PATH];
         GetSystemDirectoryA(sys, MAX_PATH); strcat(sys, "\\d3d8.dll");
