@@ -2185,3 +2185,111 @@ Timeline of one cast (measured in logs; hold = keydown->keyup intent):
       while the window burns). P2/P3 pass through.
     * After 30 s: "[lumos] v69 P%d light went cold on its own (stock Tick
       auto-off ...)" for stock-lit companions - the window ends stock-side.
+
+v70 (2026-09-10) - LUMOS P2/P3 ROUND 4: THE v69 FIELD LOG DECODED
+------------------------------------------------------------------
+Same HP3_InsideHub gargoyle test, 2 players, P2 = Hermione casts Lumos at
+gargoyle6. Lead glows natively; P2's wand dark; P2 cannot pass the wall.
+Every symptom is explained by lines already in that log:
+
+- "[lumos] v69 level-side fields PARTIAL: ... Pawn.bLumosOn=+0xFFFFFFFE(0x0)"
+  The pawn's bLumosOn bit NEVER resolved. The v69 table guessed
+  hgame.harry / hgame.HPawn / hgame.HPCharacter .bLumosOn; HP3 renamed the
+  hierarchy (the same log shows hgame.HPPawn, hgame.HPHeroPawn and the wand
+  class hgame.WeaponWand - none of the HP2 names). Consequence: the v69
+  "gate dance" masked NOTHING. PlayerHarry.bLumosOn stayed True (the
+  gargoyle had just lit the lead), stock LumosLight.TurnOn hit
+  `if (PlayerHarry.bLumosOn) return;` and did nothing:
+     "-> ProcessEvent LumosLight.TurnOn [stock replication]"
+     "[lumos] v69 P1 stock TurnOn did not engage (light still cold)"
+  FIX: resolve bLumosOn by walking the LIVE pawn's own class chain
+  (lumosResolvePawnLumosBit - the exact walk that found TheLumosLight on
+  hgame.WeaponWand in v68), and add a PRIMARY gate that needs no pawn bit
+  at all: for the one synchronous TurnOn call the light's OWN PlayerHarry
+  var (LumosLight.PlayerHarry, chain-resolved from the live light) is
+  retargeted at the companion. Stock then reads the gate off the companion
+  (whose bit the mod holds FALSE for the call), writes
+  PlayerHarry.bLumosOn=True ONTO THE COMPANION and spawns the glow - the
+  literal stock semantics, per player. The var is restored right after the
+  call (Tick/TurnOff/ClientMessage keep talking to the lead). The retarget
+  is only done when the companion's class declares bLumosOn at the resolved
+  offset (lumosPawnHasLumosBit, cached per class) - stock declares it on
+  harry, and writing harry's offset inside a Hermione object would be a
+  foreign-field poke; otherwise the chain-resolved bit mask on the lead
+  (the v69 dance, now with a real offset) is the gate. The lead's own bit is
+  never written by the mod any more (the stock chain owns it).
+
+- "[lumos] v69 P1 TheLumosLight turned ON (v68 fallback register)" then,
+  16 ms later, "[lumos] v69 P1 light went cold on its own (stock Tick
+  auto-off ...) - one shot per cast". NOT a stock auto-off. The v68
+  fallback deliberately holds LumosLight.bLumosOn LOW until a glow exists
+  (UpdateLocation dereferences Particles), and GlowFX=00000000 in the same
+  log (HPParticle.LumosLightFX does not exist on HP3 by that path) meant no
+  glow ever existed - so lumosLightBurning() (which reads bLumosOn, resolved
+  +0x3F8) returned cold on the very next frame and the observation latch
+  declared the cast dead. The light was ON (register written) for one
+  frame. FIX: the auto-off observation applies to STOCK-lit lights only
+  (hp3lumos::observedStockAutoOff, regression-tested); the fallback keeps
+  the mod's own 30 s timer as before. LumosLightFX is now also resolved by
+  CLASS TOKEN in any package (LRK_CLASSTOKEN "*.LumosLightFX" - HP3 moved
+  it out of HPParticle), and a glow-less fallback light is ridden onto the
+  companion every frame by the mod (the stock ride is off while the bit is
+  low), so at least the dynamic light travels with P2.
+
+- "[lumos] v68 Tag walk fires Function Engine.Actor.Trigger on 10e0c800 via
+  Engine.Actor.Trigger (EMPTY base - no-op!)" and the pelog line
+  "LumosSparklesTrigger HP3_InsideHub.LumosSparklesTrigger5 ::
+  Function Engine.Actor.Trigger other=LumosTrigger HP3_InsideHub.LumosTrigger0"
+  Two things. (a) lumosTriggerFnFor's class-level loop walked the chain
+  down to Engine.Actor, found the EMPTY base Trigger there and returned it
+  - the state-declared pass (Pkg.Class.State.Trigger) that v68 added for
+  Movers NEVER RAN. (b) The receiver of LumosTrigger0's Event is the
+  LumosSparklesTrigger - HP3 wires LumosTrigger --Event--> LumosSparkles
+  Trigger --Event--> wall (the scan's 4 Event==Tag pairings are
+  sparkles.Event == wall.Tag). The walk fired the empty base on the
+  sparkles, counted that as a fire, latched the slot, and the wall's real
+  linkage one hop further was never dispatched. Meanwhile the pelog shows
+  Hermione Bump-ing something at the wall and touching GenericColObj2 -
+  the mod had opened "#63", but the log never said which actor #63 was
+  nor what she bumped. FIX: (1) fire the SCRIPT Engine.Actor.TriggerEvent
+  (UE2: a plain UnrealScript function; the HP2 DuelTrigger overrides its
+  exact signature) through ProcessEvent ON THE TRIGGER - byte for byte
+  what stock StateLumosOn.BeginState does - so the ENGINE performs the
+  virtual Trigger dispatch on every Tag-matched receiver, state-declared
+  Mover Triggers included; (2) relay an EMPTY-Trigger receiver's own Event
+  one hop onward the same way (lumosRelayEventChain, depth <= 3, every
+  receiver named with its Tag/Event) - that is how the sparkles hop
+  reaches the wall; (3) the manual Tag walk (fallback) never counts the
+  empty base as a fire and relays through it instead; (4) the chain
+  lookup stops before Engine.Actor so the state pass actually runs.
+
+- Diagnostics: "[lumos] v69 level-side fields PARTIAL" was logged EVERY
+  FRAME for a second (condition evaluated per frame, sAttempts advanced
+  per second) - once per attempt now. The scan lists every cached trigger
+  (name, Tag, Event, location) and every secret wall (name, Tag, paired
+  trigger, pristine bits, location); an opened wall is logged by NAME and
+  position; the pelog prints the Bump partner ("other=...") so the next
+  log names whatever still blocks a companion at a revealed wall.
+
+  tools/hostcheck/check.sh: syntax clean (-Wall -Wextra). tests/run.sh:
+  all suites pass (lumos: +observedStockAutoOff). The Windows DLL could NOT
+  be rebuilt in this sandbox (no i686 MinGW toolchain, no root) - build via
+  CI (build-release.yml) and confirm line 2 of hp3mod.log says build v70.
+
+  HARDWARE CHECK LIST:
+    * Log line 2 says build v70.
+    * "[lumos] v70 Pawn.bLumosOn resolved on hgame.<class> = +0x... mask
+      0x..." and "[lumos] v70 LumosLight.PlayerHarry resolved (+0x...)".
+      If either says NOT FOUND, report the line.
+    * "[lumos] v70 class token *.LumosLightFX resolved to Class <pkg>.
+      LumosLightFX" - tells us where HP3 keeps the glow class.
+    * P2 casts Lumos at the gargoyle: expect "[lumos] v69 P1 TheLumosLight
+      turned ON via the STOCK TurnOn script ... glow=0x<nonzero>" and NO
+      "did not engage". P2's wand tip glows and the glow follows the wand.
+    * Walk P2 to the wall: expect "[lumos] v68 TriggerEvent fired (script
+      Engine.Actor.TriggerEvent ...)" followed by "[lumos] v70 event
+      receiver[1]: LumosSparklesTrigger... (own Trigger: EMPTY base,
+      Event=0x....)" and "relaying ... via script TriggerEvent" and then
+      the wall receiver line. If P2 still bumps, the pelog now says
+      "HPCharacter.Bump other=<actor>" - report that actor's line and the
+      "secret wall #k <name> ..." lines from the scan.
