@@ -464,10 +464,19 @@ int main()
     assert(!isLumosTriggerObject("Texture hgame.LumosTriggerIcon"));
     assert(!isLumosTriggerObject("Class hgame.LumosTrigger"));
 
+    // 17. v70: the stock auto-off observation applies to STOCK-lit lights
+    //     only; a fallback-lit light reading cold (its bit is held low until
+    //     a glow exists) is NOT an auto-off and must not be latched dead.
+    assert(observedStockAutoOff(true, true, false));    // stock-lit, cold
+    assert(!observedStockAutoOff(true, true, true));    // still burning
+    assert(!observedStockAutoOff(true, false, false));  // fallback-lit, cold
+    assert(!observedStockAutoOff(false, false, false)); // never lit by mod
+    assert(!observedStockAutoOff(false, true, false));  // inconsistent
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
               "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
               "v66.5 wall-bits/follow-light, v67 stock-register/"
               "trigger-fire, v68 proxied-wall/retry and v69 Event==Tag "
-              "linkage / LumosSparkles token assertions passed");
+              "linkage / LumosSparkles token, v70 stock-auto-off observation assertions passed");
     return 0;
 }

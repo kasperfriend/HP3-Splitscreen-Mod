@@ -221,6 +221,16 @@ inline bool companionLightShouldTurnOn(bool lumosActive, bool lightBurning,
     return lumosActive && !lightBurning && !modAlreadyTurnedOn;
 }
 
+// v70: a light the mod lit may only be OBSERVED as "auto-off'd by stock"
+// when it was lit through the STOCK TurnOn script (stock Tick owns it). A
+// v68-fallback light deliberately holds bLumosOn low until a glow exists, so
+// reading it "cold" one frame later is the mod's own doing, not the stock
+// 30 s timer - v69 latched such a light dead after ONE frame.
+inline bool observedStockAutoOff(bool modLit, bool stockLit, bool burning)
+{
+    return modLit && stockLit && !burning;
+}
+
 struct State {
     bool active;
     int sourcePlayer;
