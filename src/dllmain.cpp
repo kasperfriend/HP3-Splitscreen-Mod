@@ -166,8 +166,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v71"
-#define MOD_STAMP "build v71 - 2026-09-19 - LUMOS P2/P3 ROUND 5: WHAT THE v70 HARDWARE LOG PROVED, AND THE TWO FIXES IT FORCED. (1) THE WALL. HP3_InsideHub has NO Event->wall linkage at all: LumosTrigger0.Event=0x8D1A is carried by exactly one actor, LumosSparklesTrigger5 (whose own Event is 0x0, so the chain ends there), while the cached walls carry Tags 0x3E63/0x405A. The mod still opened one guess - it logged v66.5 opened secret wall 63 KWBlockingVolume5 - and P2 kept bumping into something else. v71 stops trying to derive the stock linkage and keys on the only two facts the level really gives: the trigger own radius (a tracked player inside it = stock InLumosRadius, the designer you-are-at-this-wall distance) and the player own position. EVERY blocking actor near either is opened through the octree-safe SetCollision native - class-agnostic now (KWBlockingVolume, GenericColObj, a Mover, anything), because the v66.5 rule only ever considered two class tokens and only when they were paired at scan time. An opened actor is LATCHED open for the level, because stock opens a secret wall permanently (bFirstEventSent, bEventLeaving=False) - v66.5..v70 closed it again as soon as the Lumos window expired. The scan now also skips actors of another level (the v70 log carried five Save0 triggers and four Save0 walls into HP3_InsideHub). (2) THE LIGHT. v68..v70 seeded a companion light at the PAWN and left it there, because stock baseWand.Tick ride never reached a companion wand - the field report light-underneath-but-no-wand-glow is exactly that: light AND LumosLightFX parked on the character. v71 rides both onto a wand-tip anchor every frame (the wand actor own Location when it is believable, else hand height above the pawn - the game own projectile origin), and stands down automatically if the game own ride turns out to be carrying the light. Every glow the mod ever sees on a player light is tracked (v70 kept ONE pointer and orphaned the previous LumosLightFX on every re-cast - the stacked-up report), all of them ride, all of them are destroyed on teardown, and a mod-owned light is retired on a hard ceiling so nothing can burn forever (stuck spell). The LEAD light is now only ever touched in two narrow ways: it is never forced visible (v66.5..v70 ran setLumosActorHidden(FALSE) for every player, p==0 included - the prime suspect for the main character receiving heavy light underneath), and its POSITION is only fixed when it is provably lost or sitting underfoot (LeadRide=1). Two player slots resolving to the same pawn are collapsed to one (stacked lights on one character). (3) DIAGNOSTICS: a 1 Hz status line prints every player pawn/wand/light/glow position and whether the light is being carried; every opened actor is named with the key that opened it; and while a player stands at a revealed wall the mod names every blocking actor within 260 units of him with its open state, so the next log says exactly what still blocks. v70 STOCK-TURNON REPLICATION, v69 EVENT DISPATCH, v68 DEFERRED RESOLUTION, v66.5 OCTREE-SAFE SETCOLLISION: ALL KEPT."
+#define MOD_BUILD  "v72"
+#define MOD_STAMP "build v72 - 2026-09-19 - LUMOS P2/P3 ROUND 6: MEASURE TO THE SURFACE, AND OPEN WHAT THE PLAYER IS PRESSED AGAINST. (1) v71 measured every distance from an actor ORIGIN. The v70 log shows why that is not enough: the player stood at (232 2423 -181), the wall actor the mod opened sits at (192 2616 32) - 290 units away, most of it vertical - so a radius keyed on origins either misses what stops him or has to be made so large that it stops being evidence. v72 measures to the SURFACE of the actor collision cylinder instead (cylinderGap, clamped so a brush reporting a huge cylinder cannot swallow the level), in both the trigger-radius rule and the cache bookkeeping. (2) The blocker cache no longer pre-filters by distance to a trigger (that filter was the same test the open rule then applied, so an actor whose origin sits further out was never even managed - every brush blocker). Every blocking actor of the current level is cached, up to LUMOS_MAX_BLOCKERS, with the actor FURTHEST from any trigger evicted when it fills; the walk is done in round-robin slices so a 1024-entry cache costs the same per frame as v71 handful. (3) THE BUMP RULE: a tracked player standing inside an armed Lumos trigger own radius who keeps pushing into something and goes nowhere for BumpHold ms is touching the blocker - whatever class it is, cached or not - and it is opened. This is the only rule that needs no linkage, no class token and no origin geometry. It also accepts TOUCH-ONLY volumes (bCollideActors, no block flag): such an actor cannot stop anyone by collision, which is exactly why v71 excluded it - but it is also the shape of a CompanionCorral, and the v70 pelog shows GenericColObj2/CompanionCorral6 touching Hermione (a COMPANION) every frame while the lead walks straight through. That is the one shape that makes players 2 and 3 fail where player 1 succeeds. Real trigger volumes are never silenced (ci->isTrigger). (4) DIAGNOSTICS: every bump prints the pawn, its controller class, Physics, the push duration, how many actors are touching it and how many were opened; when nothing that blocks is an actor the line says so, which is the proof that the blocker is level BSP and no SetCollision can ever open it. The at-wall dump now lists touch-only actors too. v71 TRIGGER-KEYED CLASS-AGNOSTIC OPENING AND LATCH, v70 STOCK-TURNON REPLICATION, v69 EVENT DISPATCH, v68 DEFERRED RESOLUTION, v66.5 OCTREE-SAFE SETCOLLISION: ALL KEPT."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -9250,6 +9250,31 @@ static int    g_lumosWandGlow      = 1;
 static int    g_lumosUnhideLight   = 1;
 static int    g_lumosLeadHeal      = 1;
 static float  g_lumosGlowRadius    = 0.0f;
+// v72 ini [lumos] knobs (see hp3mod.ini):
+//   BumpOpen  - 1 = when a tracked player pushes into something at a Lumos
+//               secret and gets nowhere for BumpHold ms, open what is
+//               literally touching him: class-agnostic, and independent of
+//               the cache (a brush blocker's actor origin can sit hundreds of
+//               units from the surface it blocks, which is exactly what every
+//               origin-keyed radius rule misses).
+//   BumpGap   - units of surface gap that still count as "touching him",
+//               on top of his own collision radius.
+//   BumpHold  - ms of pushing without progress before anything is opened.
+//   TouchOpen - 1 = a TOUCH-ONLY volume counts as a blocker too. Such an
+//               actor has bCollideActors and no block flag at all, so it
+//               cannot stop a player by collision - but that is also the
+//               shape of a CompanionCorral, which is what holds COMPANIONS
+//               (players 2 and 3) back where the lead walks straight
+//               through. The v70 pelog shows them touching Hermione.
+static int    g_lumosBumpOpen      = 1;
+static float  g_lumosBumpGap       = hp3lumos::BumpGapDefault;
+static int    g_lumosBumpHold      = (int)hp3lumos::BumpHoldMs;
+static int    g_lumosTouchOpen     = 1;
+// v72: per-player "pushed into something and got nowhere" probes.
+static hp3lumos::StuckProbe g_lumosProbe[8];
+static float  g_lumosProbePos[8][3] = { {0} };
+static DWORD  g_lumosProbeAt[8]     = { 0 };
+static BOOL   g_lumosProbeKnown[8]  = { FALSE };
 static BOOL   g_lumosTrigWarned    = FALSE;
 // Per-wand-class TheLumosLight property offset cache (wand class -> offset).
 static struct { void *cls; int off; } g_wandLightProp[8] = {};
@@ -10018,9 +10043,16 @@ static void lumosScanBlockers(void)
     if (F.Location <= 0) return;
     int n = g_objArray->Num;
     if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
-    const float R = g_lumosOpenRadius > 0.0f ? g_lumosOpenRadius
-                                            : hp3lumos::BlockerTriggerRadius;
-    for (int k = 0; k < n && g_lumosBlockersN < LUMOS_MAX_BLOCKERS; k++) {
+    // v72: NO trigger-proximity filter any more. v71 only cached a blocking
+    // actor that sat within OpenRadius of some trigger - which is exactly the
+    // test the open rule then applied, so an actor whose ORIGIN sits further
+    // out (every brush blocker, and the wall the v70 player was standing at,
+    // 290 units from its own actor origin) was never even managed. The open
+    // rules below are the gate; the cache is only the bookkeeping. The nearest
+    // trigger is still recorded (it is the log's "which secret is this"), and
+    // when the cache fills up the actor FURTHEST from any trigger is evicted,
+    // so a 1024-slot cache keeps the actors that sit at the secrets.
+    for (int k = 0; k < n; k++) {
         void *obj = g_objArray->Data[k];
         if (!obj || IsBadReadPtr(obj, 0x100)) continue;
         if (cgDeleted(obj) || !actorInCurrentLevel(obj)) continue;
@@ -10032,7 +10064,7 @@ static void lumosScanBlockers(void)
         if (!readLumosCollisionBits(obj, &c, &ba, &bp)) continue;
         if (!ba && !bp) continue;                 // does not block anything
         float *ol = (float *)((BYTE *)obj + F.Location);
-        int best = -1; float bestD = R * R;
+        int best = -1; float bestD = 1.0e30f;
         for (int t = 0; t < g_lumosTriggersN; t++) {
             void *tr = g_lumosTriggers[t];
             if (!tr || !cgLiveObject(tr) || IsBadReadPtr((BYTE *)tr + F.Location, 12))
@@ -10042,8 +10074,31 @@ static void lumosScanBlockers(void)
             float d2 = dx * dx + dy * dy + dz * dz;
             if (d2 < bestD) { bestD = d2; best = t; }
         }
-        if (best < 0) continue;                   // nowhere near a secret wall
-        int s = g_lumosBlockersN++;
+        int s;
+        if (g_lumosBlockersN < LUMOS_MAX_BLOCKERS) {
+            s = g_lumosBlockersN++;
+        } else {
+            // full: evict the managed actor that is furthest from every
+            // trigger - the one least likely to be a secret wall.
+            int worst = -1; float worstD = bestD;
+            for (int w = 0; w < g_lumosBlockersN; w++) {
+                void *wo = g_lumosBlockers[w];
+                if (!wo || IsBadReadPtr((BYTE *)wo + F.Location, 12)) {
+                    worst = w; worstD = 1.0e30f; break;
+                }
+                int wt = g_lumosBlockerTrig[w];
+                if (wt < 0 || wt >= g_lumosTriggersN) { worst = w; worstD = 1.0e30f; break; }
+                void *tr = g_lumosTriggers[wt];
+                if (!tr || IsBadReadPtr((BYTE *)tr + F.Location, 12)) { worst = w; worstD = 1.0e30f; break; }
+                float *tl = (float *)((BYTE *)tr + F.Location);
+                float *wl = (float *)((BYTE *)wo + F.Location);
+                float dx = wl[0] - tl[0], dy = wl[1] - tl[1], dz = wl[2] - tl[2];
+                float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > worstD) { worstD = d2; worst = w; }
+            }
+            if (worst < 0) continue;              // nothing is further out: drop it
+            s = worst;
+        }
         g_lumosBlockers[s] = obj;
         g_lumosBlockerTrig[s] = (short)best;
         g_lumosBlockerOrig[s] = hp3lumos::packWallBits(c != FALSE, ba != FALSE,
@@ -10051,8 +10106,8 @@ static void lumosScanBlockers(void)
         g_lumosBlockerColl[s] = 1;                // pristine: solid
     }
     if (g_lumosBlockersN >= LUMOS_MAX_BLOCKERS)
-        logf_("[lumos] v71 blocker cache FULL (%d actors) - the rest are not "
-              "managed; raise LUMOS_MAX_BLOCKERS or lower [lumos] OpenRadius",
+        logf_("[lumos] v72 blocker cache FULL (%d actors) - furthest-from-a-"
+              "trigger actors were evicted; raise LUMOS_MAX_BLOCKERS",
               g_lumosBlockersN);
 }
 
@@ -10702,13 +10757,22 @@ static BOOL lumosBlockerVerified(void *obj)
     return TRUE;
 }
 
-static BOOL lumosBlockerWantOpen(const float loc[3], const BOOL *armed,
+static BOOL lumosBlockerWantOpen(void *obj, const float loc[3],
+                                 const BOOL *armed,
                                  const float playerPos[8][3],
                                  const BOOL *slotAtTrig, int validPlayers,
                                  int *why)
 {
     if (why) *why = 0;
-    if (!loc || !armed) return FALSE;
+    if (!obj || !loc || !armed) return FALSE;
+    // v72: measure to the SURFACE of the actor, not to its origin. A brush
+    // blocker (KWBlockingVolume, GenericColObj) reports its builder-brush
+    // origin, which in the v70 log sat 290 units from where the player was
+    // standing - the actor was in range on screen and out of range by the
+    // numbers. The clamp in cylinderGap keeps a volume reporting a huge
+    // collision cylinder from reaching across the level.
+    float rad = lumosReadFloat(obj, g_offColRadius, 0.0f);
+    float hgt = lumosReadFloat(obj, g_offColHeight, 0.0f);
     // (1) within OpenRadius of a trigger a tracked player is standing in.
     if (g_lumosOpenRadius > 0.0f) {
         for (int t = 0; t < g_lumosTriggersN; t++) {
@@ -10717,9 +10781,7 @@ static BOOL lumosBlockerWantOpen(const float loc[3], const BOOL *armed,
             if (!tr || !cgLiveObject(tr) || F.Location <= 0 ||
                 IsBadReadPtr((BYTE *)tr + F.Location, 12)) continue;
             float *tl = (float *)((BYTE *)tr + F.Location);
-            float dx = loc[0] - tl[0], dy = loc[1] - tl[1], dz = loc[2] - tl[2];
-            if (dx * dx + dy * dy + dz * dz <=
-                g_lumosOpenRadius * g_lumosOpenRadius) {
+            if (hp3lumos::cylinderGap(loc, tl, rad, hgt) <= g_lumosOpenRadius) {
                 if (why) *why = 1;
                 return TRUE;
             }
@@ -10756,7 +10818,7 @@ static BOOL lumosApplyActorOpen(void *obj, BYTE origBits, signed char *coll,
             static BOOL sNoNative = FALSE;
             if (!sNoNative) {
                 sNoNative = TRUE;
-                logf_("  [lumos] v71 passability unavailable: Engine.Actor."
+                logf_("  [lumos] v72 passability unavailable: Engine.Actor."
                       "SetCollision native not exported - walls stay solid");
             }
             *coll = -1;
@@ -10767,7 +10829,7 @@ static BOOL lumosApplyActorOpen(void *obj, BYTE origBits, signed char *coll,
         char wn[160]; objName(obj, wn, sizeof(wn));
         float *wl = (F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12))
                     ? (float *)((BYTE *)obj + F.Location) : NULL;
-        logf_("  [lumos] v71 OPENED %s #%d %s at (%.0f %.0f %.0f) "
+        logf_("  [lumos] v72 OPENED %s #%d %s at (%.0f %.0f %.0f) "
               "bits=0x%02X key=%d (SetCollision off - removed from the "
               "collision octree, passable for every player)%s",
               what, idx, wn, wl ? wl[0] : 0.f, wl ? wl[1] : 0.f, wl ? wl[2] : 0.f,
@@ -10786,7 +10848,7 @@ static BOOL lumosApplyActorOpen(void *obj, BYTE origBits, signed char *coll,
                             b.blockActors ? TRUE : FALSE,
                             b.blockPlayers ? TRUE : FALSE)) return FALSE;
     *coll = 1;
-    logf_("  [lumos] v71 closed %s #%d (pristine collision bits restored)",
+    logf_("  [lumos] v72 closed %s #%d (pristine collision bits restored)",
           what, idx);
     return TRUE;
 }
@@ -10831,8 +10893,15 @@ static void lumosReportNearbyBlockers(const float playerPos[8][3],
             if (!ci || !ci->isActor || ci->isPawn) continue;
             BOOL c = FALSE, ba = FALSE, bp = FALSE;
             if (!readLumosCollisionBits(o, &c, &ba, &bp)) continue;
-            if (!ba && !bp) continue;
+            if (!ba && !bp && !c) continue;        // v72: touch-only is listed too
             // is it one we manage, and is it open?
+            // v72: a TOUCH-ONLY actor (bCollideActors, no block flag) is
+            // listed too. It cannot stop a player by collision, but that is
+            // also the shape of a CompanionCorral - and the v70 pelog shows
+            // GenericColObj / CompanionCorral volumes touching Hermione every
+            // frame, which is the one shape that can hold a COMPANION where
+            // the lead walks straight through.
+            BOOL blocks = (ba || bp);
             const char *state = "NOT CACHED";
             for (int w = 0; w < g_lumosWallsN; w++)
                 if (g_lumosWalls[w] == o) {
@@ -10845,13 +10914,149 @@ static void lumosReportNearbyBlockers(const float playerPos[8][3],
                     break;
                 }
             char nb[160];
-            logf_("  [lumos] v71 at-wall P%d: blocker %s d=%.0f bits=0x%02X %s",
-                  s, objName(o, nb, sizeof(nb)), (float)sqrt(d2),
+            logf_("  [lumos] v72 at-wall P%d: %s %s d=%.0f bits=0x%02X %s",
+                  s, blocks ? "blocker" : "touch-only",
+                  objName(o, nb, sizeof(nb)), (float)sqrt(d2),
                   hp3lumos::packWallBits(c != FALSE, ba != FALSE, bp != FALSE),
                   state);
             shown++;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v72: THE BUMP RULE - open what the player is literally pressed against.
+//
+// Every rule up to v71 measures from an actor's ORIGIN: near an armed
+// trigger, or near the player. A brush blocker reports the origin of its
+// builder brush, not the wall the player is standing at - in the v70 log the
+// wall the mod opened sits 290 units from where the player was standing, most
+// of it vertical, and none of the radius rules can see that as "touching".
+//
+// This rule needs no class token, no level linkage and no cache: a tracked
+// player who is inside an armed Lumos trigger's own radius and has been
+// pushing into something for BumpHold ms without going anywhere is touching
+// the blocker. It is also the only rule that can free a companion from a
+// TOUCH-ONLY volume, i.e. an actor with bCollideActors and no block flag -
+// which cannot stop anyone by collision, but is exactly the shape of a
+// CompanionCorral, and the v70 pelog shows those touching Hermione every
+// frame. That shape is what makes "players 2 and 3 cannot pass" possible
+// while the lead walks straight through.
+// ---------------------------------------------------------------------------
+static void lumosBumpOpen(int p, int slot, void *pawn, const float pos[3],
+                          DWORD now, BOOL lumosActive)
+{
+    if (!g_lumosBumpOpen || !lumosActive || !pawn || slot < 0 || slot >= 8) return;
+    if ((DWORD)(now - g_lumosProbeAt[slot]) < hp3lumos::BumpSampleMs) return;
+    g_lumosProbeAt[slot] = now;
+
+    float moved = 0.0f;
+    if (g_lumosProbeKnown[slot]) {
+        float dx = pos[0] - g_lumosProbePos[slot][0];
+        float dy = pos[1] - g_lumosProbePos[slot][1];
+        float dz = pos[2] - g_lumosProbePos[slot][2];
+        moved = (float)sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    memcpy(g_lumosProbePos[slot], pos, 12);
+    g_lumosProbeKnown[slot] = TRUE;
+
+    // The lead (slot 0) has no mod-side input: readInput only reads players
+    // 1..N, so his probe never accumulates and this rule stays a companion
+    // rule in practice - which is what the field report is about.
+    PadState pad; readInput(p, &pad);
+    float inMag = (float)fabs(pad.fwd);
+    if ((float)fabs(pad.side) > inMag) inMag = (float)fabs(pad.side);
+    std::uint32_t held = g_lumosProbe[slot].sample(inMag, moved, now);
+    if (held < (std::uint32_t)(g_lumosBumpHold > 0 ? g_lumosBumpHold : 0)) return;
+
+    // "Touching" = the gap between the player's own collision cylinder and
+    // the actor's is within the player's radius plus a small skin.
+    float pRad = lumosReadFloat(pawn, g_offColRadius, 0.0f);
+    if (pRad < 8.0f)  pRad = 8.0f;
+    if (pRad > 128.0f) pRad = 128.0f;
+    const float gapMax = pRad + g_lumosBumpGap;
+
+    if (!g_objArray || !g_objArray->Data || F.Location <= 0) return;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+    const float pre = gapMax + hp3lumos::BlockerSurfaceMax + 64.0f;
+    int opened = 0, found = 0;
+    for (int k = 0; k < n && opened < 4; k++) {
+        void *o = g_objArray->Data[k];
+        if (!o || IsBadReadPtr(o, 0x100)) continue;
+        if (IsBadReadPtr((BYTE *)o + F.Location, 12)) continue;
+        float *ol = (float *)((BYTE *)o + F.Location);
+        float dx = ol[0] - pos[0], dy = ol[1] - pos[1], dz = ol[2] - pos[2];
+        if (dx * dx + dy * dy + dz * dz > pre * pre) continue;   // distance FIRST
+        if (cgDeleted(o) || !actorInCurrentLevel(o)) continue;
+        CgClass *ci = cgClassInfo(cgClassOf(o));
+        if (!ci || !ci->isActor || ci->isPawn || ci->isProjectile) continue;
+        if (hp3lumos::isLumosTriggerClassToken(ci->token)) continue;
+        BOOL c = FALSE, ba = FALSE, bp = FALSE;
+        if (!readLumosCollisionBits(o, &c, &ba, &bp)) continue;
+        BOOL blocks    = (ba || bp);
+        BOOL touchOnly = (!ba && !bp && c);
+        if (!blocks && !(touchOnly && g_lumosTouchOpen)) continue;
+        // A real trigger volume is never silenced: taking its collision away
+        // would stop the level's own events, not just a corral.
+        if (touchOnly && ci->isTrigger) continue;
+        float arad = lumosReadFloat(o, g_offColRadius, 0.0f);
+        float ahgt = lumosReadFloat(o, g_offColHeight, 0.0f);
+        if (hp3lumos::cylinderGap(pos, ol, arad, ahgt) > gapMax) continue;
+        found++;
+        // Is it already managed, and is it already open?
+        int idx = -1; signed char *coll = NULL; BYTE orig = 0;
+        const char *what = "blocker";
+        for (int w = 0; w < g_lumosWallsN; w++)
+            if (g_lumosWalls[w] == o) {
+                idx = w; coll = &g_lumosWallColl[w]; orig = g_lumosWallOrig[w];
+                what = "wall"; break;
+            }
+        if (idx < 0)
+            for (int w = 0; w < g_lumosBlockersN; w++)
+                if (g_lumosBlockers[w] == o) {
+                    idx = w; coll = &g_lumosBlockerColl[w];
+                    orig = g_lumosBlockerOrig[w]; break;
+                }
+        if (idx >= 0 && coll && *coll == 0) continue;      // already open
+        if (idx < 0) {
+            if (g_lumosBlockersN >= LUMOS_MAX_BLOCKERS) {
+                static BOOL sFull = FALSE;
+                if (!sFull) {
+                    sFull = TRUE;
+                    logf_("  [lumos] v72 blocker cache FULL - a bumped actor "
+                          "could not be adopted; raise LUMOS_MAX_BLOCKERS");
+                }
+                continue;
+            }
+            int s = g_lumosBlockersN++;                    // adopt it
+            g_lumosBlockers[s]    = o;
+            g_lumosBlockerTrig[s] = -1;
+            g_lumosBlockerOrig[s] = hp3lumos::packWallBits(c != FALSE, ba != FALSE,
+                                                           bp != FALSE);
+            g_lumosBlockerColl[s] = 1;
+            idx = s; coll = &g_lumosBlockerColl[s]; orig = g_lumosBlockerOrig[s];
+        }
+        if (lumosApplyActorOpen(o, orig, coll, TRUE, what, idx, 4)) opened++;
+    }
+
+    static DWORD sSaid[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    if ((DWORD)(now - sSaid[slot]) < 1000) return;
+    sSaid[slot] = now;
+    char pn[128], cn[128];
+    void *ctrl = (F.PawnController > 0 &&
+                  !IsBadReadPtr((BYTE *)pawn + F.PawnController, 4))
+               ? *(void **)((BYTE *)pawn + F.PawnController) : NULL;
+    cn[0] = 0;
+    if (ctrl && !IsBadReadPtr(ctrl, 0x30)) objName(cgClassOf(ctrl), cn, sizeof(cn));
+    logf_("  [lumos] v72 BUMP P%d %s pressed %lums (in=%.1f moved=%.0f gap<=%.0f) "
+          "at (%.0f %.0f %.0f) phys=%d ctrl=%s - %d actor(s) touching, %d opened%s",
+          p, objName(pawn, pn, sizeof(pn)), (unsigned long)held, inMag, moved,
+          gapMax, pos[0], pos[1], pos[2],
+          F.Physics > 0 ? *((BYTE *)pawn + F.Physics) : -1, cn, found, opened,
+          found == 0 ? " (nothing blocking is an actor here - if the player is "
+                       "still stuck the blocker is level BSP, which SetCollision "
+                       "cannot touch)" : "");
 }
 
 static void lumosTick(void)
@@ -11473,7 +11678,8 @@ static void lumosTick(void)
         // actor the player was bumping into in the v70 field log. The secret
         // classification is kept for the log only.
         int why = 0;
-        BOOL wantOpen = lumosBlockerWantOpen((float *)((BYTE *)obj + F.Location),
+        BOOL wantOpen = lumosBlockerWantOpen(obj,
+                                             (float *)((BYTE *)obj + F.Location),
                                              trigArmed, playerPos, slotAtTrig,
                                              validPlayers, &why);
         // v69: stock linkage still opens a wall outright, at any distance.
@@ -11494,25 +11700,39 @@ static void lumosTick(void)
     }
 
     // ---- v71: the class-agnostic blocker cache ---------------------------
-    for (int k = 0; k < g_lumosBlockersN; k++) {
-        void *obj = g_lumosBlockers[k];
-        if (!cgLiveObject(obj) || cgDeleted(obj) || F.Location <= 0 ||
-            IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
-            g_lumosBlockerColl[k] = -1;
-            continue;
+    // v72: the cache is no longer a handful of walls (it holds every blocking
+    // actor of the level, up to LUMOS_MAX_BLOCKERS), so it is walked in
+    // round-robin slices instead of in full every frame - 1024 actors x 60 fps
+    // of IsBadReadPtr/liveness probes would cost more than the wall logic is
+    // worth. A full pass still completes in ~130 ms, so a player arriving at a
+    // secret is served well inside one step.
+    {
+        static int sScan = 0;
+        const int SLICE = 128;
+        int total = g_lumosBlockersN;
+        for (int i = 0; i < SLICE && i < total; i++) {
+            int k = (sScan + i) % total;
+            void *obj = g_lumosBlockers[k];
+            if (!cgLiveObject(obj) || cgDeleted(obj) || F.Location <= 0 ||
+                IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
+                g_lumosBlockerColl[k] = -1;
+                continue;
+            }
+            int why = 0;
+            BOOL wantOpen = lumosBlockerWantOpen(obj,
+                                                 (float *)((BYTE *)obj + F.Location),
+                                                 trigArmed, playerPos, slotAtTrig,
+                                                 validPlayers, &why);
+            signed char want = wantOpen ? 0 : 1;
+            if (g_lumosBlockerColl[k] == want && !(reassert && wantOpen)) continue;
+            if (!lumosBlockerVerified(obj)) {
+                g_lumosBlockerColl[k] = -1;
+                continue;
+            }
+            lumosApplyActorOpen(obj, g_lumosBlockerOrig[k], &g_lumosBlockerColl[k],
+                                wantOpen != FALSE, "blocker", k, why);
         }
-        int why = 0;
-        BOOL wantOpen = lumosBlockerWantOpen((float *)((BYTE *)obj + F.Location),
-                                             trigArmed, playerPos, slotAtTrig,
-                                             validPlayers, &why);
-        signed char want = wantOpen ? 0 : 1;
-        if (g_lumosBlockerColl[k] == want && !(reassert && wantOpen)) continue;
-        if (!lumosBlockerVerified(obj)) {
-            g_lumosBlockerColl[k] = -1;
-            continue;
-        }
-        lumosApplyActorOpen(obj, g_lumosBlockerOrig[k], &g_lumosBlockerColl[k],
-                            wantOpen != FALSE, "blocker", k, why);
+        if (total > 0) sScan = (sScan + SLICE) % total;
     }
 
     // v71: while a player stands at a revealed wall, name everything that
@@ -11521,6 +11741,19 @@ static void lumosTick(void)
     // blocker cache rejected, or something that is not an actor at all).
     if (lumosActive)
         lumosReportNearbyBlockers(playerPos, slotAtTrig, validPlayers, now);
+
+    // v72: the bump rule - a tracked player who is standing inside an armed
+    // Lumos trigger's radius and has been pushing into something for
+    // BumpHold ms without going anywhere is touching the blocker. Opens it
+    // whatever class it is, cached or not (and, with TouchOpen, a Touch-only
+    // corral volume that holds companions where the lead walks through).
+    if (lumosActive) {
+        for (int p = 0; p < numP; p++) {
+            if (posSlot[p] < 0 || !slotAtTrig[posSlot[p]]) continue;
+            lumosBumpOpen(p, posSlot[p], pw[p], playerPos[posSlot[p]],
+                          now, lumosActive);
+        }
+    }
 }
 
 // v52 native particles use bHidden masking only (hardware verification pending).
@@ -12440,14 +12673,23 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             g_lumosLeadRide    = GetPrivateProfileIntA("lumos", "LeadRide", 1, ini) != 0;
             int gr = GetPrivateProfileIntA("lumos", "GlowRadius", -1, ini);
             if (gr >= 0)  g_lumosGlowRadius = (float)(gr > 500 ? 500 : gr);
+            // v72: the bump rule.
+            g_lumosBumpOpen  = GetPrivateProfileIntA("lumos", "BumpOpen", 1, ini) != 0;
+            g_lumosTouchOpen = GetPrivateProfileIntA("lumos", "TouchOpen", 1, ini) != 0;
+            int bg = GetPrivateProfileIntA("lumos", "BumpGap", -1, ini);
+            if (bg >= 0)  g_lumosBumpGap = (float)(bg > 400 ? 400 : bg);
+            int bh = GetPrivateProfileIntA("lumos", "BumpHold", -1, ini);
+            if (bh >= 0)  g_lumosBumpHold = (bh > 5000 ? 5000 : bh);
         }
         logf_("hp3mod.ini: lumos TriggerEvents=%d GlowFX=%d OpenRadius=%.0f "
               "PlayerRadius=%.0f LatchOpen=%d WandGlow=%d UnhideLight=%d "
-              "LeadHeal=%d LeadRide=%d GlowRadius=%.0f",
+              "LeadHeal=%d LeadRide=%d GlowRadius=%.0f BumpOpen=%d BumpGap=%.0f "
+              "BumpHold=%d TouchOpen=%d",
               g_lumosTriggerEvents, g_lumosGlowFX, g_lumosOpenRadius,
               g_lumosPlayerRadius, g_lumosLatchOpen, g_lumosWandGlow,
               g_lumosUnhideLight, g_lumosLeadHeal, g_lumosLeadRide,
-              g_lumosGlowRadius);
+              g_lumosGlowRadius, g_lumosBumpOpen, g_lumosBumpGap,
+              g_lumosBumpHold, g_lumosTouchOpen);
 
         char sys[MAX_PATH];
         GetSystemDirectoryA(sys, MAX_PATH); strcat(sys, "\\d3d8.dll");

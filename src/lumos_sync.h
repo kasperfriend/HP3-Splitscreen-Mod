@@ -599,6 +599,109 @@ inline bool blockerStaysOpen(bool openedByMod, bool latchOpen)
 }
 
 // ---------------------------------------------------------------------------
+// v72 policy: measure to the SURFACE of an actor, and open the actor the
+// player is literally pressed against.
+//
+// v71 measured every distance from the actor's ORIGIN. That is honest for a
+// small collision proxy and useless for a brush. In the v70 field log the
+// player stood at (232 2423 -181) and the wall actor the mod opened sits at
+// (192 2616 32) - 290 units away, most of it vertical - while the trigger he
+// was standing in sits at (338 2618 -111). A radius keyed on origins either
+// misses the actor that is stopping him or has to be made so large that it
+// stops being evidence of anything.
+//
+// cylinderGap() measures from the actor's COLLISION CYLINDER instead, with a
+// hard clamp so a brush that reports an enormous cylinder cannot swallow the
+// level. The bump rule is the other half: a tracked player who keeps pushing
+// into something at a Lumos secret and does not get anywhere is touching the
+// blocker, whatever class it is, cached or not - and a CompanionCorral-style
+// volume blocks a companion by TOUCH (bCollideActors, no block flag at all),
+// which is the one shape v71's "does it block?" cache filter rejected by
+// design.
+// ---------------------------------------------------------------------------
+
+// A brush volume's collision cylinder can be gigantic; treating all of it as
+// "surface" would put every actor in the level within reach of every player.
+static const float BlockerSurfaceMax = 256.0f;
+
+// Distance from a point to the surface of an actor's collision cylinder
+// (0 when the point is inside it). radius/height are the actor's own
+// CollisionRadius / CollisionHeight; <= 0 means "unknown, treat as a point".
+inline float cylinderGap(const float pos[3], const float center[3],
+                         float radius, float height)
+{
+    if (!pos || !center) return 1.0e9f;
+    if (!(radius > 0.0f)) radius = 0.0f;
+    if (!(height > 0.0f)) height = 0.0f;
+    if (radius > BlockerSurfaceMax) radius = BlockerSurfaceMax;
+    if (height > BlockerSurfaceMax) height = BlockerSurfaceMax;
+    float dx = pos[0] - center[0];
+    float dy = pos[1] - center[1];
+    float dz = pos[2] - center[2];
+    float horiz = std::sqrt(dx * dx + dy * dy) - radius;
+    if (horiz < 0.0f) horiz = 0.0f;
+    float vert = std::fabs(dz) - height;
+    if (vert < 0.0f) vert = 0.0f;
+    return std::sqrt(horiz * horiz + vert * vert);
+}
+
+// "Touching" = within gap units of the actor's collision surface. The caller
+// passes the player's own collision radius plus a small skin.
+inline bool isTouchingActor(const float pos[3], const float center[3],
+                            float radius, float height, float gap)
+{
+    return cylinderGap(pos, center, radius, height) <= gap;
+}
+
+// The push detector: a player who is steering into something and going
+// nowhere is the only reliable "this actor is what stops me" sensor the mod
+// has that needs no class token, no cache and no level linkage.
+static const float BumpInputMin       = 0.30f;  // stick deflection that counts as pushing
+static const float BumpMoveMax        = 20.0f;  // units travelled per sample; under this while pushing = blocked
+static const std::uint32_t BumpSampleMs = 150;  // sample cadence
+static const std::uint32_t BumpHoldMs   = 700;  // sustained push before the mod touches anything
+static const float BumpGapDefault     = 48.0f;  // skin on top of the player's collision radius
+
+class StuckProbe {
+public:
+    StuckProbe() : held_(0), last_(0), have_(false) {}
+
+    // One sample. Returns how long this player has been pushing without
+    // getting anywhere; zero the moment he moves or lets go of the stick.
+    std::uint32_t sample(float inputMag, float movedDist, std::uint32_t nowMs)
+    {
+        if (!have_) { have_ = true; last_ = nowMs; held_ = 0; return 0; }
+        std::uint32_t dt = nowMs - last_;
+        last_ = nowMs;
+        if (dt > 500) dt = 500;              // a frame hitch is not progress
+        if (inputMag >= BumpInputMin && movedDist < BumpMoveMax) held_ += dt;
+        else held_ = 0;
+        return held_;
+    }
+    std::uint32_t held() const { return held_; }
+    void reset() { held_ = 0; }
+
+private:
+    std::uint32_t held_;
+    std::uint32_t last_;
+    bool          have_;
+};
+
+// v72: the actor you are pressed against is the blocker. The four gates in
+// front of it - Lumos on, a tracked player inside an armed Lumos trigger's
+// own radius, pushing for BumpHoldMs, and the actor touching him - are what
+// keep this from opening the rest of the level.
+inline bool bumpShouldOpen(bool lumosActive, bool playerAtTrigger,
+                           bool pressedLongEnough, bool touching,
+                           bool blocks, bool touchOnlyVolume,
+                           bool touchVolumesAllowed)
+{
+    if (!lumosActive || !playerAtTrigger || !pressedLongEnough || !touching)
+        return false;
+    return blocks || (touchOnlyVolume && touchVolumesAllowed);
+}
+
+// ---------------------------------------------------------------------------
 // v66.3 crash fix: the per-level Lumos trigger/secret-wall scan classified
 // objects by substring-matching the WHOLE GetFullName string
 // ("ClassName Package.Object"). That also collects non-actor objects that

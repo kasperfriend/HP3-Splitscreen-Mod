@@ -24,7 +24,7 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v71`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v72`.
 
 ### v71 Lumos for P2/P3, round 5: the wall is opened by what blocks, and the glow rides the wand
 
@@ -94,6 +94,63 @@ position (`dPawn`, `riding=yes/NO`), every opened actor named with the key
 that opened it, the blocker list from the scan, and — while a player stands
 inside a trigger's radius — every actor still blocking within 260 units of
 him with its state (`open` / `SOLID` / `NOT CACHED`).
+
+### v72 Lumos for P2/P3, round 6: measure to the surface, and open what you are pressed against
+
+The v70 log contained the number that says v71's radii are measured from the
+wrong point. The player (P2, Hermione) stood at `(232 2423 -181)`, the armed
+`LumosTrigger0` at `(338 2618 -111)`, and the wall actor the mod opened sits at
+`(192 2616 32)` — **290 units away, 213 of them vertical**. A brush blocker
+reports the origin of its builder brush, not the wall you are standing at, so
+"the player is at this wall" cannot be expressed as a radius around a point
+that is not on the wall. Worse, v71's cache pre-filter was *the same test the
+open rule then applied*, so an actor whose origin sat further out was never
+even managed — it could not be opened, and it could not even be reported.
+
+1. **Measure to the surface.** `hp3lumos::cylinderGap()` measures from the
+   actor's own collision cylinder (clamped, so a brush reporting a huge
+   cylinder cannot reach across the level) instead of from its origin.
+
+2. **The cache is bookkeeping, not a filter.** Every blocking actor of the
+   current level is cached (up to `LUMOS_MAX_BLOCKERS`), and when it fills, the
+   actor **furthest from any trigger** is evicted, so a full cache still holds
+   the actors that sit at the secrets. The per-frame walk runs in round-robin
+   slices, so a 1024-entry cache costs what v71's handful cost.
+
+3. **The bump rule** — no class token, no cache, no linkage, no origin
+   geometry. A tracked player who stands inside an armed Lumos trigger's own
+   radius, keeps pushing (`|fwd|/|side| >= 0.3`) for `BumpHold = 700 ms` and
+   gets nowhere (under 20 units per 150 ms sample) is *touching the blocker*,
+   and every actor touching him is opened through the same octree-safe
+   `SetCollision` native. Input comes from `readInput()`, which only reads
+   players 1..N, so this is a companion rule in practice — which is what the
+   field report is about.
+
+4. **Touch-only volumes (`TouchOpen=1`).** An actor with `bCollideActors` and
+   *no* block flag cannot stop anyone by collision — which is exactly why v71
+   excluded it on purpose. It is also the shape of a **`CompanionCorral`**, and
+   the v70 pelog shows those touching Hermione (a **companion**) every single
+   frame while the lead walks straight through:
+
+   ```
+   Ron      :: KWPawn.Touch other=GenericColObj GenericColObj3   (every frame)
+   GenericColObj2 :: GenericColObj.Touch other=CompanionCorral6
+   Hermione :: KWPawn.Touch other=GenericColObj GenericColObj2
+   ```
+
+   That is the one shape that can make "players 2 and 3 cannot pass" true while
+   player 1 walks through, and taking its collision away is precisely how you
+   free a pawn from it. Real trigger volumes are never silenced.
+
+New `[lumos]` knobs: `BumpOpen=1`, `BumpGap=48` (units of surface gap on top
+of the player's own collision radius), `BumpHold=700`, `TouchOpen=1`.
+
+New diagnostics: every bump logs the pawn, **its controller class**, `Physics`,
+how long he has been pushing, how many actors are touching him and how many
+were opened — and when nothing that blocks is an actor at all it says so,
+which is the proof that the blocker is level BSP and no `SetCollision` can ever
+open it. The at-wall dump now lists touch-only actors too (`touch-only` vs
+`blocker`), so a corral is visible before any bump happens.
 
 ### v69 Lumos for P2/P3, round 3: the stock script runs the glow
 
@@ -442,6 +499,7 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 
 - **v67/v68/v69/v70** carry the Lumos replication forward: the stock `LumosLight.TurnOn` script is called on every companion's own `TheLumosLight` (register, glow particles, `OnLumosOn` broadcast, stock 30 s auto-off tick), the wall trigger's `Event` is dispatched through the engine's own script `TriggerEvent`, empty-`Trigger` receivers relay their own `Event` one hop (HP3 chains `LumosTrigger -> LumosSparklesTrigger -> wall`), and every level-side field is resolved by walking the live objects' own class chains with a 1 Hz retry instead of a menu-time one-shot.
 - **v71** fixes the v70 field report ("no pass through walls, light underneath, no wand glow, heavy light stacked on the main character") from the attached v70 log. (1) **Walls**: HP3_InsideHub has no `Event -> wall.Tag` linkage at all — the trigger's Event is carried only by a sparkles trigger whose own Event is empty — so the mod stopped deriving the linkage and instead opens **whatever blocks** near a trigger a player is standing inside (`OpenRadius`, stock's own `fDistanceCheck`) or right next to that player (`PlayerRadius`), class-agnostically through a per-level blocker cache and the octree-safe `SetCollision` native, **latched open for the level** like stock. The scan no longer caches actors of the previous level. (2) **Light**: the companion light and every glow attached to it now ride onto a wand-tip anchor every frame (stock's own wand ride never reaches a companion), standing down automatically if the game's ride is carrying the light; up to four glows per player are tracked and destroyed on teardown (v70 orphaned one per re-cast — the "stacked" report), and a mod-owned light is retired on a hard ceiling (the "stuck spell"). (3) **The lead** is never forced visible any more and only has his light's *position* fixed, when it is provably lost or sitting underfoot. Plus a 1 Hz status line with every player's pawn/wand/light/glow position, named open/blocker logging, and an at-wall dump of everything still blocking.
+- **v72** fixes what the v70 log showed about *distance*: a brush blocker's actor origin can sit 290 units from the surface it blocks, so v71's origin-keyed radii both missed the real blocker and had to be too wide to be evidence. Distances are now measured to the **surface** of the actor's collision cylinder; the blocker cache holds every blocking actor of the level (evicting the one furthest from any trigger when full, walked in round-robin slices) instead of pre-filtering by the very test the open rule applies; and the **bump rule** opens whatever a player standing inside an armed Lumos trigger is literally pressed against after 700 ms of pushing without progress — no class token, no cache, no linkage. It also accepts **touch-only volumes** (`TouchOpen`), the `CompanionCorral` shape the v70 pelog shows touching Hermione every frame while the lead walks straight through.
 
 ## Disclaimer
 

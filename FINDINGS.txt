@@ -2457,3 +2457,85 @@ HARDWARE CHECK LIST:
     at (..) bits=0x05 key=1" lines (and "latched open for the level"), then
     the at-wall blocker dump. If P2 still cannot pass, send the at-wall
     dump: any SOLID / NOT CACHED line there is the answer.
+
+29. v72 (2026-09-19) - LUMOS P2/P3 ROUND 6: THE ORIGIN LIE, AND THE BUMP RULE
+--------------------------------------------------------------------------
+v71 shipped on the strength of the v70 log, but the same log contains the
+number that says v71's radii are measured from the wrong point:
+
+    player (Hermione)      at (232 2423 -181)
+    armed LumosTrigger0    at (338 2618 -111)
+    wall #63 the mod opened at (192 2616  32)
+
+The wall actor sits 290 units from where the player was standing - 213 of
+them vertical. Every v71 rule measures from an actor ORIGIN, so "the player
+is at this wall" had to be expressed as a radius around a point that is not
+on the wall at all. Two consequences, both bad: a radius honest enough to
+catch that wall (290+) is also wide enough to catch railings and camera
+blockers, and a brush blocker whose builder-brush origin sits outside the
+radius is never even CACHED (v71's cache pre-filter was the very same test
+the open rule then applied - so an actor that failed the open rule was not
+managed either, and could not even be reported).
+
+FIX 1 - MEASURE TO THE SURFACE. hp3lumos::cylinderGap() measures from the
+actor's COLLISION CYLINDER (its own CollisionRadius/CollisionHeight, clamped
+to BlockerSurfaceMax = 256 so a brush reporting an enormous cylinder cannot
+reach across the level). Used by the trigger-radius open rule.
+
+FIX 2 - THE CACHE IS BOOKKEEPING, NOT A FILTER. lumosScanBlockers now
+admits every current-level actor with bBlockActors/bBlockPlayers (never
+bCollideActors alone), up to LUMOS_MAX_BLOCKERS, recording the nearest
+trigger for the log; when it fills, the actor FURTHEST from any trigger is
+evicted, so a full cache still holds the actors that sit at the secrets.
+The per-frame walk is done in round-robin slices of 128 (a 1024-entry cache
+completes a pass in ~130 ms instead of costing 1024 liveness probes every
+frame).
+
+FIX 3 - THE BUMP RULE (the one that can answer the field report). No class
+token, no cache, no level linkage, no origin geometry:
+    a tracked player is inside an ARMED Lumos trigger's own radius
+    AND he has been pushing (|fwd|,|side| >= 0.3) for BumpHold = 700 ms
+    AND he has not moved more than 20 units per 150 ms sample
+    => every actor TOUCHING him (gap between his collision cylinder and the
+       actor's <= his radius + BumpGap) is opened, and adopted into the cache
+       so the latch/restore machinery owns it.
+Input comes from readInput(), which only reads players 1..N - so this is a
+companion rule in practice, which is what the report is about.
+
+FIX 4 - TOUCH-ONLY VOLUMES ([lumos] TouchOpen, default 1). An actor with
+bCollideActors and NO block flag cannot stop anyone by collision, which is
+exactly why v71 excluded it on purpose. It is also the shape of a
+CompanionCorral, and the v70 pelog shows them touching Hermione (a
+COMPANION) every single frame while the lead walks straight through:
+
+  Ron      :: KWPawn.Touch other=GenericColObj GenericColObj3   (every frame)
+  GenericColObj2 :: GenericColObj.Touch other=CompanionCorral6
+  Hermione :: KWPawn.Touch other=GenericColObj GenericColObj2
+
+That is the ONE shape that can make "players 2 and 3 cannot pass" true while
+player 1 walks through, and SetCollision(false) is precisely how you free a
+pawn from it. Real trigger volumes are never silenced (ci->isTrigger), and
+the whole rule is gated behind the four conditions above, so it cannot open
+the level behind a player who is simply walking past.
+
+DIAGNOSTICS (the point of the round): every bump prints
+  [lumos] v72 BUMP P1 Hermione pressed 850ms (in=1.0 moved=4 gap<=78)
+          at (..) phys=1 ctrl=Class hgame.HPCompanionController -
+          2 actor(s) touching, 1 opened
+and when nothing that blocks is an actor it says so outright - that line is
+the proof that the blocker is level BSP, which no SetCollision can touch.
+The at-wall dump now lists touch-only actors as well ("touch-only" vs
+"blocker"), so a corral shows up even before a bump happens.
+
+HARDWARE CHECK LIST:
+  * Log line 2 says build v72.
+  * "hp3mod.ini: lumos ... BumpOpen=1 BumpGap=48 BumpHold=700 TouchOpen=1".
+  * The scan line's blocker count is now the whole level's blocking actors
+    (expect hundreds, not a handful) - and it is capped/evicted at 1024.
+  * Walk P2 into the secret wall and KEEP PUSHING for a second. Expect
+    "v72 BUMP P1 ... pressed 7xx ms ... N actor(s) touching, M opened" and
+    the "v72 OPENED ... key=4" lines right after. If M == 0 and the line
+    says nothing blocking is an actor here, the blocker is BSP.
+  * If P2 passes but something else in the level turned walk-through, look
+    for the "OPENED" line with that actor's name and lower OpenRadius /
+    BumpGap, or set TouchOpen=0 (corrals are then left alone again).

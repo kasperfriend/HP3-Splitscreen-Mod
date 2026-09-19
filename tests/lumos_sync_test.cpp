@@ -560,11 +560,81 @@ int main()
         assert(ModLightHardOffMs <= StockLumosDurationMs + 10000);
     }
 
+    // 22. v72: MEASURE TO THE SURFACE. The v70 log's wall actor sits 290
+    //     units from where the player stood (most of it vertical), so an
+    //     origin-keyed radius cannot express "he is at this wall". The gap
+    //     to the actor's collision cylinder can - and it is clamped, so a
+    //     brush reporting an enormous cylinder cannot reach across the level.
+    {
+        const float centre[3] = { 0.f, 0.f, 0.f };
+        const float atSurface[3] = { 100.f, 0.f, 0.f };
+        const float inside[3]    = { 10.f, 0.f, 0.f };
+        // no cylinder known: degenerates to the plain centre distance
+        assert(std::fabs(cylinderGap(atSurface, centre, 0.f, 0.f) - 100.f) < 0.5f);
+        // a 90-unit radius wall: the same point is 10 units off its surface
+        assert(std::fabs(cylinderGap(atSurface, centre, 90.f, 0.f) - 10.f) < 0.5f);
+        // inside the cylinder is zero, never negative
+        assert(cylinderGap(inside, centre, 90.f, 40.f) == 0.0f);
+        // the clamp: a brush claiming a 100000-unit cylinder is treated as
+        // BlockerSurfaceMax, or every actor in the level would be "at" it
+        const float far[3] = { 5000.f, 0.f, 0.f };
+        assert(std::fabs(cylinderGap(far, centre, 100000.f, 100000.f) -
+                         (5000.f - BlockerSurfaceMax)) < 0.5f);
+        // vertical extent counts too (the v70 wall's Z gap was the largest
+        // part of its 290-unit offset)
+        const float above[3] = { 0.f, 0.f, 100.f };
+        assert(std::fabs(cylinderGap(above, centre, 0.f, 90.f) - 10.f) < 0.5f);
+        assert(isTouchingActor(atSurface, centre, 90.f, 0.f, 20.f));
+        assert(!isTouchingActor(atSurface, centre, 0.f, 0.f, 20.f));
+    }
+    // 23. v72: THE PUSH PROBE. Pushing and getting nowhere is the only
+    //     "this is what stops me" sensor that needs no class token, no cache
+    //     and no level linkage. It must release the moment the player moves
+    //     or lets go, or the mod would open the level behind him.
+    {
+        StuckProbe pr;
+        assert(pr.sample(1.0f, 0.0f, 1000) == 0);            // first sample
+        assert(pr.sample(1.0f, 2.0f, 1150) == 150);          // pushed, stuck
+        assert(pr.sample(1.0f, 1.0f, 1300) == 300);
+        assert(pr.sample(0.0f, 0.0f, 1450) == 0);            // let go -> reset
+        assert(pr.sample(1.0f, 90.0f, 1600) == 0);           // moving -> reset
+        assert(pr.sample(1.0f, 3.0f, 1750) == 150);
+        // a frame hitch is capped, it must not fabricate a press
+        assert(pr.sample(1.0f, 0.0f, 10000) == 650);         // +500 cap
+        pr.reset();
+        assert(pr.held() == 0);
+        // below the deflection floor nothing accumulates
+        StuckProbe tiny;
+        tiny.sample(0.1f, 0.0f, 0);
+        assert(tiny.sample(0.1f, 0.0f, 200) == 0);
+    }
+    // 24. v72: THE BUMP RULE. Four gates: Lumos on, a player inside an armed
+    //     trigger's radius, pushing long enough, and the actor touching him.
+    //     A touch-only volume only opens when TouchOpen allows it - it is the
+    //     CompanionCorral shape, and it must stay optional.
+    {
+        assert(bumpShouldOpen(true, true, true, true, true, false, true));
+        assert(bumpShouldOpen(true, true, true, true, false, true, true));
+        assert(!bumpShouldOpen(true, true, true, true, false, true, false));
+        assert(!bumpShouldOpen(true, true, false, true, true, false, true));
+        assert(!bumpShouldOpen(true, false, true, true, true, false, true));
+        assert(!bumpShouldOpen(false, true, true, true, true, false, true));
+        assert(!bumpShouldOpen(true, true, true, false, true, false, true));
+        // neither shape: nothing that blocks and nothing that touches
+        assert(!bumpShouldOpen(true, true, true, true, false, false, true));
+        // the defaults are a sustained push, not a single frame
+        assert(BumpHoldMs >= 500 && BumpHoldMs <= 2000);
+        assert(BumpSampleMs >= 50 && BumpSampleMs < BumpHoldMs);
+        assert(BumpInputMin > 0.0f && BumpInputMin < 1.0f);
+        assert(BumpGapDefault > 0.0f && BumpGapDefault < 200.0f);
+    }
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
               "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
               "v66.5 wall-bits/follow-light, v67 stock-register/"
               "trigger-fire, v68 proxied-wall/retry, v69 Event==Tag "
-              "linkage / LumosSparkles token, v70 stock-auto-off observation "
-              "and v71 wand-tip ride / trigger-keyed blocker opening assertions passed");
+              "linkage / LumosSparkles token, v70 stock-auto-off observation, "
+              "v71 wand-tip ride / trigger-keyed blocker opening and "
+              "v72 surface-gap / push-probe / bump-rule assertions passed");
     return 0;
 }
