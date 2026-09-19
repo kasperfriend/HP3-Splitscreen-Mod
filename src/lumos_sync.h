@@ -47,6 +47,70 @@ static const std::uint32_t ResolveRetryMs   = 1000;
 static const std::uint32_t EmptyScanRetryMs = 1000;
 static const std::uint32_t DispatchRetryMs  = 1000;
 
+// ---------------------------------------------------------------------------
+// v71: WHERE A REPLICATED LUMOS LIGHT HAS TO SIT (the "light underneath"
+// field report). Stock rides the light with baseWand.Tick ->
+// TheLumosLight.UpdateLocation(WandEndPoint), which SetLocations BOTH the
+// light and its Particles. On hardware that ride never reached a companion
+// wand, so v68..v70 seeded the light at the pawn and parked it there - the
+// field report's "light effect underneath, no wand glow": a bright light and
+// its LumosLightFX particles sitting on the character's body instead of at
+// the wand tip. The mod now rides both onto a wand-tip anchor itself.
+// ---------------------------------------------------------------------------
+
+// Fallback anchor when the wand actor's own Location is not believable:
+// hand height above the pawn's origin. This is the game's own projectile
+// origin (hp3charged::LaunchPlan org = pawn + 45Z, verified in the field
+// since v63 - spells leave the hand, not the feet), and the split camera
+// pivots at pawn + 50Z, so the pawn's Location is at its feet in HP3.
+static const float WandTipFallbackZ   = 45.0f;
+// Sanity bounds for trusting the WAND ACTOR's own Location as the tip.
+// The lower bound is the important one: a wand actor sitting AT the pawn's
+// origin (dZ = 0, the shape that made the light read as "underneath" on
+// hardware) is not a wand tip, it is an actor the game never positioned -
+// hand height above the pawn is the better answer in that case.
+static const float WandTipMaxHoriz    = 256.0f;
+static const float WandTipMinZ        = 16.0f;    // at/below the feet = bogus
+static const float WandTipMaxZ        = 128.0f;   // above the head    = bogus
+// Ride tolerance: below this the light is close enough and the mod leaves
+// it alone (so a STOCK ride that is working is never fought).
+static const float LightRideEpsilon   = 8.0f;
+// A light this far from its pawn is LOST (parked at the level-entry wand
+// position, at the world origin, ...). Only the recovery path uses it, and
+// only after the light has been proven stationary for LightRideHealMs.
+static const float LightLostDist      = 250.0f;
+static const std::uint32_t LightRideHealMs = 1000;
+// v71: a light the mod owns is force-retired after the stock window plus a
+// grace period, whatever stock's own Tick did or did not do. The v70 log
+// never shows a companion light going cold; without this ceiling a
+// replicated light can burn forever ("stuck spell on him").
+static const std::uint32_t ModLightHardOffMs = 33000;
+
+// ---------------------------------------------------------------------------
+// v71: THE WALL-OPEN KEY THAT ACTUALLY MATCHES HP3 (see FINDINGS 28).
+// The v70 hardware log killed the "Event -> wall.Tag" theory for the level
+// under test: HP3_InsideHub's LumosTrigger0 has Event=0x8D1A and the ONLY
+// actor carrying Tag 0x8D1A is LumosSparklesTrigger5 (whose own Event is
+// 0x0, so the chain ends there). The cached secret walls carry Tags
+// 0x3E63 / 0x405A - nothing links them to a trigger by name at all, and the
+// mod's single proximity pick ("wall #63") was not what the player was
+// bumping into. So the open rule no longer tries to derive the stock
+// linkage: it keys on the one thing the level designer DID tune - the
+// trigger's own radius, the stock InLumosRadius check - and then opens
+// whatever actually blocks near it.
+// ---------------------------------------------------------------------------
+// Any blocking actor within this radius of an ARMED trigger (one a tracked
+// player currently stands inside) is opened. Stock's own fDistanceCheck
+// default is 512, i.e. exactly the designer's "you are at this wall"
+// distance; the mod uses the trigger's own value when it reads one.
+static const float BlockerTriggerRadius = 512.0f;
+// ...or within this of a player who is himself inside an armed trigger.
+// This is the "whatever she is actually bumping" key: it catches a blocker
+// whose actor origin sits far from the trigger (a large volume) and, unlike
+// the v66.5 wall-actor test, it is class-agnostic.
+static const float BlockerPlayerRadius  = 200.0f;
+static const float BlockerPlayerHeight  = 160.0f;
+
 struct LightProperties {
     unsigned char lightType;        // 0 = LT_None, 1 = LT_Steady
     unsigned char lightEffect;
@@ -420,6 +484,118 @@ inline bool wallShouldOpenProxied(bool lumosActive, bool secretCandidate,
 {
     return lumosActive && secretCandidate &&
            (playerNearTrigger || playerNearWall);
+}
+
+// ---------------------------------------------------------------------------
+// v71 policy: the wand-tip anchor and the trigger-keyed wall opening.
+// ---------------------------------------------------------------------------
+
+// Is the wand actor's own Location a believable wand tip for this pawn? A
+// wand actor whose Location was never updated by the game (still at the
+// level's origin, at the pawn's feet, or hundreds of units away - all seen
+// on hardware) must not be used as the glow anchor, or the "wand glow" ends
+// up under the floor or across the map.
+inline bool wandLocIsTip(const float pawnLoc[3], const float wandLoc[3])
+{
+    if (!pawnLoc || !wandLoc) return false;
+    if (wandLoc[0] == 0.0f && wandLoc[1] == 0.0f && wandLoc[2] == 0.0f)
+        return false;                                   // unassigned vector
+    float dx = wandLoc[0] - pawnLoc[0];
+    float dy = wandLoc[1] - pawnLoc[1];
+    float dz = wandLoc[2] - pawnLoc[2];
+    if (dz < WandTipMinZ || dz > WandTipMaxZ) return false;
+    return (dx * dx + dy * dy) <= (WandTipMaxHoriz * WandTipMaxHoriz);
+}
+
+// The point a Lumos light (and its Particles glow) must sit at. The wand
+// actor's own Location when it is believable, otherwise hand height above
+// the pawn - the same origin the game fires its own spells from.
+inline void wandTipFor(const float pawnLoc[3], const float wandLoc[3],
+                       float out[3])
+{
+    if (!out || !pawnLoc) return;
+    out[0] = pawnLoc[0];
+    out[1] = pawnLoc[1];
+    out[2] = pawnLoc[2] + WandTipFallbackZ;
+    if (wandLoc && wandLocIsTip(pawnLoc, wandLoc)) {
+        out[0] = wandLoc[0];
+        out[1] = wandLoc[1];
+        out[2] = wandLoc[2];
+    }
+}
+
+// Does this light need to be moved onto the tip? Deliberately loose: a
+// STOCK ride that is working keeps the light within a few units of the
+// wand tip, so the mod never fights it.
+inline bool lightNeedsRide(const float lightLoc[3], const float tip[3],
+                           float eps = LightRideEpsilon)
+{
+    if (!lightLoc || !tip) return false;
+    float dx = lightLoc[0] - tip[0];
+    float dy = lightLoc[1] - tip[1];
+    float dz = lightLoc[2] - tip[2];
+    return (dx * dx + dy * dy + dz * dz) > (eps * eps);
+}
+
+// Is this light LOST - so far from its pawn that no ride can be carrying
+// it? Only the recovery path (lead's own light, never touched otherwise)
+// uses this, and only together with the stationarity test in dllmain.cpp.
+inline bool lightIsLost(const float lightLoc[3], const float pawnLoc[3],
+                        float dist = LightLostDist)
+{
+    if (!lightLoc || !pawnLoc) return false;
+    float dx = lightLoc[0] - pawnLoc[0];
+    float dy = lightLoc[1] - pawnLoc[1];
+    float dz = lightLoc[2] - pawnLoc[2];
+    return (dx * dx + dy * dy + dz * dz) > (dist * dist);
+}
+
+// Is this light UNDERFOOT - hugging the pawn's origin (at or below the feet)
+// instead of being carried at hand height? The field report's "heavy light
+// underneath" is exactly this shape: a light the ride parks at the pawn's
+// origin. The mod lifts it onto the wand tip when LeadRide=1.
+static const float LeadUnderfootZ = 16.0f;
+static const float LeadUnderfootR = 150.0f;
+inline bool lightIsUnderfoot(const float lightLoc[3], const float pawnLoc[3],
+                             float z = LeadUnderfootZ, float r = LeadUnderfootR)
+{
+    if (!lightLoc || !pawnLoc) return false;
+    float dx = lightLoc[0] - pawnLoc[0];
+    float dy = lightLoc[1] - pawnLoc[1];
+    float dz = lightLoc[2] - pawnLoc[2];
+    return dz < z && (dx * dx + dy * dy) <= (r * r);
+}
+
+// v71: the ONE open rule for every blocking actor near a Lumos secret wall.
+//   lumosActive     - the shared Lumos window is open
+//   playerAtTrigger - a tracked player stands inside the trigger's own
+//                     radius (stock's InLumosRadius key). This is the only
+//                     thing that proves the player is at a secret wall at
+//                     all, and it is what keeps ordinary railings and
+//                     camera blockers elsewhere in the level solid.
+//   eventLinked     - the actor's Tag equals the trigger's Event (the stock
+//                     TriggerEvent dispatch would have reached it: the
+//                     definitive "this is the wall" proof, kept from v69)
+//   nearTrigger     - within BlockerTriggerRadius of that armed trigger
+//   nearPlayer      - within BlockerPlayerRadius/Height of that player (the
+//                     "whatever you are actually bumping into" key)
+inline bool blockerShouldOpen(bool lumosActive, bool playerAtTrigger,
+                              bool eventLinked, bool nearTrigger,
+                              bool nearPlayer)
+{
+    if (!lumosActive || !playerAtTrigger) return false;
+    return eventLinked || nearTrigger || nearPlayer;
+}
+
+// v71: a revealed secret wall STAYS open. Stock opens it permanently -
+// LumosTrigger fires once (bFirstEventSent, never reset) and the wall's
+// TriggerToggle mover has bEventLeaving = False - so v66.5..v70 re-closing
+// a wall when the Lumos window expired (or when the player stepped two
+// metres back) took the secret away again and could shut it on a player
+// standing inside it.
+inline bool blockerStaysOpen(bool openedByMod, bool latchOpen)
+{
+    return openedByMod && latchOpen;
 }
 
 // ---------------------------------------------------------------------------

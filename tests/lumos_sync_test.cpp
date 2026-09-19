@@ -473,10 +473,98 @@ int main()
     assert(!observedStockAutoOff(false, false, false)); // never lit by mod
     assert(!observedStockAutoOff(false, true, false));  // inconsistent
 
+    // 18. v71: the wand-tip anchor. The field report is "light underneath,
+    //     no wand glow" - v68..v70 parked the light (and its LumosLightFX)
+    //     on the pawn, because stock's baseWand.Tick ride never reached a
+    //     companion wand. The anchor is the wand actor's own Location when
+    //     it is a believable tip, and hand height above the pawn otherwise
+    //     (the game fires its own spells from pawn + 45Z).
+    {
+        float pawnL[3] = { 100.0f, 200.0f, 300.0f };
+        float tip[3] = { 0.0f, 0.0f, 0.0f };
+        // A wand actor the game never updated: still at the world origin.
+        float bogusZero[3] = { 0.0f, 0.0f, 0.0f };
+        wandTipFor(pawnL, bogusZero, tip);
+        assert(near(tip[0], 100.0f) && near(tip[1], 200.0f) &&
+               near(tip[2], 300.0f + WandTipFallbackZ));
+        // A wand actor parked at the character's feet (dZ = 0): the shape
+        // that reads as "the light is underneath him".
+        float atFeet[3] = { 100.0f, 200.0f, 300.0f };
+        assert(!wandLocIsTip(pawnL, atFeet));
+        wandTipFor(pawnL, atFeet, tip);
+        assert(near(tip[2], 300.0f + WandTipFallbackZ));
+        // A wand actor across the level (a stale Location).
+        float farAway[3] = { 9000.0f, 9000.0f, 300.0f };
+        assert(!wandLocIsTip(pawnL, farAway));
+        // A wand actor at hand height in front of the character: accepted
+        // verbatim - that IS the wand tip.
+        float goodWand[3] = { 118.0f, 196.0f, 344.0f };
+        assert(wandLocIsTip(pawnL, goodWand));
+        wandTipFor(pawnL, goodWand, tip);
+        assert(near(tip[0], 118.0f) && near(tip[1], 196.0f) &&
+               near(tip[2], 344.0f));
+    }
+    // 19. v71: the ride test. Only a light that is actually off the tip is
+    //     moved, so a STOCK ride that is working (it keeps the light within
+    //     a few units of the wand end) is never fought frame by frame.
+    {
+        float pawnL[3] = { 100.0f, 200.0f, 300.0f };
+        float tip[3]   = { 100.0f, 200.0f, 345.0f };
+        float onTip[3] = { 101.0f, 200.0f, 345.0f };
+        float seated[3]= { 100.0f, 200.0f, 305.0f };  // 40 short of the tip
+        float lost[3]  = { 100.0f, 200.0f, 0.0f };    // parked at the origin
+        assert(!lightNeedsRide(onTip, tip));
+        assert(lightNeedsRide(seated, tip));
+        assert(!lightIsLost(onTip, pawnL));
+        assert(!lightIsLost(seated, pawnL));
+        assert(lightIsLost(lost, pawnL));
+    }
+    // 20. v71: the lead's "heavy light underneath" - a light hugging the
+    //     pawn's origin (at or below the feet) is the shape the mod lifts
+    //     onto the wand tip when LeadRide=1. A light at hand height, or a
+    //     light somewhere else entirely, is left where stock put it.
+    {
+        float pawnL[3] = { 0.0f, 0.0f, 500.0f };
+        float under[3] = { 10.0f, 0.0f, 498.0f };   // at/below the feet
+        float atHand[3]= { 10.0f, 0.0f, 545.0f };   // hand height
+        float above[3] = { 10.0f, 0.0f, 700.0f };   // somewhere else
+        assert(lightIsUnderfoot(under, pawnL));
+        assert(!lightIsUnderfoot(atHand, pawnL));
+        assert(!lightIsUnderfoot(above, pawnL));
+    }
+    // 21. v71: THE WALL-OPEN KEY. The v70 hardware log proved HP3_InsideHub
+    //     has no Event->wall linkage at all, so the open rule is the pair
+    //     (player inside the trigger's own radius) + (blocker near that
+    //     trigger OR near that player). Nothing opens without the first.
+    {
+        assert(blockerShouldOpen(true, true, false, true, false));  // near trig
+        assert(blockerShouldOpen(true, true, false, false, true));  // near you
+        assert(blockerShouldOpen(true, true, true, false, false));  // linked
+        assert(!blockerShouldOpen(true, false, true, true, true));  // not at wall
+        assert(!blockerShouldOpen(false, true, true, true, true));  // Lumos off
+        assert(!blockerShouldOpen(true, true, false, false, false));// nothing near
+        // v71: a revealed wall stays open - stock fires a secret wall's
+        // event once and never closes it again (bEventLeaving defaults
+        // False), so v66.5..v70 re-closing it on window expiry took the
+        // secret away (and could shut it on a player standing inside).
+        assert(blockerStaysOpen(true, true));
+        assert(!blockerStaysOpen(true, false));
+        assert(!blockerStaysOpen(false, true));
+        // The radii are the designer's own distances, not arbitrary.
+        assert(BlockerTriggerRadius == StockTriggerDistanceCheck);
+        assert(BlockerPlayerRadius > 0.0f && BlockerPlayerHeight > 0.0f);
+        assert(BlockerPlayerRadius < BlockerTriggerRadius);
+        // A mod-owned light is retired on a hard ceiling: it can never
+        // outlive the stock window by more than the grace period.
+        assert(ModLightHardOffMs > StockLumosDurationMs);
+        assert(ModLightHardOffMs <= StockLumosDurationMs + 10000);
+    }
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
               "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
               "v66.5 wall-bits/follow-light, v67 stock-register/"
-              "trigger-fire, v68 proxied-wall/retry and v69 Event==Tag "
-              "linkage / LumosSparkles token, v70 stock-auto-off observation assertions passed");
+              "trigger-fire, v68 proxied-wall/retry, v69 Event==Tag "
+              "linkage / LumosSparkles token, v70 stock-auto-off observation "
+              "and v71 wand-tip ride / trigger-keyed blocker opening assertions passed");
     return 0;
 }

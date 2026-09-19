@@ -2293,3 +2293,167 @@ Every symptom is explained by lines already in that log:
       the wall receiver line. If P2 still bumps, the pelog now says
       "HPCharacter.Bump other=<actor>" - report that actor's line and the
       "secret wall #k <name> ..." lines from the scan.
+
+28. v71 (2026-09-19) - LUMOS P2/P3 ROUND 5: THE v70 FIELD REPORT, DECODED
+--------------------------------------------------------------------------
+FIELD REPORT (v70 running, 2 players, P2 = Hermione, HP3_InsideHub gargoyle6):
+  "Lumos still doesn't let Player 2 and 3 pass through walls designed for
+   this. It seems to be giving some light effect underneath, but no wand
+   glow and no pass through walls. Main character also receives heavy light
+   underneath, maybe stacked up stuck spell on him."
+
+The full v70 hp3mod.log was attached. The decisive lines:
+
+  [lumos] v70 Pawn.bLumosOn resolved on Engine.Pawn = +0x620 mask 0x4
+  [lumos] v70 LumosLight.PlayerHarry NOT FOUND (+0xFFFFFFFE on -)
+  [lumos] v70 Hermione ...: bLumosOn declared on its chain (+0x620 vs 620)
+  [lumos] v70 harry    ...: bLumosOn declared on its chain (+0x620 vs 620)
+     -> ProcessEvent LumosLight.TurnOn [stock replication]
+  [lumos] v69 P1 TheLumosLight turned ON via the STOCK TurnOn script
+          (register + Particles glow + Tick armed ...) glow=1d186e00
+  [lumos] v70 event receiver[1]: LumosSparklesTrigger
+          HP3_InsideHub.LumosSparklesTrigger5 (own Trigger: EMPTY base,
+          Event=0x0)
+  [lumos] v68 TriggerEvent fired (script Engine.Actor.TriggerEvent ...):
+          LumosTrigger HP3_InsideHub.LumosTrigger0 event=0x8D1A ...
+  [lumos] v66.5 opened secret wall #63 KWBlockingVolume
+          HP3_InsideHub.KWBlockingVolume5 at (192 2616 32) orig bits=0x05
+
+GOOD NEWS FIRST: v70's two layers worked. bLumosOn resolved (Engine.Pawn
++0x620 mask 0x4 - HP3 declares it on the ENGINE class, which is why every
+hgame.* guess missed), the gate dance masked it, and the stock TurnOn script
+ENGAGED for Hermione complete with its own LumosLightFX (glow=1d186e00) -
+even though the mod's own name-based LumosLightFX lookup still reports
+GlowFX=00000000, i.e. HP3's glow class is not reachable by any path the mod
+can resolve. Stock's script has the class reference; the mod never will.
+
+SO WHY NO PASS-THROUGH - the wall part:
+
+* The stock "Event -> wall.Tag" linkage DOES NOT EXIST in this level.
+     trigger[5] LumosTrigger0        Tag=0x0    Event=0x8D1A  (338 2618 -111)
+     trigger[6] LumosSparklesTrigger5 Tag=0x8D1A Event=0x0    (-64 2764 32)
+     secret wall #63 KWBlockingVolume5 Tag=0x3E63             (192 2616 32)
+  The ONLY actor carrying Tag 0x8D1A is the sparkles trigger, and its own
+  Event is 0x0 - the chain ends there. The wall actors of this level carry
+  Tags 0x3E63 / 0x405A, unrelated to any trigger Event. (In Save0 the
+  linkage is real - walls Tag 0x76E4 == LumosTrigger1.Event 0x76E4 - which
+  is exactly why the v69 theory survived one round.)
+* Therefore every wall the mod picked was a GUESS (Event==Tag pairing, else
+  "nearest wall within 900 units of a trigger"), and the actor the player
+  was actually bumping into was never considered. The mod opened one
+  KWBlockingVolume and P2 still could not get through.
+* The engine's Tag dispatch (v70's script TriggerEvent) is therefore a dead
+  end in this level for the wall itself - it can only ever reach the
+  sparkles trigger. Firing it is still correct (it is what stock does, and
+  it arms whatever the level DID link), but passability has to come from
+  SetCollision on the actor that blocks.
+
+FIX (v71): stop deriving the linkage; open what blocks. The level gives
+exactly two trustworthy facts, and v71 keys on both:
+  1. THE TRIGGER'S OWN RADIUS. A tracked player standing inside trigger t's
+     fDistanceCheck IS stock's InLumosRadius - the designer's "you are at
+     this wall" distance. Nothing opens anywhere else in the level, so
+     railings and camera blockers stay solid.
+  2. THE PLAYER'S OWN POSITION. Whatever blocks within 200 units of a player
+     who is inside that radius is what he is bumping into.
+Every actor near either is opened through the octree-safe SetCollision
+native, CLASS-AGNOSTICALLY. That last part matters: v66.5..v70 only ever
+considered two class tokens (GenericColObj / KWBlockingVolume) AND only when
+the wall had been "paired" at scan time, which is precisely what excluded
+the real blocker. The new blocker cache is built once per level from every
+actor of the current level that has bBlockActors or bBlockPlayers set
+(NOT bCollideActors alone - that is a Touch-only volume and taking its
+collision away would silently kill its events) and sits near a cached
+trigger. Pawns, projectiles and the triggers themselves are excluded.
+An opened actor is LATCHED OPEN for the level (new [lumos] LatchOpen=1):
+stock opens a secret wall permanently (bFirstEventSent, bEventLeaving is
+False), and v66.5..v70 re-closed it the moment the Lumos window expired -
+which took the secret away again and could shut it on a player standing
+inside it.
+
+SECOND BUG THE SAME LOG EXPOSED: the scan cached actors of the PREVIOUS
+level. Entering HP3_InsideHub the log reads "9 triggers, 80 walls" - five of
+those triggers and four of those walls are Save0's, still alive in
+GObjObjects. The mod could arm a Save0 trigger's radius and "open" a Save0
+wall while the player bumped into an HP3_InsideHub one. lumosScanActors now
+applies the same actorInCurrentLevel() gate findActorByClass always used
+(and cgDeleted), and logs how many actors were skipped.
+
+WHY THE LIGHT SAT "UNDERNEATH" WITH NO WAND GLOW - the light part:
+
+* v68..v70 seeded the companion's light at the PAWN (pawn + 48Z) before
+  calling TurnOn, and then left it there: stock's own ride (baseWand.Tick
+  -> TheLumosLight.UpdateLocation(WandEndPoint), which SetLocations BOTH
+  the light and its Particles) never reached a companion wand on hardware.
+  Light AND LumosLightFX therefore sat on the character - literally
+  "some light effect underneath, but no wand glow".
+* v71 rides both onto a wand-tip anchor every frame (lumosRideToTip): the
+  wand actor's own Location when it is a believable tip (not the origin,
+  not at/below the feet, not 9000 units away), otherwise hand height above
+  the pawn - pawn + 45Z, the game's own projectile origin, which is where
+  its spells leave the hand. The ride only moves what is actually off the
+  tip (8 units), and it STANDS DOWN automatically if the light turns out to
+  be moving on its own, i.e. if the game's ride is in fact carrying it -
+  two writers per frame would just leave the light wherever the last one
+  put it, and the game's answer wins when it exists.
+* "STACKED UP": v70 tracked exactly ONE glow pointer per player and
+  overwrote it on every re-spawn, so each new cast orphaned the previous
+  LumosLightFX at the light's position. LUMOS_MAX_GLOW (4) glows are now
+  tracked per player; every one of them rides, every one of them is
+  destroyed on teardown, and a slot is only recycled when it is dead.
+* "STUCK": a mod-owned light is now retired on a hard ceiling - 30 s for a
+  fallback-registered light, 33 s for a stock-lit one - whatever stock's own
+  Tick did. The v70 log shows the companion light turning on and never
+  going cold again.
+
+AND THE MAIN CHARACTER: v66.5..v70 ran setLumosActorHidden(light, FALSE)
+for EVERY player's light, p == 0 included - it is the only thing the mod
+ever did to the lead's light, and it is the prime suspect for "the main
+character also receives heavy light underneath". v71 never forces the lead's
+light visible ([lumos] UnhideLight only applies to companions now) and only
+ever touches the lead's light POSITION, in two narrow shapes:
+  * LOST      - more than 250 units from him and moved by nobody for a
+                full second (LeadHeal=1);
+  * UNDERFOOT - hugging the pawn's origin, at or below the feet, which is
+                exactly the reported shape (LeadRide=1 lifts it onto the
+                wand tip, with its glow).
+Both are logged once and both can be switched off from the ini; neither
+touches the register, the pawn bit or the visibility.
+Additionally, two player slots that resolve to the SAME pawn are now
+collapsed to one (logged): that shape would light, hide and ride one
+character's light twice - stacked lights on a single character.
+
+DIAGNOSTICS ADDED (the v70 log could prove the light turned on but never
+said WHERE it was, which is what made this round a guessing game):
+  * "[lumos] v71 window: Xs left, triggers=N walls=M blockers=K" plus one
+    line per player, every second while Lumos is up:
+      P1 Hermione pawn=(..) wand=0x.. at (..) light=0x.. at (..)
+      dPawn=.. on=1 stock=1 glow=0x.. at (..) riding=yes/NO
+  * every opened actor is named with the key that opened it
+    (key=1 near an armed trigger, 2 near the player, 3 stock Event==Tag);
+  * the scan lists every cached blocker (name, paired trigger, bits,
+    location) and says how many actors of another level it skipped;
+  * while a player stands inside a trigger's radius, "[lumos] v71 at-wall
+    P1: blocker <name> d=.. bits=0x.. open/SOLID/NOT CACHED" (1 Hz) names
+    everything still blocking within 260 units of him - if the next log
+    shows a SOLID or NOT CACHED blocker there, that line IS the next fix
+    (and if it shows nothing at all, the blocker is level BSP, which no
+    SetCollision can touch).
+
+HARDWARE CHECK LIST:
+  * Log line 2 says build v71.
+  * "hp3mod.ini: lumos TriggerEvents=1 GlowFX=1 OpenRadius=512
+    PlayerRadius=200 LatchOpen=1 WandGlow=1 UnhideLight=1 LeadHeal=1
+    LeadRide=1 GlowRadius=0".
+  * Scan line now reads "N triggers, M walls cached, K blocking actors near
+    a trigger (v71); ... A actors of ANOTHER level skipped" - expect K > 0
+    and the Save0 entries gone from the trigger list (4, not 9).
+  * P2 casts Lumos at the gargoyle: expect the stock TurnOn line with
+    glow=0x<nonzero> again, then the 1 Hz status line. Report the
+    "P1 ... light=0x.. at (..) dPawn=.. glow=0x.. riding=yes/NO" line - it
+    says whether the light is at the wand or on the character, and whether
+    the game is carrying it.
+  * Walk P2 to the wall: expect one or more "v71 OPENED blocker #k <name>
+    at (..) bits=0x05 key=1" lines (and "latched open for the level"), then
+    the at-wall blocker dump. If P2 still cannot pass, send the at-wall
+    dump: any SOLID / NOT CACHED line there is the answer.

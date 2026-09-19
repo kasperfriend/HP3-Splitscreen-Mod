@@ -166,8 +166,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v70"
-#define MOD_STAMP "build v70 - 2026-09-10 - LUMOS P2/P3 ROUND 4: WHAT THE v69 LOG PROVED. (1) Pawn.bLumosOn=+0xFFFFFFFE - the pawn bit NEVER resolved (HP3 renamed the hierarchy: hgame.HPPawn/HPHeroPawn, not harry/HPawn/HPCharacter), so the v69 gate dance masked NOTHING, PlayerHarry.bLumosOn stayed True (lead already lit by the gargoyle) and stock TurnOn early-returned every time = the logged -stock TurnOn did not engage-. v70 resolves bLumosOn by walking the LIVE pawn own class chain (same walk that found TheLumosLight on hgame.WeaponWand) and, as the primary gate, RETARGETS the light own PlayerHarry var at the companion for the one synchronous TurnOn call (stock then reads the gate off the companion and writes PlayerHarry.bLumosOn=True onto the companion - literal per-player stock semantics), restoring it right after. (2) The v68 fallback register lit the light with bLumosOn deliberately LOW (glow-gated) and GlowFX=0 (HPParticle.LumosLightFX absent on HP3) - one frame later the cold-light latch read that same low bit as the stock 30s auto-off and killed the cast (-went cold on its own- 16 ms after -turned ON-). v70 observes the auto-off for STOCK-lit lights only (hp3lumos::observedStockAutoOff, tested), resolves LumosLightFX by class token in ANY package, and rides a glow-less fallback light onto the companion every frame. (3) The Tag walk fired the EMPTY Engine.Actor.Trigger on LumosSparklesTrigger5 and called it a fire: the class-level loop reached Engine.Actor before the state-declared pass ever ran. HP3 chain is LumosTrigger -Event-> LumosSparklesTrigger -Event-> wall (scan: 4 walls paired by sparkles.Event==wall.Tag). v70 fires the SCRIPT Engine.Actor.TriggerEvent through ProcessEvent on the trigger (the engine does the virtual Trigger dispatch incl. state Movers), RELAYS an empty-Trigger receiver own Event onward (depth<=3, receivers named), never counts the empty base as a fire, and stops the chain lookup before Engine.Actor. (4) Diagnostics: the PARTIAL fields line no longer floods (once per attempt), scan lists every trigger Tag/Event and every secret wall with name/Tag/bits/location, opened walls are named, and the pelog names the Bump partner. v69 STOCK-TURNON REPLICATION, EMPTY-WEAPON FILL, EVENT==TAG PAIRING; v68 DEFERRED RESOLUTION; v66.5 OCTREE-SAFE SETCOLLISION; ALL KEPT."
+#define MOD_BUILD  "v71"
+#define MOD_STAMP "build v71 - 2026-09-19 - LUMOS P2/P3 ROUND 5: WHAT THE v70 HARDWARE LOG PROVED, AND THE TWO FIXES IT FORCED. (1) THE WALL. HP3_InsideHub has NO Event->wall linkage at all: LumosTrigger0.Event=0x8D1A is carried by exactly one actor, LumosSparklesTrigger5 (whose own Event is 0x0, so the chain ends there), while the cached walls carry Tags 0x3E63/0x405A. The mod still opened one guess - it logged v66.5 opened secret wall 63 KWBlockingVolume5 - and P2 kept bumping into something else. v71 stops trying to derive the stock linkage and keys on the only two facts the level really gives: the trigger own radius (a tracked player inside it = stock InLumosRadius, the designer you-are-at-this-wall distance) and the player own position. EVERY blocking actor near either is opened through the octree-safe SetCollision native - class-agnostic now (KWBlockingVolume, GenericColObj, a Mover, anything), because the v66.5 rule only ever considered two class tokens and only when they were paired at scan time. An opened actor is LATCHED open for the level, because stock opens a secret wall permanently (bFirstEventSent, bEventLeaving=False) - v66.5..v70 closed it again as soon as the Lumos window expired. The scan now also skips actors of another level (the v70 log carried five Save0 triggers and four Save0 walls into HP3_InsideHub). (2) THE LIGHT. v68..v70 seeded a companion light at the PAWN and left it there, because stock baseWand.Tick ride never reached a companion wand - the field report light-underneath-but-no-wand-glow is exactly that: light AND LumosLightFX parked on the character. v71 rides both onto a wand-tip anchor every frame (the wand actor own Location when it is believable, else hand height above the pawn - the game own projectile origin), and stands down automatically if the game own ride turns out to be carrying the light. Every glow the mod ever sees on a player light is tracked (v70 kept ONE pointer and orphaned the previous LumosLightFX on every re-cast - the stacked-up report), all of them ride, all of them are destroyed on teardown, and a mod-owned light is retired on a hard ceiling so nothing can burn forever (stuck spell). The LEAD light is now only ever touched in two narrow ways: it is never forced visible (v66.5..v70 ran setLumosActorHidden(FALSE) for every player, p==0 included - the prime suspect for the main character receiving heavy light underneath), and its POSITION is only fixed when it is provably lost or sitting underfoot (LeadRide=1). Two player slots resolving to the same pawn are collapsed to one (stacked lights on one character). (3) DIAGNOSTICS: a 1 Hz status line prints every player pawn/wand/light/glow position and whether the light is being carried; every opened actor is named with the key that opened it; and while a player stands at a revealed wall the mod names every blocking actor within 260 units of him with its open state, so the next log says exactly what still blocks. v70 STOCK-TURNON REPLICATION, v69 EVENT DISPATCH, v68 DEFERRED RESOLUTION, v66.5 OCTREE-SAFE SETCOLLISION: ALL KEPT."
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -2930,8 +2930,9 @@ static void cgDeliverHit(CgPending *p, BOOL spellAlive)
             // between a light's auto-off and the state expiry, and that
             // cast must open a window the companions can join.
             lumosClearDeadLatches();
-            logf_("    [lumos] p%d delivered Lumos hit to %s - Lumos activated for 25s",
-                  i, p->targetName);
+            logf_("    [lumos] p%d delivered Lumos hit to %s - Lumos activated "
+                  "for %.0fs", i, p->targetName,
+                  hp3lumos::DefaultLumosDurationMs / 1000.0f);
         }
     }
     if (!did)
@@ -9182,13 +9183,40 @@ static DWORD  g_lumosLightOnAt[8] = { 0 };
 // fresh cast.
 static BOOL   g_lumosLightDead[8] = { FALSE };
 
+// v71: per-player ride telemetry for the 1 Hz status line and for the
+// "is the stock ride carrying this light?" test the lead heal keys on.
+static float  g_lumosLastLightLoc[8][3] = { {0} };
+static DWORD  g_lumosLightMovedAt[8]   = { 0 };
+static BOOL   g_lumosLightLocKnown[8]  = { FALSE };
+// v71: the last position the MOD wrote onto a player's light, and the last
+// time the light moved WITHOUT the mod writing it (i.e. the game's own
+// baseWand.Tick ride is carrying it - in which case the mod's ride stands
+// down instead of fighting it frame by frame).
+static float  g_lumosRideWrote[8][3]   = { {0} };
+static BOOL   g_lumosRideWroteValid[8] = { FALSE };
+static DWORD  g_lumosRideForeignAt[8]  = { 0 };
+static BOOL   g_lumosRideStandDown[8]  = { FALSE };
+static int    g_lumosLeadRide          = 1;
+
 static void lumosClearDeadLatches(void)
 {
     memset(g_lumosLightDead, 0, sizeof(g_lumosLightDead));
+    // v71: a fresh cast re-arms the ride too - the "the game is carrying
+    // this light, stand down" verdict is only valid for the window it was
+    // reached in.
+    memset(g_lumosRideStandDown, 0, sizeof(g_lumosRideStandDown));
+    memset(g_lumosRideForeignAt, 0, sizeof(g_lumosRideForeignAt));
+    memset(g_lumosRideWroteValid, 0, sizeof(g_lumosRideWroteValid));
 }
-// The LumosLightFX particles we spawned for that player - the visible wand
+// The LumosLightFX particles riding that player's light - the visible wand
 // glow. Stock spawns them inside TurnOn and destroys them in TurnOff.
-static void  *g_lumosGlow[8]      = { NULL };
+// v71: a SMALL ARRAY, because v70 tracked exactly one and silently orphaned
+// every earlier one (each new cast spawned a fresh LumosLightFX and simply
+// overwrote the slot: the field report's "stacked up stuck spell on him").
+// Everything the mod ever attached to a player's light is tracked here so
+// the teardown can destroy all of it, and the ride can carry all of it.
+#define LUMOS_MAX_GLOW 4
+static void  *g_lumosGlow[8][LUMOS_MAX_GLOW] = { { NULL } };
 // Once-per-level latch per cached trigger: 1 = its Event was fired (by us or
 // by stock - bFirstEventSent). Stock secret walls open exactly once per
 // level; a second TriggerEvent on a TriggerToggle Mover would CLOSE it.
@@ -9196,6 +9224,32 @@ static signed char g_lumosTrigFired[LUMOS_MAX_ACTORS];
 // ini [lumos] TriggerEvents / GlowFX.
 static int    g_lumosTriggerEvents = 1;
 static int    g_lumosGlowFX        = 1;
+// v71 ini [lumos] knobs (see hp3mod.ini):
+//   OpenRadius   - blocking actors within this of an ARMED lumos trigger are
+//                  opened (0 disables the trigger-radius key).
+//   PlayerRadius - blocking actors within this of a player who is himself
+//                  inside an armed trigger are opened (the "bumping into it"
+//                  key; 0 disables it).
+//   LatchOpen    - 1 = a revealed wall stays open for the level, exactly
+//                  like stock (default). 0 = restore it when Lumos expires.
+//   WandGlow     - 1 = ride light + glow onto the wand tip (default).
+//   UnhideLight  - 1 = force the companion's light actor visible. v66.5..v70
+//                  did this unconditionally for EVERY player's light,
+//                  including the lead's - the prime suspect for the
+//                  "heavy light underneath the main character" report, so
+//                  the lead's light actor is never touched now.
+//   LeadHeal     - 1 = recover the lead's own light when it is provably lost
+//                  (parked >250 units away and stationary for >1 s).
+//   GlowRadius   - >0 overrides the LightRadius the mod writes on a
+//                  companion light (0 = the stock 15).
+static float  g_lumosOpenRadius    = hp3lumos::BlockerTriggerRadius;
+static float  g_lumosPlayerRadius  = hp3lumos::BlockerPlayerRadius;
+static float  g_lumosPlayerHeight  = hp3lumos::BlockerPlayerHeight;
+static int    g_lumosLatchOpen     = 1;
+static int    g_lumosWandGlow      = 1;
+static int    g_lumosUnhideLight   = 1;
+static int    g_lumosLeadHeal      = 1;
+static float  g_lumosGlowRadius    = 0.0f;
 static BOOL   g_lumosTrigWarned    = FALSE;
 // Per-wand-class TheLumosLight property offset cache (wand class -> offset).
 static struct { void *cls; int off; } g_wandLightProp[8] = {};
@@ -9787,9 +9841,33 @@ static BYTE  g_lumosWallOrig[LUMOS_MAX_ACTORS];
 // past the surface a player presses against.
 static short g_lumosWallTrig[LUMOS_MAX_ACTORS];
 
+// ---------------------------------------------------------------------------
+// v71: THE BLOCKER CACHE - every actor in the current level that actually
+// BLOCKS (bBlockActors or bBlockPlayers - NOT bCollideActors alone, which is
+// a Touch-only volume that must keep its collision) and sits near a cached
+// Lumos trigger. This is what the v70 field log demanded: the mod opened
+// "secret wall #63 KWBlockingVolume5" while the player kept bumping into
+// something else, and the stock Event->Tag linkage that choice was based on
+// does not exist in HP3_InsideHub at all (LumosTrigger0.Event=0x8D1A is
+// carried by exactly one actor - LumosSparklesTrigger5 - whose own Event is
+// 0x0, so the chain ends there; the cached walls carry Tags 0x3E63/0x405A).
+// Class-agnostic on purpose: whatever blocks a companion at a revealed wall
+// is whatever the level put there (KWBlockingVolume, GenericColObj, a Mover,
+// a StaticMeshActor, ...), and none of it can be derived from a name.
+// ---------------------------------------------------------------------------
+#define LUMOS_MAX_BLOCKERS 1024
+static void       *g_lumosBlockers[LUMOS_MAX_BLOCKERS];
+static short       g_lumosBlockerTrig[LUMOS_MAX_BLOCKERS];  // nearest trigger
+static BYTE        g_lumosBlockerOrig[LUMOS_MAX_BLOCKERS];  // pristine bits
+static signed char g_lumosBlockerColl[LUMOS_MAX_BLOCKERS];  // -1/0/1, as walls
+static int         g_lumosBlockersN = 0;
+
 
 // Defined further down; needed by lumosRestoreAllWalls.
 static BOOL lumosClassVerified(void *obj, BOOL wantWall);
+
+// v71: fire-time re-verification for the class-agnostic blocker cache.
+static BOOL lumosBlockerVerified(void *obj);
 
 // v66.5: hand every wall the mod opened back its pristine collision state
 // through the engine's own SetCollision native. Called on level travel
@@ -9812,6 +9890,23 @@ static void lumosRestoreAllWalls(void)
                            b.blockActors ? TRUE : FALSE,
                            b.blockPlayers ? TRUE : FALSE);
     }
+    // v71: the same teardown for the class-agnostic blocker cache. A wall we
+    // leave open is CONSISTENT (the native removed it from the octree), so
+    // this is about handing the level back the way it loaded, not about
+    // avoiding the v66.4 teardown assert.
+    for (int k = 0; k < g_lumosBlockersN; k++) {
+        if (g_lumosBlockerColl[k] != 0) continue;
+        g_lumosBlockerColl[k] = 1;
+        if (g_lumosBlockerOrig[k] == hp3lumos::WallBitsUnknown) continue;
+        void *obj = g_lumosBlockers[k];
+        if (!obj || !cgLiveObject(obj) || cgDeleted(obj)) continue;
+        if (!lumosBlockerVerified(obj)) continue;
+        if (!g_execSetCollision) continue;
+        hp3lumos::WallCollisionBits b = hp3lumos::unpackWallBits(g_lumosBlockerOrig[k]);
+        nativeSetCollision(obj, b.collideActors ? TRUE : FALSE,
+                           b.blockActors ? TRUE : FALSE,
+                           b.blockPlayers ? TRUE : FALSE);
+    }
 }
 
 static void lumosInvalidate(void)
@@ -9827,6 +9922,11 @@ static void lumosInvalidate(void)
     memset(g_lumosWallTrig, 0xFF, sizeof(g_lumosWallTrig));     // v68: -1 = unpaired
     memset(g_lumosTrigFired, 0, sizeof(g_lumosTrigFired));
     memset(g_lumosTrigNextTryAt, 0, sizeof(g_lumosTrigNextTryAt));
+    // v71: the blocker cache belongs to the level too.
+    g_lumosBlockersN = 0;
+    memset(g_lumosBlockerColl, -1, sizeof(g_lumosBlockerColl));
+    memset(g_lumosBlockerOrig, hp3lumos::WallBitsUnknown, sizeof(g_lumosBlockerOrig));
+    memset(g_lumosBlockerTrig, 0xFF, sizeof(g_lumosBlockerTrig));
     // v67: drop the per-player replication state. The level is (being)
     // destroyed, so any glow particles are going with it - never touch them
     // here; a dead pointer is dropped via the liveness check in lumosTick.
@@ -9836,8 +9936,9 @@ static void lumosInvalidate(void)
         g_lumosLightOn[p] = FALSE;
         g_lumosLightStock[p] = FALSE;  // v69: fresh level, stock path reset
         g_lumosLightOnAt[p] = 0;
-        g_lumosGlow[p] = NULL;
+        for (int g = 0; g < LUMOS_MAX_GLOW; g++) g_lumosGlow[p][g] = NULL;
         g_lumosLightDead[p] = FALSE;   // v68: fresh level, fresh window
+        g_lumosLightLocKnown[p] = FALSE;   // v71: ride telemetry
     }
 }
 
@@ -9879,6 +9980,82 @@ static BOOL lumosChainProves(void *obj, BOOL wantWall)
     return hp3lumos::chainContainsAny(chain, nc, refs, refsN) ? TRUE : FALSE;
 }
 
+// ---------------------------------------------------------------------------
+// v71: build the blocker cache - every actor of the CURRENT level that can
+// actually stop a player and sits near one of the cached Lumos triggers.
+// Once per level, right after the trigger/wall scan that it is keyed on.
+//
+// Why this exists (v70 field log, HP3_InsideHub): the mod opened "secret
+// wall #63 KWBlockingVolume5" through the Event==Tag / proximity pairing and
+// the player still could not get through. That level has NO Event->wall
+// linkage at all - LumosTrigger0.Event=0x8D1A is carried by exactly one
+// actor, LumosSparklesTrigger5, whose own Event is 0x0 (the chain ends
+// there), while the cached walls carry Tags 0x3E63/0x405A. So the mod's
+// single "best guess" wall was a guess, and the actor the player bumped was
+// never considered. The only two facts the level really gives us are the
+// trigger's own radius (the designer's "you are at this wall" distance,
+// stock's InLumosRadius check) and the player's position - so every blocker
+// near either is opened, whatever its class.
+//
+// What is deliberately EXCLUDED:
+//   * pawns / players and projectiles (un-colliding a character would break
+//     the game outright);
+//   * anything that does not BLOCK (bBlockActors/bBlockPlayers clear).
+//     bCollideActors alone means a Touch-only volume - triggers, corrals,
+//     water - and taking its collision away would silently kill its events;
+//   * the Lumos triggers/lights themselves;
+//   * actors of another level (see the actorInCurrentLevel gate in
+//     lumosScanActors - stale Save0 actors are the whole reason the v70
+//     cache was polluted).
+// ---------------------------------------------------------------------------
+static void lumosScanBlockers(void)
+{
+    g_lumosBlockersN = 0;
+    memset(g_lumosBlockerColl, -1, sizeof(g_lumosBlockerColl));
+    memset(g_lumosBlockerOrig, hp3lumos::WallBitsUnknown, sizeof(g_lumosBlockerOrig));
+    memset(g_lumosBlockerTrig, 0xFF, sizeof(g_lumosBlockerTrig));
+    if (!g_objArray || !g_objArray->Data || g_lumosTriggersN <= 0) return;
+    if (F.Location <= 0) return;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+    const float R = g_lumosOpenRadius > 0.0f ? g_lumosOpenRadius
+                                            : hp3lumos::BlockerTriggerRadius;
+    for (int k = 0; k < n && g_lumosBlockersN < LUMOS_MAX_BLOCKERS; k++) {
+        void *obj = g_objArray->Data[k];
+        if (!obj || IsBadReadPtr(obj, 0x100)) continue;
+        if (cgDeleted(obj) || !actorInCurrentLevel(obj)) continue;
+        if (IsBadReadPtr((BYTE *)obj + F.Location, 12)) continue;
+        CgClass *ci = cgClassInfo(cgClassOf(obj));
+        if (!ci || !ci->isActor || ci->isPawn || ci->isProjectile) continue;
+        if (hp3lumos::isLumosTriggerClassToken(ci->token)) continue;
+        BOOL c = FALSE, ba = FALSE, bp = FALSE;
+        if (!readLumosCollisionBits(obj, &c, &ba, &bp)) continue;
+        if (!ba && !bp) continue;                 // does not block anything
+        float *ol = (float *)((BYTE *)obj + F.Location);
+        int best = -1; float bestD = R * R;
+        for (int t = 0; t < g_lumosTriggersN; t++) {
+            void *tr = g_lumosTriggers[t];
+            if (!tr || !cgLiveObject(tr) || IsBadReadPtr((BYTE *)tr + F.Location, 12))
+                continue;
+            float *tl = (float *)((BYTE *)tr + F.Location);
+            float dx = ol[0] - tl[0], dy = ol[1] - tl[1], dz = ol[2] - tl[2];
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < bestD) { bestD = d2; best = t; }
+        }
+        if (best < 0) continue;                   // nowhere near a secret wall
+        int s = g_lumosBlockersN++;
+        g_lumosBlockers[s] = obj;
+        g_lumosBlockerTrig[s] = (short)best;
+        g_lumosBlockerOrig[s] = hp3lumos::packWallBits(c != FALSE, ba != FALSE,
+                                                       bp != FALSE);
+        g_lumosBlockerColl[s] = 1;                // pristine: solid
+    }
+    if (g_lumosBlockersN >= LUMOS_MAX_BLOCKERS)
+        logf_("[lumos] v71 blocker cache FULL (%d actors) - the rest are not "
+              "managed; raise LUMOS_MAX_BLOCKERS or lower [lumos] OpenRadius",
+              g_lumosBlockersN);
+}
+
 // One full table scan, once per level. Only the class/name match is needed;
 // each result is cached for the rest of the level's life.
 static void lumosScanActors(BOOL quiet = FALSE)
@@ -9895,9 +10072,18 @@ static void lumosScanActors(BOOL quiet = FALSE)
     char name[160];
     int impostorTrig = 0, impostorWall = 0;   // rejected look-alikes
     int chainTrig = 0, chainWall = 0;         // v66.4 chain-admitted subclasses
+    int otherLevel = 0;                       // v71: actors of the PREVIOUS level
     for (int k = 0; k < n; k++) {
         void *obj = g_objArray->Data[k];
         if (!obj || IsBadReadPtr(obj, 0x100)) continue;
+        // v71: NEVER cache an actor of another level. GObjObjects keeps the
+        // actors of the level you travelled out of alive for a while (the
+        // v70 log: entering HP3_InsideHub still listed Save0's five
+        // triggers and four KWBlockingVolumes - "9 triggers, 80 walls"), so
+        // the mod could "open" a Save0 wall while the player bumped into an
+        // HP3_InsideHub one, and a stale trigger's radius check could arm
+        // the wrong wall. findActorByClass has always filtered this way.
+        if (cgDeleted(obj) || !actorInCurrentLevel(obj)) { otherLevel++; continue; }
         objName(obj, name, sizeof(name));
         // v66.4 crash fix: membership is the EXACT class token (the word
         // before the first space) and nothing else. v66 substring-matched the
@@ -10019,13 +10205,38 @@ static void lumosScanActors(BOOL quiet = FALSE)
         }
         return;
     }
-    logf_("[lumos] scan: %d triggers, %d walls cached; %d+%d name look-alikes "
-          "rejected, %d+%d subclasses chain-admitted (v66.4 exact-family "
-          "rule, v69 Engine.Triggers anchor); %d walls paired to a lumos "
-          "trigger (v69 %d by Event==Tag stock linkage, %d by proximity - "
-          "v66.5 secret-wall candidates)",
-          g_lumosTriggersN, g_lumosWallsN, impostorTrig, impostorWall,
-          chainTrig, chainWall, paired, pairedByLink, pairedByDist);
+    // v71: the class-agnostic blocker cache - everything near a lumos
+    // trigger that can actually stop a player. Built AFTER the trigger
+    // cache (it is keyed on trigger proximity) and in the same once-per-
+    // level pass, so the extra table walk costs nothing per frame.
+    lumosScanBlockers();
+    logf_("[lumos] scan: %d triggers, %d walls cached, %d blocking actors "
+          "near a trigger (v71); %d+%d name look-alikes rejected, %d+%d "
+          "subclasses chain-admitted (v66.4 exact-family rule, v69 "
+          "Engine.Triggers anchor), %d actors of ANOTHER level skipped "
+          "(v71: stale Save0 entries used to pollute the cache); %d walls "
+          "paired to a lumos trigger (v69 %d by Event==Tag stock linkage, "
+          "%d by proximity - v66.5 secret-wall candidates)",
+          g_lumosTriggersN, g_lumosWallsN, g_lumosBlockersN,
+          impostorTrig, impostorWall, chainTrig, chainWall, otherLevel,
+          paired, pairedByLink, pairedByDist);
+    // v71: list the blockers the mod will open at each trigger, so a field
+    // log shows what the wall actually IS before anyone walks into it.
+    if (!quiet) {
+        char tn[160];
+        int shown = 0;
+        for (int k = 0; k < g_lumosBlockersN && shown < 24; k++) {
+            void *obj = g_lumosBlockers[k];
+            if (!obj || !cgLiveObject(obj)) continue;
+            float *bl = (F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12))
+                        ? (float *)((BYTE *)obj + F.Location) : NULL;
+            logf_("    blocker[%d] %s trig=%d bits=0x%02X at (%.0f %.0f %.0f)",
+                  k, objName(obj, tn, sizeof(tn)), g_lumosBlockerTrig[k],
+                  g_lumosBlockerOrig[k], bl ? bl[0] : 0.f, bl ? bl[1] : 0.f,
+                  bl ? bl[2] : 0.f);
+            shown++;
+        }
+    }
     // v70: name the linkage so a field log shows the whole chain per wall
     // (trigger -> Event -> receiver Tag), and every cached trigger's own
     // Tag/Event - the v69 log could only say "#63 opened" while the player
@@ -10161,6 +10372,488 @@ static void *lumosLightOf(int p, void *pawn)
     return g_lumosLight[p];
 }
 
+// ---------------------------------------------------------------------------
+// v71: the wand glow - tracking, riding and retiring a player's LumosLightFX.
+//
+// Stock keeps ONE glow: LumosLight.Particles. TurnOn spawns it, the wand's
+// Tick relocates it together with the light (UpdateLocation SetLocations
+// both), TurnOff destroys it. v66..v70 tracked one pointer per player and
+// overwrote it on every re-spawn, so each new cast orphaned the previous
+// particle actor at the light's position - the "stacked up stuck spell"
+// the field report describes. The mod now tracks every glow it ever sees on
+// a player's light (a stock spawn, or one it made itself) so the ride can
+// carry all of them and the teardown can destroy all of them.
+// ---------------------------------------------------------------------------
+static void *lumosParticlesOf(void *light)
+{
+    if (!light || g_offLightParticles <= 0 ||
+        IsBadReadPtr((BYTE *)light + g_offLightParticles, 4)) return NULL;
+    void *fx = *(void **)((BYTE *)light + g_offLightParticles);
+    if (!fx || IsBadReadPtr(fx, 0x100) || !cgLiveObject(fx)) return NULL;
+    return fx;
+}
+
+static BOOL lumosAnyGlowLive(int p)
+{
+    if (p < 0 || p >= 8) return FALSE;
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
+        void *fx = g_lumosGlow[p][g];
+        if (fx && cgLiveObject(fx)) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL lumosGlowSlotsFree(int p)
+{
+    if (p < 0 || p >= 8) return FALSE;
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
+        void *fx = g_lumosGlow[p][g];
+        if (!fx || !cgLiveObject(fx)) return TRUE;
+    }
+    return FALSE;
+}
+
+// Remember a glow for this player. Idempotent (the same actor is never
+// tracked twice), and it recycles a dead slot before adding - so a re-spawn
+// can never push a live glow out of the list and orphan it.
+static void lumosTrackGlow(int p, void *fx)
+{
+    if (p < 0 || p >= 8 || !fx) return;
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++)
+        if (g_lumosGlow[p][g] == fx) return;
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
+        if (!g_lumosGlow[p][g] || !cgLiveObject(g_lumosGlow[p][g])) {
+            g_lumosGlow[p][g] = fx;
+            return;
+        }
+    }
+    // Every slot holds a live glow: retire the oldest rather than leak it.
+    if (cgLiveObject(g_lumosGlow[p][0])) destroyActorFX(g_lumosGlow[p][0]);
+    g_lumosGlow[p][0] = fx;
+}
+
+// Forget (and optionally destroy) every glow tracked for this player.
+// destroy = FALSE is the "stock TurnOff already destroyed them" case.
+static void lumosDropGlows(int p, BOOL destroy)
+{
+    if (p < 0 || p >= 8) return;
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
+        void *fx = g_lumosGlow[p][g];
+        g_lumosGlow[p][g] = NULL;
+        if (!fx) continue;
+        if (destroy && cgLiveObject(fx)) destroyActorFX(fx);
+    }
+}
+
+// The point a light must sit at for this player: the wand actor's own
+// Location when it is a believable wand tip, otherwise hand height above the
+// pawn (the game's own projectile origin - see hp3lumos::wandTipFor).
+static BOOL lumosTipOf(void *pawn, void *wand, float out[3])
+{
+    if (!pawn || F.Location <= 0 || !out) return FALSE;
+    if (IsBadReadPtr((BYTE *)pawn + F.Location, 12)) return FALSE;
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    float *wl = NULL;
+    if (wand && cgLiveObject(wand) && !IsBadReadPtr((BYTE *)wand + F.Location, 12))
+        wl = (float *)((BYTE *)wand + F.Location);
+    hp3lumos::wandTipFor(pl, wl, out);
+    return TRUE;
+}
+
+// Stock TurnOn spawns the glow at the light's CURRENT Location, so the light
+// has to be at the wand tip BEFORE the call - v68..v70 seeded it at the pawn
+// and the glow popped into existence on the character.
+static void lumosSeedLightAtTip(void *pawn, void *wand, void *light)
+{
+    if (!light || !g_execSetLocation) return;
+    if (IsBadReadPtr((BYTE *)light + F.Location, 12)) return;
+    float tip[3];
+    if (!lumosTipOf(pawn, wand, tip)) return;
+    nativeSetLocation(light, tip);
+}
+
+// v71: carry the light AND every tracked glow onto the wand tip - the ride
+// stock's baseWand.Tick does for the lead and never did for a companion.
+// Only moves what is actually off the tip, so a stock ride that IS working
+// is never fought (it keeps the light within a few units of the wand end).
+static void lumosRideToTip(int p, void *pawn, void *wand, void *light, DWORD now)
+{
+    if (!g_lumosWandGlow || !light || !pawn || F.Location <= 0) return;
+    if (IsBadReadPtr((BYTE *)light + F.Location, 12)) return;
+    // v71: if the game's own ride is carrying this light, leave it alone.
+    // Two writers per frame would leave the light wherever the last one put
+    // it, and the game's answer is the authoritative one when it exists.
+    if (g_lumosRideForeignAt[p] &&
+        (DWORD)(now - g_lumosRideForeignAt[p]) < 2000u) {
+        if (!g_lumosRideStandDown[p]) {
+            g_lumosRideStandDown[p] = TRUE;
+            logf_("  [lumos] v71 P%d light is being carried by the game's own "
+                  "wand ride - the mod's ride stands down for this window", p);
+        }
+        return;
+    }
+    float tip[3];
+    if (!lumosTipOf(pawn, wand, tip)) return;
+    BOOL wrote = FALSE;
+    float *ll = (float *)((BYTE *)light + F.Location);
+    if (hp3lumos::lightNeedsRide(ll, tip) && g_execSetLocation) {
+        nativeSetLocation(light, tip);
+        wrote = TRUE;
+    }
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
+        void *fx = g_lumosGlow[p][g];
+        if (!fx || !cgLiveObject(fx) || IsBadReadPtr((BYTE *)fx + F.Location, 12))
+            continue;
+        float *fl = (float *)((BYTE *)fx + F.Location);
+        if (hp3lumos::lightNeedsRide(fl, tip) && g_execSetLocation)
+            nativeSetLocation(fx, tip);
+    }
+    if (wrote) {
+        memcpy(g_lumosRideWrote[p], tip, 12);
+        g_lumosRideWroteValid[p] = TRUE;
+    }
+}
+
+// v71: retire a mod-owned light completely - the stock teardown (TurnOff
+// script when the light was stock-lit, the TurnOff register otherwise),
+// every tracked glow destroyed, the light's Particles pointer cleared so a
+// live wand Tick cannot dereference a dead actor, and the one-shot latch
+// set so the still-open window cannot re-light it.
+static void lumosRetireLight(int p, void *light, DWORD ageMs, const char *why)
+{
+    BOOL stock = g_lumosLightStock[p];
+    if (light && cgLiveObject(light)) {
+        if (stock && g_fnLumosTurnOff && g_ProcessEvent) {
+            callFn(light, g_fnLumosTurnOff, "LumosLight.TurnOff [v71 retire]");
+        } else {
+            // stock TurnOff order: bLumosOn=False FIRST (the wand Tick
+            // stops riding the light), then the particles are destroyed.
+            lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
+                                    g_lightBrightIsFloat,
+                                    g_lightRadiusInnerIsFloat, FALSE, TRUE);
+        }
+    }
+    lumosDropGlows(p, TRUE);
+    if (light) lumosSetLightParticles(light, NULL);
+    g_lumosLightOn[p]    = FALSE;
+    g_lumosLightStock[p] = FALSE;
+    g_lumosLightDead[p]  = TRUE;   // v68: one shot per cast
+    logf_("  [lumos] v71 P%d light retired after %lums (%s) - %s", p,
+          (unsigned long)ageMs, why,
+          stock ? "stock TurnOff script replayed"
+                : "TurnOff register + every tracked glow destroyed");
+}
+
+// v71: the lead's light is the stock chain's - the mod never writes it. The
+// one thing it will do is recover it when it is provably LOST: parked more
+// than LightLostDist from its pawn and moved by nobody (stock's ride, or our
+// own last heal) for a full second. That is the difference between "the main
+// character has a light stuck under him" and a stock ride we must not fight.
+// v71: the lead's own light. The mod never lights it, never writes its
+// register and (since v71) never forces it visible - but the field report is
+// "the main character also receives heavy light underneath", so it does fix
+// the light's PLACE, in two shapes:
+//   * LOST    - parked far from the character and moved by nobody for a
+//               full second (the ride never engaged at all);
+//   * UNDERFOOT - hugging the pawn's origin, i.e. at or below the feet,
+//               which is what "light underneath" looks like. LeadRide=1
+//               lifts it onto the wand tip (and its glow with it).
+// Both only ever write the Location, and both are logged once.
+static void lumosHealLeadLight(int p, void *pawn, void *wand, void *light,
+                               DWORD now)
+{
+    if (!light || !pawn || F.Location <= 0) return;
+    if (IsBadReadPtr((BYTE *)light + F.Location, 12) ||
+        IsBadReadPtr((BYTE *)pawn + F.Location, 12)) return;
+    float *ll = (float *)((BYTE *)light + F.Location);
+    float *pl = (float *)((BYTE *)pawn + F.Location);
+    BOOL lost = hp3lumos::lightIsLost(ll, pl);
+    BOOL under = g_lumosLeadRide && hp3lumos::lightIsUnderfoot(ll, pl);
+    if (!lost && !under) return;
+    if (lost && g_lumosLightLocKnown[p] &&
+        (DWORD)(now - g_lumosLightMovedAt[p]) < hp3lumos::LightRideHealMs)
+        return;                       // something IS moving it: leave it alone
+    float tip[3];
+    if (!lumosTipOf(pawn, wand, tip)) return;
+    if (!g_execSetLocation) return;
+    nativeSetLocation(light, tip);
+    g_lumosLightMovedAt[p] = now;
+    memcpy(g_lumosRideWrote[p], tip, 12);
+    g_lumosRideWroteValid[p] = TRUE;
+    void *fx = lumosParticlesOf(light);
+    if (fx && !IsBadReadPtr((BYTE *)fx + F.Location, 12))
+        nativeSetLocation(fx, tip);
+    static BOOL sSaid[8] = { FALSE, FALSE, FALSE, FALSE,
+                             FALSE, FALSE, FALSE, FALSE };
+    if (!sSaid[p]) {
+        sSaid[p] = TRUE;
+        logf_("  [lumos] v71 P%d light was %s (%.0f units from the pawn, "
+              "dZ=%.0f) - lifted onto the wand tip (%.0f %.0f %.0f) glow=%p "
+              "(LeadRide=%d; set [lumos] LeadRide=0 to leave the lead's "
+              "light exactly where the game puts it)",
+              p, lost ? "LOST" : "UNDERFOOT",
+              (float)sqrt((ll[0]-pl[0])*(ll[0]-pl[0]) + (ll[1]-pl[1])*(ll[1]-pl[1]) +
+                          (ll[2]-pl[2])*(ll[2]-pl[2])),
+              ll[2] - pl[2], tip[0], tip[1], tip[2], fx, g_lumosLeadRide);
+    }
+}
+
+// v71: ride telemetry - "is anything carrying this light at all?" Without it
+// the v70 log could prove the light turned on but never where it sat.
+static void lumosNoteLightLoc(int p, void *light, DWORD now)
+{
+    if (p < 0 || p >= 8 || !light || F.Location <= 0) return;
+    if (IsBadReadPtr((BYTE *)light + F.Location, 12)) return;
+    float *ll = (float *)((BYTE *)light + F.Location);
+    if (g_lumosLightLocKnown[p]) {
+        float dx = ll[0] - g_lumosLastLightLoc[p][0];
+        float dy = ll[1] - g_lumosLastLightLoc[p][1];
+        float dz = ll[2] - g_lumosLastLightLoc[p][2];
+        if (dx * dx + dy * dy + dz * dz > 4.0f) {
+            g_lumosLightMovedAt[p] = now;
+            // Was that move OURS? If not, the game's own baseWand.Tick ride
+            // is carrying this light and the mod must stop writing it.
+            BOOL ours = g_lumosRideWroteValid[p] &&
+                        (float)fabs(ll[0] - g_lumosRideWrote[p][0]) < 4.0f &&
+                        (float)fabs(ll[1] - g_lumosRideWrote[p][1]) < 4.0f &&
+                        (float)fabs(ll[2] - g_lumosRideWrote[p][2]) < 4.0f;
+            if (!ours) g_lumosRideForeignAt[p] = now;
+        }
+    }
+    memcpy(g_lumosLastLightLoc[p], ll, 12);
+    g_lumosLightLocKnown[p] = TRUE;
+}
+
+// v71: one status line per player per second while Lumos is up - where the
+// wand, the light and the glow actually are. This is the diagnostic the v70
+// log was missing.
+static void lumosStatus(int numP, void *pw[8], DWORD now)
+{
+    static DWORD sStatusAt = 0;
+    if ((DWORD)(now - sStatusAt) < 1000) return;
+    sStatusAt = now;
+    logf_("  [lumos] v71 window: %.1fs left, triggers=%d walls=%d blockers=%d",
+          g_lumosState.remainingSeconds(now), g_lumosTriggersN,
+          g_lumosWallsN, g_lumosBlockersN);
+    for (int p = 0; p < numP; p++) {
+        void *pawn = pw[p];
+        if (!pawn) continue;
+        void *wand  = lumosWandOf(p, pawn);
+        void *light = lumosLightOf(p, pawn);
+        char nb[96];
+        float *pl = (F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12))
+                    ? (float *)((BYTE *)pawn + F.Location) : NULL;
+        float *wl = (wand && F.Location > 0 &&
+                     !IsBadReadPtr((BYTE *)wand + F.Location, 12))
+                    ? (float *)((BYTE *)wand + F.Location) : NULL;
+        float *ll = (light && F.Location > 0 &&
+                     !IsBadReadPtr((BYTE *)light + F.Location, 12))
+                    ? (float *)((BYTE *)light + F.Location) : NULL;
+        void *fx = NULL; float *fl = NULL;
+        for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
+            if (g_lumosGlow[p][g] && cgLiveObject(g_lumosGlow[p][g])) {
+                fx = g_lumosGlow[p][g];
+                if (!IsBadReadPtr((BYTE *)fx + F.Location, 12))
+                    fl = (float *)((BYTE *)fx + F.Location);
+                break;
+            }
+        }
+        float dLight = -1.0f;
+        if (ll && pl)
+            dLight = (float)sqrt((ll[0]-pl[0])*(ll[0]-pl[0]) +
+                                 (ll[1]-pl[1])*(ll[1]-pl[1]) +
+                                 (ll[2]-pl[2])*(ll[2]-pl[2]));
+        logf_("    P%d %s pawn=(%.0f %.0f %.0f) wand=%p at (%.0f %.0f %.0f) "
+              "light=%p at (%.0f %.0f %.0f) dPawn=%.0f on=%d stock=%d "
+              "glow=%p at (%.0f %.0f %.0f) riding=%s",
+              p, objName(pawn, nb, sizeof(nb)),
+              pl ? pl[0] : 0.f, pl ? pl[1] : 0.f, pl ? pl[2] : 0.f,
+              wand, wl ? wl[0] : 0.f, wl ? wl[1] : 0.f, wl ? wl[2] : 0.f,
+              light, ll ? ll[0] : 0.f, ll ? ll[1] : 0.f, ll ? ll[2] : 0.f,
+              dLight, g_lumosLightOn[p] ? 1 : 0,
+              g_lumosLightStock[p] ? 1 : 0, fx,
+              fl ? fl[0] : 0.f, fl ? fl[1] : 0.f, fl ? fl[2] : 0.f,
+              ((DWORD)(now - g_lumosLightMovedAt[p]) < 1000) ? "yes" : "NO");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v71: the trigger-keyed open test, shared by the wall cache and the blocker
+// cache. Returns TRUE when this actor must be passable right now; *why is
+// 1 = near an armed trigger, 2 = next to a player who is inside one,
+// 0 = not opened (only set when the answer is FALSE).
+// ---------------------------------------------------------------------------
+// v71: the fire-time re-verification for the BLOCKER cache. It cannot use
+// lumosClassVerified(wantWall=TRUE) - that helper admits the two wall class
+// tokens only, which is exactly the class-agnosticism v71 exists for. It
+// re-proves what the SCAN admitted: a live actor, not a pawn (un-colliding
+// a character would break the game), not a projectile, not a lumos trigger,
+// and it re-reads the collision bits so an actor the level already opened
+// is not handed to the native again.
+static BOOL lumosBlockerVerified(void *obj)
+{
+    if (!obj || IsBadReadPtr(obj, 0x30)) return FALSE;
+    if (!g_cgChainOK) return TRUE;
+    void *cls = cgClassOf(obj);
+    if (!cls) return FALSE;                       // recycled memory
+    CgClass *ci = cgClassInfo(cls);
+    if (!ci || !ci->isActor || ci->isPawn || ci->isProjectile) return FALSE;
+    if (hp3lumos::isLumosTriggerClassToken(ci->token)) return FALSE;
+    return TRUE;
+}
+
+static BOOL lumosBlockerWantOpen(const float loc[3], const BOOL *armed,
+                                 const float playerPos[8][3],
+                                 const BOOL *slotAtTrig, int validPlayers,
+                                 int *why)
+{
+    if (why) *why = 0;
+    if (!loc || !armed) return FALSE;
+    // (1) within OpenRadius of a trigger a tracked player is standing in.
+    if (g_lumosOpenRadius > 0.0f) {
+        for (int t = 0; t < g_lumosTriggersN; t++) {
+            if (!armed[t]) continue;
+            void *tr = g_lumosTriggers[t];
+            if (!tr || !cgLiveObject(tr) || F.Location <= 0 ||
+                IsBadReadPtr((BYTE *)tr + F.Location, 12)) continue;
+            float *tl = (float *)((BYTE *)tr + F.Location);
+            float dx = loc[0] - tl[0], dy = loc[1] - tl[1], dz = loc[2] - tl[2];
+            if (dx * dx + dy * dy + dz * dz <=
+                g_lumosOpenRadius * g_lumosOpenRadius) {
+                if (why) *why = 1;
+                return TRUE;
+            }
+        }
+    }
+    // (2) right next to a player who is himself inside some trigger's radius
+    // - the "whatever you are actually bumping into" key.
+    if (g_lumosPlayerRadius > 0.0f) {
+        for (int s = 0; s < validPlayers; s++) {
+            if (!slotAtTrig[s]) continue;
+            if (hp3lumos::isWithinCylinder(playerPos[s], loc,
+                                           g_lumosPlayerRadius,
+                                           g_lumosPlayerHeight)) {
+                if (why) *why = 2;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+// v71: one octree-safe open/close transition, shared by both caches.
+// Returns TRUE when the actor ends up in the wanted state. Closing restores
+// the PRISTINE bits snapshotted at scan time, and is skipped entirely while
+// LatchOpen is on (stock's own behaviour: a revealed wall stays open).
+static BOOL lumosApplyActorOpen(void *obj, BYTE origBits, signed char *coll,
+                                BOOL wantOpen, const char *what, int idx,
+                                int why)
+{
+    if (!obj || !coll) return FALSE;
+    if (wantOpen) {
+        if (*coll == 0) return TRUE;                  // already open (by us)
+        if (!g_execSetCollision) {
+            static BOOL sNoNative = FALSE;
+            if (!sNoNative) {
+                sNoNative = TRUE;
+                logf_("  [lumos] v71 passability unavailable: Engine.Actor."
+                      "SetCollision native not exported - walls stay solid");
+            }
+            *coll = -1;
+            return FALSE;
+        }
+        if (!nativeSetCollision(obj, FALSE, FALSE, FALSE)) return FALSE;
+        *coll = 0;
+        char wn[160]; objName(obj, wn, sizeof(wn));
+        float *wl = (F.Location > 0 && !IsBadReadPtr((BYTE *)obj + F.Location, 12))
+                    ? (float *)((BYTE *)obj + F.Location) : NULL;
+        logf_("  [lumos] v71 OPENED %s #%d %s at (%.0f %.0f %.0f) "
+              "bits=0x%02X key=%d (SetCollision off - removed from the "
+              "collision octree, passable for every player)%s",
+              what, idx, wn, wl ? wl[0] : 0.f, wl ? wl[1] : 0.f, wl ? wl[2] : 0.f,
+              origBits, why,
+              g_lumosLatchOpen ? " - latched open for the level" : "");
+        return TRUE;
+    }
+    if (*coll != 0) return TRUE;                      // not ours / already solid
+    if (g_lumosLatchOpen) return TRUE;                // v71: never re-closed
+    if (!g_execSetCollision || origBits == hp3lumos::WallBitsUnknown) {
+        *coll = 1;
+        return TRUE;
+    }
+    hp3lumos::WallCollisionBits b = hp3lumos::unpackWallBits(origBits);
+    if (!nativeSetCollision(obj, b.collideActors ? TRUE : FALSE,
+                            b.blockActors ? TRUE : FALSE,
+                            b.blockPlayers ? TRUE : FALSE)) return FALSE;
+    *coll = 1;
+    logf_("  [lumos] v71 closed %s #%d (pristine collision bits restored)",
+          what, idx);
+    return TRUE;
+}
+
+// v71: at 1 Hz while a player stands at a revealed wall, name every blocking
+// actor right next to him and say whether the mod has it open. This is the
+// line that decides the next round: if the log shows a blocker here the mod
+// did NOT open, we know exactly which class to admit (or that the blocker is
+// not an actor at all, i.e. level BSP, which SetCollision cannot touch).
+static void lumosReportNearbyBlockers(const float playerPos[8][3],
+                                      const BOOL *slotAtTrig, int validPlayers,
+                                      DWORD now)
+{
+    static DWORD sAt = 0;
+    if ((DWORD)(now - sAt) < 1000) return;
+    BOOL any = FALSE;
+    for (int s = 0; s < validPlayers; s++) if (slotAtTrig[s]) any = TRUE;
+    if (!any) return;
+    sAt = now;
+    if (!g_objArray || !g_objArray->Data || F.Location <= 0) return;
+    int n = g_objArray->Num;
+    if (n <= 0 || n > 400000 || IsBadReadPtr(g_objArray->Data, 4)) return;
+    const float R = 260.0f;
+    int shown = 0;
+    for (int s = 0; s < validPlayers && shown < 8; s++) {
+        if (!slotAtTrig[s]) continue;
+        for (int k = 0; k < n && shown < 8; k++) {
+            void *o = g_objArray->Data[k];
+            if (!o || IsBadReadPtr(o, 0x100)) continue;
+            // Distance FIRST: this runs at 1 Hz over the whole object table,
+            // so only the handful of actors that are actually next to the
+            // player may cost a GetFullName (actorInCurrentLevel / objName).
+            if (IsBadReadPtr((BYTE *)o + F.Location, 12)) continue;
+            float *ol = (float *)((BYTE *)o + F.Location);
+            float dx = ol[0] - playerPos[s][0];
+            float dy = ol[1] - playerPos[s][1];
+            float dz = ol[2] - playerPos[s][2];
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > R * R) continue;
+            if (cgDeleted(o) || !actorInCurrentLevel(o)) continue;
+            CgClass *ci = cgClassInfo(cgClassOf(o));
+            if (!ci || !ci->isActor || ci->isPawn) continue;
+            BOOL c = FALSE, ba = FALSE, bp = FALSE;
+            if (!readLumosCollisionBits(o, &c, &ba, &bp)) continue;
+            if (!ba && !bp) continue;
+            // is it one we manage, and is it open?
+            const char *state = "NOT CACHED";
+            for (int w = 0; w < g_lumosWallsN; w++)
+                if (g_lumosWalls[w] == o) {
+                    state = g_lumosWallColl[w] == 0 ? "open" : "SOLID";
+                    break;
+                }
+            for (int w = 0; w < g_lumosBlockersN; w++)
+                if (g_lumosBlockers[w] == o) {
+                    state = g_lumosBlockerColl[w] == 0 ? "open" : "SOLID";
+                    break;
+                }
+            char nb[160];
+            logf_("  [lumos] v71 at-wall P%d: blocker %s d=%.0f bits=0x%02X %s",
+                  s, objName(o, nb, sizeof(nb)), (float)sqrt(d2),
+                  hp3lumos::packWallBits(c != FALSE, ba != FALSE, bp != FALSE),
+                  state);
+            shown++;
+        }
+    }
+}
+
 static void lumosTick(void)
 {
     resolveLumosFields();
@@ -10203,6 +10896,30 @@ static void lumosTick(void)
     // findActorByClass walk. Resolve each player's pawn once per frame.
     void *pw[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     for (int p = 0; p < numP; p++) pw[p] = getPawn(p);
+    // v71: never drive the same pawn twice. Two player slots bound to ONE
+    // character (a missing Hermione/Ron in the level, or a character class
+    // that resolves to the same actor) used to make the mod light, hide and
+    // ride that character's light once per slot - two or three stacked
+    // lights and glows on a single character, which is exactly the "stacked
+    // up stuck spell on him" the field report describes. The duplicate slot
+    // is dropped (and named once), so slot 0 always owns a shared pawn.
+    for (int p = 1; p < numP; p++) {
+        if (!pw[p]) continue;
+        for (int q = 0; q < p; q++) {
+            if (pw[q] != pw[p]) continue;
+            static BOOL sDupSaid[8] = { FALSE, FALSE, FALSE, FALSE,
+                                        FALSE, FALSE, FALSE, FALSE };
+            if (!sDupSaid[p]) {
+                sDupSaid[p] = TRUE;
+                char nb[128];
+                logf_("  [lumos] v71 P%d resolves to the same pawn as P%d (%s) "
+                      "- slot dropped, that character is driven once",
+                      p, q, objName(pw[p], nb, sizeof(nb)));
+            }
+            pw[p] = NULL;
+            break;
+        }
+    }
 
     // Scan for any actively burning wand light (wand/light pointers are
     // cached now). v66.5: while a light is genuinely burning, the state
@@ -10234,6 +10951,11 @@ static void lumosTick(void)
 
     BOOL wasActive = g_lumosState.active;
     BOOL lumosActive = g_lumosState.update(now);
+    // v71: one status line per second while Lumos is up - where every
+    // player's wand, light and glow actually are. The v70 log could prove
+    // the light turned on but never said WHERE it ended up, which is what
+    // made "light effect underneath, no wand glow" undiagnosable.
+    if (lumosActive) lumosStatus(numP, pw, now);
     // v68: the stock window is ONE SHOT per cast. The per-player dead latch
     // below keeps an auto-off'd replicated light from being re-armed by the
     // still-active state (the light-follow ratchet keeps the state alive
@@ -10243,6 +10965,26 @@ static void lumosTick(void)
     if (wasActive && !lumosActive)
         lumosClearDeadLatches();
 
+    // -----------------------------------------------------------------------
+    // v71: REPLICATED LUMOS, PER PLAYER.
+    //
+    // Two field-report symptoms this rewrites:
+    //   * "some light effect underneath, but no wand glow" - v68..v70 seeded
+    //     the companion's light at the PAWN (pawn + 48Z) and left it there,
+    //     because stock's own ride (baseWand.Tick -> TheLumosLight.
+    //     UpdateLocation(WandEndPoint)) never reached a companion wand. The
+    //     light AND the LumosLightFX particles parked on the character are
+    //     exactly that "light underneath, no wand glow". v71 carries both
+    //     onto a wand-tip anchor every frame (lumosRideToTip).
+    //   * "main character also receives heavy light underneath, maybe
+    //     stacked up" - the only thing v66.5..v70 ever did to the LEAD's
+    //     light was force its actor visible (setLumosActorHidden(FALSE) ran
+    //     for every player, p == 0 included), and every re-cast overwrote
+    //     the single tracked glow pointer, orphaning the previous
+    //     LumosLightFX. v71 never touches the lead's light actor, tracks up
+    //     to LUMOS_MAX_GLOW glows per player, and retires a mod-owned light
+    //     on a hard ceiling so nothing can burn forever.
+    // -----------------------------------------------------------------------
     if (lumosActive) {
         for (int p = 0; p < numP; p++) {
             void *pawn = pw[p];
@@ -10300,18 +11042,43 @@ static void lumosTick(void)
             lumosResolvePawnLumosBit(pawn);
             if (light) lumosResolveLightPlayerHarry(light);
             // v67: the literal character state stock writes on TurnOn -
-            // PlayerHarry.bLumosOn = True (here: every driven player).
+            // PlayerHarry.bLumosOn = True (here: every driven companion).
             // v70: NOT for the lead - the stock chain owns his bit (and the
             // v69 dance below needs to read it back untouched).
             if (p > 0 && g_offPawnLumosOn > 0 && g_maskPawnLumosOn &&
                 lumosPawnHasLumosBit(pawn))
                 lumosWriteBit(pawn, g_offPawnLumosOn, g_maskPawnLumosOn, TRUE);
             if (!light) continue;
-            // Keep the light actor itself visible (v66.5 compensation, kept:
-            // idempotent, and the stock chain never hides these lights).
-            setLumosActorHidden(light, FALSE);
+            // v71: the lead's light actor belongs to the stock chain and is
+            // never forced visible by the mod (v66.5..v70 did it for every
+            // player; the field report is "the main character receives heavy
+            // light underneath"). Companions' lights are the mod's own
+            // replicated glow, so they are shown when UnhideLight=1.
+            if (p > 0 && g_lumosUnhideLight)
+                setLumosActorHidden(light, FALSE);
+            // v71: ride telemetry - runs for EVERY player with a light, every
+            // frame, so the mod knows whether anything is carrying the light.
+            lumosNoteLightLoc(p, light, now);
 
             BOOL burning = lumosLightBurning(light);
+
+            // v71 HARD CEILING, checked before any on/off decision: a light
+            // the mod owns may never outlive the stock window (+grace),
+            // whatever stock's own Tick did or did not do. The v70 log shows
+            // the companion light turning on and never going cold again -
+            // the "stuck spell on him" of the field report.
+            if (p > 0 && g_lumosLightOn[p] &&
+                (DWORD)(now - g_lumosLightOnAt[p]) >=
+                    (g_lumosLightStock[p] ? hp3lumos::ModLightHardOffMs
+                                          : hp3lumos::StockLumosDurationMs)) {
+                lumosRetireLight(p, light,
+                                 (DWORD)(now - g_lumosLightOnAt[p]),
+                                 g_lumosLightStock[p]
+                                     ? "stock window + 3s grace elapsed"
+                                     : "mod-owned 30s window elapsed");
+                continue;
+            }
+
             // v69: a stock-lit light that went COLD on its own is the stock
             // 30 s auto-off (stock Tick -> TurnOff: register cleared,
             // Particles destroyed, OnLumosOff broadcast). Observe it, latch
@@ -10332,35 +11099,25 @@ static void lumosTick(void)
                 g_lumosLightOn[p] = FALSE;
                 g_lumosLightStock[p] = FALSE;
                 g_lumosLightDead[p] = TRUE;
-                g_lumosGlow[p] = NULL;   // stock TurnOff destroyed the FX
+                lumosDropGlows(p, FALSE);   // stock TurnOff destroyed the FX
                 logf_("  [lumos] v69 P%d light went cold on its own (stock "
                       "Tick auto-off after fLumosTimeToTurnOff) - one shot "
                       "per cast", p);
                 continue;
             }
-            // v68: the lead (p == 0, PlayerHarry) is NEVER replicated by the
-            // mod - the stock chain (gargoyle.HandleSpellLumos ->
-            // baseWand(PlayerHarry.Weapon).LumosTurnOn) owns his light
-            // completely. v67 could re-light his wand for the ~1 s the
-            // state outlived the stock 30 s window (burning reads cold,
-            // state still active), a visible tail blip every cast.
+            // v68: the lead (p == 0, PlayerHarry) is NEVER lit by the mod -
+            // the stock chain (gargoyle.HandleSpellLumos -> baseWand
+            // (PlayerHarry.Weapon).LumosTurnOn) owns his light completely.
             if (p > 0 &&
                 hp3lumos::companionLightShouldTurnOn(lumosActive != FALSE,
                                                      burning != FALSE,
                                                      g_lumosLightOn[p] != FALSE) &&
                 !g_lumosLightDead[p]) {
                 // Stock TurnOn spawns the glow at the light's current
-                // Location, so seed the light next to its owner FIRST - a
-                // cold light can still sit at the level-entry wand position
-                // (stock leaves it PHYS_None where PostBeginPlay spawned
-                // it), and the Particles would pop in mid-air far away.
-                if (F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12) &&
-                    g_execSetLocation) {
-                    float pl[3], dst[3];
-                    memcpy(pl, (BYTE *)pawn + F.Location, 12);
-                    dst[0] = pl[0]; dst[1] = pl[1]; dst[2] = pl[2] + 48.0f;
-                    nativeSetLocation(light, dst);
-                }
+                // Location, so seed the light at the WAND TIP first - v68..v70
+                // seeded it at the pawn, which is why the glow appeared on
+                // the character instead of at the wand.
+                lumosSeedLightAtTip(pawn, wand, light);
                 // v69 PRIMARY PATH: call the light's own stock TurnOn script
                 // (Function hgame.LumosLight.TurnOn) through ProcessEvent.
                 // The stock bytecode then does EVERYTHING the v66..v68
@@ -10373,7 +11130,9 @@ static void lumosTick(void)
                 // THE GLOW: Particles = Spawn(Class'LumosLightFX', self,,
                 // Location); Particles.EnableEmission(True). Zero dependency
                 // on the mod resolving LumosLightFX / Particles / bEmit -
-                // exactly the bytecode that glows P1's wand natively.
+                // exactly the bytecode that glows P1's wand natively (the
+                // v70 log: it engaged, glow=1d186e00, while the mod's own
+                // name-based LumosLightFX lookup still reports GlowFX=0).
                 // The one stock behaviour the call cannot pass by itself is
                 // the single-player gate `if (PlayerHarry.bLumosOn) return;`
                 // (PlayerHarry is the light's OWN var - the LEAD pawn, set
@@ -10392,20 +11151,14 @@ static void lumosTick(void)
                     // every time ("did not engage"). Two layers now:
                     //  (a) PRIMARY: retarget the LIGHT's own PlayerHarry
                     //      var at THIS companion for the one synchronous
-                    //      call. Stock then reads the gate off the companion
-                    //      (whose bit we hold FALSE for the call) and writes
-                    //      PlayerHarry.bLumosOn=True onto the companion -
-                    //      the literal stock semantics, per player. The var
-                    //      is restored right after (TurnOff/Tick/ClientMessage
-                    //      keep talking to the lead as before).
-                    //  (b) SECONDARY (var unreadable): the v69 bit mask on
-                    //      every pawn, now with the chain-resolved bit.
+                    //      call (HP3 does not declare that var - v70 log
+                    //      "LumosLight.PlayerHarry NOT FOUND" - so this
+                    //      usually cannot fire);
+                    //  (b) SECONDARY: the v69 bit mask on every pawn, now
+                    //      with the chain-resolved bit (Engine.Pawn
+                    //      +0x620 mask 0x4 on hardware - this is what made
+                    //      v70's TurnOn engage at all).
                     void *savedPH = NULL; BOOL phSwapped = FALSE;
-                    // Retarget only when the companion's class declares the
-                    // gate bit itself (stock writes PlayerHarry.bLumosOn at
-                    // harry's offset - on a class without it that is a
-                    // foreign-field poke). Otherwise the bit mask on the
-                    // lead (b) is the only gate.
                     if (g_offLightPlayerHarry > 0 && lumosPawnHasLumosBit(pawn) &&
                         !IsBadWritePtr((BYTE *)light + g_offLightPlayerHarry, 4)) {
                         savedPH = *(void **)((BYTE *)light + g_offLightPlayerHarry);
@@ -10442,19 +11195,15 @@ static void lumosTick(void)
                         g_lumosLightOn[p] = TRUE;
                         g_lumosLightStock[p] = TRUE;
                         g_lumosLightOnAt[p] = now;
-                        // Track the stock-spawned glow through the light's
-                        // own Particles property (best effort - the stock
-                        // path does not NEED this pointer; it only feeds
-                        // the log and the degenerate no-ride heal below).
-                        g_lumosGlow[p] = NULL;
-                        if (g_offLightParticles > 0 &&
-                            !IsBadReadPtr((BYTE *)light + g_offLightParticles, 4))
-                            g_lumosGlow[p] =
-                                *(void **)((BYTE *)light + g_offLightParticles);
+                        // v71: track the glow the stock script spawned in
+                        // the light's Particles property, so the ride below
+                        // can carry it and the teardown can destroy it (v70
+                        // kept ONE pointer per player and orphaned the rest).
+                        lumosTrackGlow(p, lumosParticlesOf(light));
                         logf_("  [lumos] v69 P%d TheLumosLight turned ON via the "
                               "STOCK TurnOn script (register + Particles glow + "
                               "Tick armed by the game's own bytecode) glow=%p",
-                              p, g_lumosGlow[p]);
+                              p, g_lumosGlow[p][0]);
                         continue;   // stock path owns this light from here
                     }
                     // The stock script did NOT engage (its gate variable
@@ -10468,17 +11217,18 @@ static void lumosTick(void)
                           (g_offPawnLumosOn > 0) ? "masked" : "UNRESOLVED");
                 }
                 // v68 FALLBACK - reached when the TurnOn function object
-                // never resolved OR the stock call above did not engage
-                // (unreadable gate variable / aborted call): replicate
-                // LumosLight.TurnOn() WITHOUT the stock single-player
-                // gate. The exact stock register, then the hand-rolled
-                // glow spawn. bLumosOn is deliberately written LAST,
-                // after the glow exists and is stored in the light's
-                // Particles - the stock wand Tick starts riding the
-                // light the moment the bit reads True, and
-                // UpdateLocation dereferences Particles.
+                // never resolved OR the stock call above did not engage:
+                // replicate LumosLight.TurnOn() WITHOUT the stock
+                // single-player gate. The exact stock register, then the
+                // hand-rolled glow spawn. bLumosOn is deliberately written
+                // LAST, after the glow exists and is stored in the light's
+                // Particles - the stock wand Tick starts riding the light
+                // the moment the bit reads True, and UpdateLocation
+                // dereferences Particles.
                 if (!g_lumosLightOn[p]) {
-                    lumosApplyLightRegister(light, hp3lumos::stockLumosLightOn(),
+                    hp3lumos::LumosLightRegister reg = hp3lumos::stockLumosLightOn();
+                    if (g_lumosGlowRadius > 0.0f) reg.radius = g_lumosGlowRadius;
+                    lumosApplyLightRegister(light, reg,
                                             g_lightBrightIsFloat,
                                             g_lightRadiusInnerIsFloat, TRUE,
                                             FALSE /* bLumosOn comes last */);
@@ -10486,115 +11236,59 @@ static void lumosTick(void)
                     g_lumosLightStock[p] = FALSE;
                     g_lumosLightOnAt[p] = now;
                     logf_("  [lumos] v69 P%d TheLumosLight turned ON "
-                          "(v68 fallback register)", p);
+                          "(v68 fallback register, radius %.0f)", p, reg.radius);
                 }
             }
-            if (!g_lumosLightOn[p]) continue;
+            if (p > 0 && !g_lumosLightOn[p]) continue;
 
-            // v69: a STOCK-lit light is fully managed by the game's own
-            // bytecode from here - its Tick runs the 30 s auto-off, the
-            // particle scaling and the OnLumosOff broadcast, all observed
-            // by the cold-light latch above. The mod neither re-times nor
-            // re-lights it; only the v68-fallback path keeps the mod-side
-            // timer / glow spawn / bLumosOn re-assert below.
-            if (g_lumosLightStock[p]) {
-                // v69: degenerate no-ride safety net. If the stock wand Tick
-                // cannot ride the light (Weapon fill impossible, wand actor
-                // dead), the light drifts nowhere but the stock glow can be
-                // left behind when our seed was overwritten; keep the same
-                // 300-unit heal the fallback path has, and carry the tracked
-                // glow with the light.
-                if (F.Location > 0 &&
-                    !IsBadReadPtr((BYTE *)light + F.Location, 12) &&
-                    !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
-                    float *ll = (float *)((BYTE *)light + F.Location);
-                    float *pl = (float *)((BYTE *)pawn + F.Location);
-                    float dx = ll[0] - pl[0], dy = ll[1] - pl[1], dz = ll[2] - pl[2];
-                    if (dx * dx + dy * dy + dz * dz > 300.0f * 300.0f &&
-                        g_execSetLocation) {
-                        float dst[3] = { pl[0], pl[1], pl[2] + 48.0f };
-                        nativeSetLocation(light, dst);
-                        if (g_lumosGlow[p] && cgLiveObject(g_lumosGlow[p]))
-                            nativeSetLocation(g_lumosGlow[p], dst);
+            if (p > 0) {
+                // v71: whatever the light's Particles property points at is
+                // this player's glow - track it (idempotent) and then ride
+                // light + every tracked glow onto the wand tip. This is the
+                // "wand glow" the field report asked for: stock's own ride
+                // never reaches a companion, so the mod carries them.
+                lumosTrackGlow(p, lumosParticlesOf(light));
+                lumosRideToTip(p, pawn, wand, light, now);
+                // v68: bLumosOn LAST, re-asserted every frame while the mod
+                // owns the light AND a live glow is attached (stock keeps
+                // the bit on PlayerHarry the same way). The bit is gated on
+                // the glow because the stock wand Tick dereferences the
+                // light's Particles in UpdateLocation every frame while it
+                // reads True.
+                BOOL glowLive = lumosAnyGlowLive(p);
+                if (g_offLumosBOn > 0 && g_maskLumosBOn && !g_lumosLightStock[p] && glowLive)
+                    lumosWriteBit(light, g_offLumosBOn, g_maskLumosBOn, TRUE);
+                // v68 fallback: the visible wand glow - stock TurnOn spawns
+                // LumosLightFX owned by the light, stores it in the light's
+                // Particles property and calls Particles.EnableEmission(True).
+                // The mod replays all three (only possible when the class
+                // resolves - HP3 hides it: v69/v70 log GlowFX=0).
+                if (g_lumosGlowFX && g_clsLumosLightFX && g_execSpawn &&
+                    !g_lumosLightStock[p] && !glowLive &&
+                    lumosGlowSlotsFree(p)) {
+                    float ll[3];
+                    if (F.Location > 0 && !IsBadReadPtr((BYTE *)light + F.Location, 12)) {
+                        memcpy(ll, (BYTE *)light + F.Location, 12);
+                        int rot0[3] = { 0, 0, 0 };
+                        void *fx = spawnFX(light, g_clsLumosLightFX, light, ll, rot0);
+                        if (fx) {
+                            lumosSetFXEmit(fx, TRUE);            // EnableEmission(True)
+                            lumosSetLightParticles(light, fx);   // Particles = glow
+                            lumosTrackGlow(p, fx);
+                            logf_("  [lumos] v69 P%d wand glow spawned + attached "
+                                  "(fallback) (stock LumosLightFX, owned by the "
+                                  "light, stored in its Particles) -> %p", p, fx);
+                        }
                     }
                 }
-                continue;
-            }
-
-            // v68 fallback: stock LumosLight.Tick auto-offs after 30 s. The
-            // mod's light-follow ratchet would otherwise never let the
-            // window close (the mod keeps this light burning while the state
-            // is active). Replay the stock timeout per replicated light.
-            if (now - g_lumosLightOnAt[p] >= hp3lumos::StockLumosDurationMs) {
-                // stock TurnOff order: bLumosOn=False FIRST (the wand Tick
-                // stops riding the light), then the particles are destroyed.
-                lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
-                                        g_lightBrightIsFloat,
-                                        g_lightRadiusInnerIsFloat, FALSE,
-                                        TRUE);
-                g_lumosLightOn[p] = FALSE;
-                g_lumosLightDead[p] = TRUE;   // v68: one shot per cast
-                if (g_lumosGlow[p]) {
-                    if (cgLiveObject(g_lumosGlow[p])) destroyActorFX(g_lumosGlow[p]);
-                    g_lumosGlow[p] = NULL;
-                }
-                lumosSetLightParticles(light, NULL);
-                logf_("  [lumos] v69 P%d fallback light auto-off after 30s "
-                      "(TurnDynamicLightOff + particles destroyed; one shot "
-                      "per cast - next cast re-arms)", p);
-                continue;
-            }
-
-            // v68 fallback: the visible wand glow - stock TurnOn spawns
-            // LumosLightFX owned by the light, stores it in the light's
-            // Particles property and calls Particles.EnableEmission(True).
-            // The mod replays all three, and only then raises bLumosOn so
-            // the STOCK wand Tick relocates light AND glow onto WandEndPoint
-            // every frame - the exact stock ride, no mod-side relocation.
-            if (g_lumosGlowFX && g_clsLumosLightFX && g_execSpawn &&
-                (!g_lumosGlow[p] || !cgLiveObject(g_lumosGlow[p]))) {
-                float ll[3];
-                if (F.Location > 0 && !IsBadReadPtr((BYTE *)light + F.Location, 12)) {
-                    memcpy(ll, (BYTE *)light + F.Location, 12);
-                    int rot0[3] = { 0, 0, 0 };
-                    g_lumosGlow[p] = spawnFX(light, g_clsLumosLightFX, light,
-                                             ll, rot0);
-                    if (g_lumosGlow[p]) {
-                        lumosSetFXEmit(g_lumosGlow[p], TRUE);   // EnableEmission(True)
-                        lumosSetLightParticles(light, g_lumosGlow[p]); // Particles = glow
-                        logf_("  [lumos] v69 P%d wand glow spawned + attached (fallback) "
-                              "(stock LumosLightFX, owned by the light, stored "
-                              "in its Particles) -> %p", p, g_lumosGlow[p]);
-                    }
-                }
-            }
-            // v68: bLumosOn LAST, re-asserted every frame while the mod owns
-            // the light AND a live glow is attached (stock keeps the bit on
-            // PlayerHarry the same way). The bit is gated on the glow because
-            // the stock wand Tick dereferences the light's Particles in
-            // UpdateLocation every frame while it reads True.
-            BOOL glowLive = g_lumosGlow[p] && cgLiveObject(g_lumosGlow[p]);
-            if (g_offLumosBOn > 0 && g_maskLumosBOn && glowLive)
-                lumosWriteBit(light, g_offLumosBOn, g_maskLumosBOn, TRUE);
-            // The stock wand Tick relocates the light every frame via
-            // TheLumosLight.UpdateLocation(WandEndPoint) while bLumosOn.
-            // v70: with NO glow (bit held low, stock ride off) the mod is
-            // the only thing that can carry the light - ride it onto the
-            // pawn every frame (chest height + forward), so the dynamic
-            // light at least visibly travels with the companion instead of
-            // sitting where the cast happened until the 300-unit heal.
-            if (F.Location > 0 &&
-                !IsBadReadPtr((BYTE *)light + F.Location, 12) &&
-                !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
-                float *ll = (float *)((BYTE *)light + F.Location);
-                float *pl = (float *)((BYTE *)pawn + F.Location);
-                float dx = ll[0] - pl[0], dy = ll[1] - pl[1], dz = ll[2] - pl[2];
-                float d2 = dx * dx + dy * dy + dz * dz;
-                if (g_execSetLocation &&
-                    (d2 > 300.0f * 300.0f || (!glowLive && d2 > 4.0f))) {
-                    float dst[3] = { pl[0], pl[1], pl[2] + 48.0f };
-                    nativeSetLocation(light, dst);
-                }
+            } else if (g_lumosLeadHeal) {
+                // v71: the lead's light is stock's. The only thing the mod
+                // will do with it is fix its PLACE - when it is provably
+                // lost (parked far away, moved by nobody for a second) or
+                // when it is sitting underfoot (the "heavy light underneath"
+                // of the field report). Never its register, never its
+                // visibility, never its pawn bit.
+                lumosHealLeadLight(p, pawn, wand, light, now);
             }
         }
     } else {
@@ -10611,53 +11305,65 @@ static void lumosTick(void)
                 lumosWriteBit(pawn, g_offPawnLumosOn, g_maskPawnLumosOn, FALSE);
             if (!g_lumosLightOn[p]) continue;
             void *light = lumosLightOf(p, pawn);
-            if (g_lumosLightStock[p] && g_fnLumosTurnOff && light &&
-                cgLiveObject(light) && g_ProcessEvent) {
-                // v69: stock-lit lights get the stock TurnOff SCRIPT - the
-                // exact stock teardown including the AllActors OnLumosOff
-                // broadcast (which the register replay never did: the armed
-                // LumosTriggers stayed half-armed in v66..v68).
-                callFn(light, g_fnLumosTurnOff,
-                       "LumosLight.TurnOff [stock replication]");
-                g_lumosGlow[p] = NULL;   // stock TurnOff destroyed the FX
-            } else {
-                if (light) {
-                    // stock TurnOff order: bLumosOn=False FIRST, then
-                    // particles.
-                    lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
-                                            g_lightBrightIsFloat,
-                                            g_lightRadiusInnerIsFloat, FALSE,
-                                            TRUE);
-                }
-                if (g_lumosGlow[p]) {
-                    if (cgLiveObject(g_lumosGlow[p])) destroyActorFX(g_lumosGlow[p]);
-                    g_lumosGlow[p] = NULL;
-                }
-                if (light) lumosSetLightParticles(light, NULL);
-            }
-            g_lumosLightOn[p] = FALSE;
-            g_lumosLightStock[p] = FALSE;
-            g_lumosLightDead[p] = TRUE;   // v68: one shot per cast
-            logf_("  [lumos] v69 P%d replicated light turned off (state "
-                  "expired - %s)", p,
-                  (g_fnLumosTurnOff && light) ? "stock TurnOff script replayed"
-                                              : "v68 TurnOff register replayed");
+            lumosTrackGlow(p, light ? lumosParticlesOf(light) : NULL);
+            lumosRetireLight(p, light, (DWORD)(now - g_lumosLightOnAt[p]),
+                             "Lumos window closed");
         }
     }
 
-    // v66.2 PERF: with Lumos off, the only reason to look at the wall cache
-    // at all is to undo something we did while it was on. The cache is
-    // edge-managed below, so "nothing left to undo" is knowable and the
-    // whole section - including a per-wall liveness probe and proximity
-    // test - is skipped for the rest of the level.
-    BOOL wallsDirty = FALSE;
-    for (int k = 0; k < g_lumosWallsN; k++)
-        if (g_lumosWallColl[k] == 0) { wallsDirty = TRUE; break; }
-    if (!lumosActive && !wallsDirty) return;
+    // -----------------------------------------------------------------------
+    // v71: SECRET-WALL PASSABILITY - THE PART THAT HAS TO WORK.
+    //
+    // What the v70 hardware log proved (HP3_InsideHub, P2 = Hermione):
+    //   trigger[5] LumosTrigger0 Tag=0x0 Event=0x8D1A at (338 2618 -111)
+    //   trigger[6] LumosSparklesTrigger5 Tag=0x8D1A Event=0x0
+    //   secret wall #63 KWBlockingVolume5 Tag=0x3E63 at (192 2616 32)
+    //   -> "[lumos] v66.5 opened secret wall #63" ... and P2 still could not
+    //      get through.
+    // The stock Event->wall linkage the wall choice was based on DOES NOT
+    // EXIST in that level: the only actor carrying Tag 0x8D1A is the sparkles
+    // trigger, whose own Event is 0x0 (the chain ends there), and the cached
+    // walls carry Tags 0x3E63 / 0x405A - nothing links them to a trigger by
+    // name. So the mod's one proximity pick was a guess, and the actor the
+    // player was actually bumping into was never even considered.
+    //
+    // v71 therefore keys on the only two facts the level really gives us:
+    //   1. the TRIGGER'S OWN RADIUS - a tracked player standing inside it is
+    //      stock's InLumosRadius check, the designer's "you are at this
+    //      wall" distance. Nothing opens anywhere else in the level, so
+    //      railings and camera blockers stay solid.
+    //   2. THE PLAYER'S OWN POSITION - whatever blocks next to a player who
+    //      is inside that radius is the thing he is bumping into, whatever
+    //      its class, whatever its Tag.
+    // Every blocking actor near either is opened through the octree-safe
+    // SetCollision native, and (like stock) it stays open for the level.
+    // -----------------------------------------------------------------------
+    if (!lumosActive) {
+        // v66.2 PERF: with Lumos off, the only reason to look at the caches
+        // at all is to undo something we did while it was on. v71: with
+        // LatchOpen (the default, and stock's own behaviour - stock fires a
+        // secret wall's event exactly once and never closes it again) there
+        // is never anything to undo, so the whole section is skipped.
+        BOOL dirty = FALSE;
+        for (int k = 0; k < g_lumosWallsN; k++)
+            if (g_lumosWallColl[k] == 0) { dirty = TRUE; break; }
+        if (!dirty)
+            for (int k = 0; k < g_lumosBlockersN; k++)
+                if (g_lumosBlockerColl[k] == 0) { dirty = TRUE; break; }
+        if (g_lumosLatchOpen || !dirty) return;
+    }
+
+    // v71: the per-frame ARMED set - trigger t is armed when a tracked
+    // player stands inside that trigger's own radius. This is the gate for
+    // every open decision below.
+    static BOOL trigArmed[LUMOS_MAX_ACTORS];
+    memset(trigArmed, 0, sizeof(trigArmed));
 
     float playerPos[8][3];
     int posSlot[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // v67: player p -> playerPos slot
     int validPlayers = 0;
+    // v71: slot -> "this player stands inside some trigger's radius"
+    BOOL slotAtTrig[8] = { FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE };
     for (int p = 0; p < numP; p++) {
         void *pawn = pw[p];
         if (pawn && F.Location > 0 && !IsBadReadPtr((BYTE *)pawn + F.Location, 12)) {
@@ -10679,48 +11385,51 @@ static void lumosTick(void)
     // (stock bFirstEventSent or the mod's once-per-level latch), and ANY
     // tracked player inside the trigger's own radius (fDistanceCheck /
     // optional fZDistanceCheck, read from the actor, stock defaults 512/64).
-    // The fire goes through the engine's own TriggerEvent native (falls back
-    // to the manual Tag walk) - that opens whatever the level linked to the
-    // trigger, including the Movers the stock secret walls are built from,
-    // which the GenericColObj/KWBlockingVolume SetCollision path below never
-    // touched. Fires once per level per trigger, exactly like stock's
-    // bFirstEventSent which is never reset.
+    // v70: the fire goes through the SCRIPT Engine.Actor.TriggerEvent on the
+    // trigger, so the ENGINE performs the virtual Trigger dispatch on every
+    // Tag-matched receiver (state-declared Mover Triggers included).
+    // Fires once per level per trigger, exactly like stock's bFirstEventSent.
+    // v71: the same pass also ARMES the trigger for the SetCollision path
+    // below - that is the part that actually lets a companion through.
     // -----------------------------------------------------------------------
-    if (lumosActive && g_lumosTriggerEvents && g_lumosTriggersN > 0) {
-        for (int t = 0; t < g_lumosTriggersN && t < LUMOS_MAX_ACTORS; t++) {
-            if (g_lumosTrigFired[t] == 1) continue;
-            // v68: a failed dispatch retries at 1 Hz instead of latching, so
-            // a wall linkage that appears late is not lost.
-            if ((int)(now - g_lumosTrigNextTryAt[t]) < 0) continue;
-            void *tr = g_lumosTriggers[t];
-            if (!tr || !cgLiveObject(tr) || cgDeleted(tr)) continue;
-            if (!lumosClassVerified(tr, FALSE)) continue;
-            if (F.Location <= 0 || IsBadReadPtr((BYTE *)tr + F.Location, 12)) continue;
-            if (g_offEvent <= 0 || IsBadReadPtr((BYTE *)tr + g_offEvent, 4)) continue;
-            DWORD ev = *(DWORD *)((BYTE *)tr + g_offEvent);
-            if (!ev) { g_lumosTrigFired[t] = 1; continue; }   // nothing linked
-            // Stock already fired this one (P1's path ran first): never fire
-            // again - a TriggerToggle wall would toggle CLOSED.
-            if (lumosReadBit(tr, g_offTrigFirstSent, g_maskTrigFirstSent, FALSE)) {
-                g_lumosTrigFired[t] = 1;
+    for (int t = 0; t < g_lumosTriggersN && t < LUMOS_MAX_ACTORS; t++) {
+        if (!lumosActive) break;
+        void *tr = g_lumosTriggers[t];
+        if (!tr || !cgLiveObject(tr) || cgDeleted(tr)) continue;
+        if (!lumosClassVerified(tr, FALSE)) continue;
+        if (F.Location <= 0 || IsBadReadPtr((BYTE *)tr + F.Location, 12)) continue;
+        float *tl = (float *)((BYTE *)tr + F.Location);
+        float rdist = lumosReadFloat(tr, g_offTrigDist,
+                                     hp3lumos::StockTriggerDistanceCheck);
+        BOOL useZ = lumosReadBit(tr, g_offTrigUseZ, g_maskTrigUseZ, FALSE);
+        float zdist = lumosReadFloat(tr, g_offTrigZDist,
+                                     hp3lumos::StockTriggerZDistanceCheck);
+        int nearP = -1;
+        for (int p = 0; p < numP; p++) {
+            if (posSlot[p] < 0) continue;
+            if (!hp3lumos::stockTriggerInRadius(tl, playerPos[posSlot[p]],
+                                                rdist, useZ != FALSE, zdist))
                 continue;
-            }
-            float *tl = (float *)((BYTE *)tr + F.Location);
-            float rdist = lumosReadFloat(tr, g_offTrigDist,
-                                         hp3lumos::StockTriggerDistanceCheck);
-            BOOL useZ = lumosReadBit(tr, g_offTrigUseZ, g_maskTrigUseZ, FALSE);
-            float zdist = lumosReadFloat(tr, g_offTrigZDist,
-                                         hp3lumos::StockTriggerZDistanceCheck);
-            int nearP = -1;
-            for (int p = 0; p < numP && nearP < 0; p++) {
-                if (posSlot[p] < 0) continue;
-                if (hp3lumos::stockTriggerInRadius(tl, playerPos[posSlot[p]],
-                                                   rdist, useZ != FALSE, zdist))
-                    nearP = p;
-            }
-            if (nearP < 0) continue;
-            lumosFireTriggerEvent(t, tr, pw[nearP]);
+            slotAtTrig[posSlot[p]] = TRUE;
+            if (nearP < 0) nearP = p;
         }
+        if (nearP < 0) continue;
+        trigArmed[t] = TRUE;                    // v71: a player is at this wall
+        if (!g_lumosTriggerEvents) continue;
+        if (g_lumosTrigFired[t] == 1) continue;
+        // v68: a failed dispatch retries at 1 Hz instead of latching, so
+        // a wall linkage that appears late is not lost.
+        if ((int)(now - g_lumosTrigNextTryAt[t]) < 0) continue;
+        if (g_offEvent <= 0 || IsBadReadPtr((BYTE *)tr + g_offEvent, 4)) continue;
+        DWORD ev = *(DWORD *)((BYTE *)tr + g_offEvent);
+        if (!ev) { g_lumosTrigFired[t] = 1; continue; }   // nothing linked
+        // Stock already fired this one (P1's path ran first): never fire
+        // again - a TriggerToggle wall would toggle CLOSED.
+        if (lumosReadBit(tr, g_offTrigFirstSent, g_maskTrigFirstSent, FALSE)) {
+            g_lumosTrigFired[t] = 1;
+            continue;
+        }
+        lumosFireTriggerEvent(t, tr, pw[nearP]);
     }
 
     // v67 history note: v66 fired Trigger() ON the LumosTrigger actors - the
@@ -10729,15 +11438,11 @@ static void lumosTick(void)
     // base event, so that was a verified no-op AND a crash risk, and v66.5
     // removed it. v67 does not fire Trigger on the trigger either: it fires
     // the trigger's Event the way stock's own state machine does (the
-    // TriggerEvent dispatch above), which is a different, safe call - the
-    // receiver of each Trigger is the event-LINKED actor found through the
-    // engine's own Tag dispatch, never the trigger and never a guessed
-    // class. The stock chain stays untouched otherwise; the octree-safe
-    // SetCollision loop below remains the fallback for collision-proxy
-    // walls. The trigger cache also marks which walls are secret walls
-    // (pairing done at scan time).
+    // TriggerEvent dispatch above). The stock chain stays untouched
+    // otherwise; the octree-safe SetCollision path below is what makes a
+    // revealed wall genuinely passable for every player.
 
-    // v66.2: only touch a wall when the wanted state differs from what we
+    // v66.2: only touch an actor when the wanted state differs from what we
     // last applied, and re-assert on a 250ms cadence while Lumos is on so
     // the game cannot quietly hand a secret wall back to us mid-spell.
     // (v66.1 re-asserted every frame for every wall, in both states.)
@@ -10748,9 +11453,10 @@ static void lumosTick(void)
     // and the cleared flag on an octree member crashed the game at exit
     // ("Assertion failed: Actor->bCollideActors [File:UnOctree.cpp]").
     static DWORD sWallAssertAt = 0;
-    static BOOL  sWallNativeLogged = FALSE;
     BOOL reassert = lumosActive && (DWORD)(now - sWallAssertAt) >= 250u;
     if (reassert) sWallAssertAt = now;
+
+    // ---- the classic wall cache (GenericColObj / KWBlockingVolume) --------
     for (int k = 0; k < g_lumosWallsN; k++) {
         void *obj = g_lumosWalls[k];
         if (!cgLiveObject(obj) || cgDeleted(obj) || F.Location <= 0 ||
@@ -10761,48 +11467,19 @@ static void lumosTick(void)
             g_lumosWallColl[k] = -1;   // unverifiable: re-manage if it returns
             continue;
         }
-        // v66.5: only SECRET walls (paired to a lumos trigger at scan time)
-        // may ever open, and only while a player is actually at the wall.
-        // Ordinary GenericColObj/KWBlockingVolume proxies are untouchable.
-        // v68: the player-near test now measures from the wall's PAIRED
-        // TRIGGER with the trigger's OWN fDistanceCheck (stock's
-        // InLumosRadius check - the condition the level designer tuned) plus
-        // the v66.5 wall-actor proximity as a secondary. The v66.5-only test
-        // could never fire for a large wall whose actor Location sits far
-        // past the surface the player presses against. Policy is
-        // hp3lumos::wallShouldOpenProxied (regression-tested).
-        BOOL wantOpen = FALSE;
-        if (lumosActive && g_lumosWallSecret[k]) {
-            float *wloc = (float *)((BYTE *)obj + F.Location);
-            BOOL nearWall = hp3lumos::anyPlayerNearTrigger(
-                playerPos, validPlayers, wloc,
-                hp3lumos::WallActorNearRadius, hp3lumos::WallActorNearHeight);
-            BOOL nearTrig = FALSE;
-            int ti = g_lumosWallTrig[k];
-            if (ti >= 0 && ti < g_lumosTriggersN) {
-                void *tr = g_lumosTriggers[ti];
-                if (tr && cgLiveObject(tr) && F.Location > 0 &&
-                    !IsBadReadPtr((BYTE *)tr + F.Location, 12)) {
-                    float *tl = (float *)((BYTE *)tr + F.Location);
-                    float rdist = lumosReadFloat(tr, g_offTrigDist,
-                                         hp3lumos::StockTriggerDistanceCheck);
-                    BOOL useZ = lumosReadBit(tr, g_offTrigUseZ,
-                                             g_maskTrigUseZ, FALSE);
-                    float zdist = lumosReadFloat(tr, g_offTrigZDist,
-                                         hp3lumos::StockTriggerZDistanceCheck);
-                    for (int p = 0; p < validPlayers && !nearTrig; p++)
-                        if (hp3lumos::stockTriggerInRadius(tl, playerPos[p],
-                                                           rdist,
-                                                           useZ != FALSE,
-                                                           zdist))
-                            nearTrig = TRUE;
-                }
-            }
-            wantOpen = hp3lumos::wallShouldOpenProxied(
-                lumosActive != FALSE, g_lumosWallSecret[k] != FALSE,
-                nearTrig, nearWall)
-                ? TRUE : FALSE;
-        }
+        // v71: the open test is the trigger-keyed one below, no longer the
+        // v66.5 "is it a proven secret wall AND is a player within 350 units
+        // of its own actor origin" test - that test is what excluded the
+        // actor the player was bumping into in the v70 field log. The secret
+        // classification is kept for the log only.
+        int why = 0;
+        BOOL wantOpen = lumosBlockerWantOpen((float *)((BYTE *)obj + F.Location),
+                                             trigArmed, playerPos, slotAtTrig,
+                                             validPlayers, &why);
+        // v69: stock linkage still opens a wall outright, at any distance.
+        if (!wantOpen && lumosActive && g_lumosWallTrig[k] >= 0 &&
+            g_lumosWallTrig[k] < g_lumosTriggersN &&
+            trigArmed[g_lumosWallTrig[k]]) { wantOpen = TRUE; why = 3; }
         signed char want = wantOpen ? 0 : 1;   // 0 = open, 1 = closed
         if (g_lumosWallColl[k] == want && !(reassert && wantOpen)) continue;
         // v66.3/v66.4 crash fix retained: same verification the old
@@ -10812,51 +11489,38 @@ static void lumosTick(void)
             g_lumosWallColl[k] = -1;         // retry only if it ever re-verifies
             continue;
         }
-        if (wantOpen) {
-            if (!g_execSetCollision) {
-                // v66.5: no native, no poke. A wall that cannot be opened
-                // properly stays solid; collision bits are never written.
-                if (!sWallNativeLogged) {
-                    logf_("  [lumos] v66.5 secret-wall passability "
-                          "unavailable: Engine.Actor.SetCollision native "
-                          "not exported - walls stay solid");
-                    sWallNativeLogged = TRUE;
-                }
-                g_lumosWallColl[k] = -1;
-                continue;
-            }
-            if (nativeSetCollision(obj, FALSE, FALSE, FALSE)) {
-                if (g_lumosWallColl[k] != 0) {
-                    char wn[160]; objName(obj, wn, sizeof(wn));
-                    float *wl = (float *)((BYTE *)obj + F.Location);
-                    logf_("  [lumos] v66.5 opened secret wall #%d %s at "
-                          "(%.0f %.0f %.0f) orig bits=0x%02X (SetCollision off "
-                          "- removed from the collision octree, passable for "
-                          "every player)", k, wn, wl[0], wl[1], wl[2],
-                          g_lumosWallOrig[k]);
-                }
-                g_lumosWallColl[k] = 0;
-            }
-        } else {
-            // Close: restore the level's PRISTINE bits exactly as
-            // snapshotted at scan time.
-            if (!g_execSetCollision) { g_lumosWallColl[k] = 1; continue; }
-            if (g_lumosWallOrig[k] == hp3lumos::WallBitsUnknown) {
-                g_lumosWallColl[k] = 1;
-                continue;
-            }
-            hp3lumos::WallCollisionBits b =
-                hp3lumos::unpackWallBits(g_lumosWallOrig[k]);
-            if (nativeSetCollision(obj, b.collideActors ? TRUE : FALSE,
-                                   b.blockActors ? TRUE : FALSE,
-                                   b.blockPlayers ? TRUE : FALSE)) {
-                if (g_lumosWallColl[k] == 0)
-                    logf_("  [lumos] v66.5 closed secret wall #%d "
-                          "(pristine collision bits restored)", k);
-                g_lumosWallColl[k] = 1;
-            }
-        }
+        lumosApplyActorOpen(obj, g_lumosWallOrig[k], &g_lumosWallColl[k],
+                            wantOpen != FALSE, "wall", k, why);
     }
+
+    // ---- v71: the class-agnostic blocker cache ---------------------------
+    for (int k = 0; k < g_lumosBlockersN; k++) {
+        void *obj = g_lumosBlockers[k];
+        if (!cgLiveObject(obj) || cgDeleted(obj) || F.Location <= 0 ||
+            IsBadReadPtr((BYTE *)obj + F.Location, 12)) {
+            g_lumosBlockerColl[k] = -1;
+            continue;
+        }
+        int why = 0;
+        BOOL wantOpen = lumosBlockerWantOpen((float *)((BYTE *)obj + F.Location),
+                                             trigArmed, playerPos, slotAtTrig,
+                                             validPlayers, &why);
+        signed char want = wantOpen ? 0 : 1;
+        if (g_lumosBlockerColl[k] == want && !(reassert && wantOpen)) continue;
+        if (!lumosBlockerVerified(obj)) {
+            g_lumosBlockerColl[k] = -1;
+            continue;
+        }
+        lumosApplyActorOpen(obj, g_lumosBlockerOrig[k], &g_lumosBlockerColl[k],
+                            wantOpen != FALSE, "blocker", k, why);
+    }
+
+    // v71: while a player stands at a revealed wall, name everything that
+    // still blocks right next to him. If the next log shows a blocker here
+    // that the mod did NOT open, the answer is in this line (a class the
+    // blocker cache rejected, or something that is not an actor at all).
+    if (lumosActive)
+        lumosReportNearbyBlockers(playerPos, slotAtTrig, validPlayers, now);
 }
 
 // v52 native particles use bHidden masking only (hardware verification pending).
@@ -11759,8 +12423,31 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         // v67: Lumos replication toggles.
         g_lumosTriggerEvents = GetPrivateProfileIntA("lumos", "TriggerEvents", 1, ini);
         g_lumosGlowFX        = GetPrivateProfileIntA("lumos", "GlowFX", 1, ini);
-        logf_("hp3mod.ini: lumos TriggerEvents=%d GlowFX=%d",
-              g_lumosTriggerEvents, g_lumosGlowFX);
+        // v71: the knobs the field report turned into. Radii are clamped so
+        // a typo can never open half a level, and every one of them can be
+        // switched off from the ini.
+        {
+            int r = GetPrivateProfileIntA("lumos", "OpenRadius", -1, ini);
+            if (r >= 0)   g_lumosOpenRadius   = (float)(r > 2000 ? 2000 : r);
+            int pr = GetPrivateProfileIntA("lumos", "PlayerRadius", -1, ini);
+            if (pr >= 0)  g_lumosPlayerRadius = (float)(pr > 1000 ? 1000 : pr);
+            if (g_lumosPlayerRadius > 0.0f)
+                g_lumosPlayerHeight = hp3lumos::BlockerPlayerHeight;
+            g_lumosLatchOpen   = GetPrivateProfileIntA("lumos", "LatchOpen", 1, ini) != 0;
+            g_lumosWandGlow    = GetPrivateProfileIntA("lumos", "WandGlow", 1, ini) != 0;
+            g_lumosUnhideLight = GetPrivateProfileIntA("lumos", "UnhideLight", 1, ini) != 0;
+            g_lumosLeadHeal    = GetPrivateProfileIntA("lumos", "LeadHeal", 1, ini) != 0;
+            g_lumosLeadRide    = GetPrivateProfileIntA("lumos", "LeadRide", 1, ini) != 0;
+            int gr = GetPrivateProfileIntA("lumos", "GlowRadius", -1, ini);
+            if (gr >= 0)  g_lumosGlowRadius = (float)(gr > 500 ? 500 : gr);
+        }
+        logf_("hp3mod.ini: lumos TriggerEvents=%d GlowFX=%d OpenRadius=%.0f "
+              "PlayerRadius=%.0f LatchOpen=%d WandGlow=%d UnhideLight=%d "
+              "LeadHeal=%d LeadRide=%d GlowRadius=%.0f",
+              g_lumosTriggerEvents, g_lumosGlowFX, g_lumosOpenRadius,
+              g_lumosPlayerRadius, g_lumosLatchOpen, g_lumosWandGlow,
+              g_lumosUnhideLight, g_lumosLeadHeal, g_lumosLeadRide,
+              g_lumosGlowRadius);
 
         char sys[MAX_PATH];
         GetSystemDirectoryA(sys, MAX_PATH); strcat(sys, "\\d3d8.dll");

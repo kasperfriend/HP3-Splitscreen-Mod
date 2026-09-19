@@ -24,7 +24,76 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v69`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v71`.
+
+### v71 Lumos for P2/P3, round 5: the wall is opened by what blocks, and the glow rides the wand
+
+The v70 field report (2 players, P2 = Hermione, HP3_InsideHub gargoyle6) with
+the **full v70 log attached**: "Lumos still doesn't let Player 2 and 3 pass
+through walls designed for this. It seems to be giving some light effect
+underneath, but no wand glow and no pass through walls. Main character also
+receives heavy light underneath, maybe stacked up stuck spell on him."
+
+Two things v70 got right, straight from the log: `Pawn.bLumosOn` resolved
+(`Engine.Pawn +0x620 mask 0x4` — HP3 declares the bit on the **engine**
+class, which is why every `hgame.*` guess missed) and the **stock `TurnOn`
+script engaged for the companion complete with its own `LumosLightFX`**
+(`glow=1d186e00`) even though the mod's own name lookup still reports
+`GlowFX=00000000`. So the light and the particles exist — they were just in
+the wrong place, and the wall was the wrong actor.
+
+1. **The stock `Event -> wall.Tag` linkage does not exist in this level.**
+   `LumosTrigger0.Event=0x8D1A` is carried by exactly one actor —
+   `LumosSparklesTrigger5`, whose own `Event` is `0x0`, so the chain ends
+   there — while the wall actors carry Tags `0x3E63` / `0x405A`. Every wall
+   the mod opened was therefore a guess ("#63 KWBlockingVolume5"), and the
+   actor the player was actually bumping into was never considered. v71 keys
+   on the two facts the level really gives: **the trigger's own radius** (a
+   player inside it *is* stock's `InLumosRadius` check) and **the player's
+   own position**. Every actor near either that actually blocks is opened
+   through the octree-safe `SetCollision` native — **class-agnostically**
+   now, via a per-level blocker cache, because v66.5..v70 only ever looked at
+   two class tokens and only when they were "paired" at scan time. Opened
+   actors are **latched open for the level**, like stock: v66.5..v70 re-closed
+   the wall the moment the Lumos window expired. The scan also no longer
+   caches actors of the *previous* level (the v70 log entered HP3_InsideHub
+   with five Save0 triggers and four Save0 walls still in the cache).
+
+2. **The light sat on the character because nothing carried it.** v68..v70
+   seeded a companion's light at the *pawn* and left it there — stock's ride
+   (`baseWand.Tick -> TheLumosLight.UpdateLocation(WandEndPoint)`, which
+   moves the light **and** its `Particles`) never reached a companion wand on
+   hardware. That is exactly "light underneath, no wand glow". v71 rides the
+   light *and every tracked glow* onto a wand-tip anchor every frame (the wand
+   actor's own `Location` when it is believable, else hand height above the
+   pawn — the game's own projectile origin), and **stands down automatically
+   if the game's own ride turns out to be carrying the light**.
+
+3. **"Stacked up / stuck".** v70 tracked exactly one glow per player and
+   overwrote it on every re-cast, orphaning the previous `LumosLightFX` on the
+   character; four are tracked now, all ride, all are destroyed on teardown.
+   A mod-owned light is retired on a hard ceiling (30 s / 33 s) whatever
+   stock's Tick did, so nothing can burn forever.
+
+4. **The lead is finally left alone** — except for the light's *place*. The
+   only thing v66.5..v70 ever did to the lead's light was force it visible
+   (`setLumosActorHidden(FALSE)` ran for every player, `p == 0` included),
+   which is the prime suspect for "the main character receives heavy light
+   underneath". v71 never touches the lead's light actor, and only fixes its
+   position when it is provably **lost** (`LeadHeal=1`) or **sitting
+   underfoot** (`LeadRide=1`) — both logged once, both switchable in the ini.
+   Two player slots resolving to the same pawn are collapsed to one.
+
+New `[lumos]` knobs: `OpenRadius=512` (blockers within this of a trigger a
+player stands in), `PlayerRadius=200` (or within this of that player),
+`LatchOpen=1`, `WandGlow=1`, `UnhideLight=1` (companions only),
+`LeadHeal=1`, `LeadRide=1`, `GlowRadius=0`.
+
+New diagnostics: a 1 Hz status line with every player's pawn/wand/light/glow
+position (`dPawn`, `riding=yes/NO`), every opened actor named with the key
+that opened it, the blocker list from the scan, and — while a player stands
+inside a trigger's radius — every actor still blocking within 260 units of
+him with its state (`open` / `SOLID` / `NOT CACHED`).
 
 ### v69 Lumos for P2/P3, round 3: the stock script runs the glow
 
@@ -371,6 +440,8 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v66.4** fixes the *second* Player-2 Lumos crash, this time with v66.3 running — same HP3_InsideHub gargoyle, GPF history `UObject::ProcessEvent <- (LumosSparklesEmitter HP3_InsideHub.LumosSparklesEmitter0, Function KWGame.KWPawn.Trigger) <- FPlayerSceneNode::Render`. Two defects cooperated: v66.3's "class-token" gate moved the substring match but did not remove it (`strstr` *within* the class token), so the placed secret-wall sparkles actor class `LumosSparklesEmitter` still entered the trigger cache (the hub scan line even showed "21 triggers"), passing the fire-time chain re-verify's identical substring behind an `isActor` gate that an `Emitter` trivially passes; and — deeper — the fire site called one globally resolved `KWGame.KWPawn.Trigger` on whatever the cache held, so any admitted non-pawn executed pawn bytecode with a too-small `this`. Fix, three layers: (1) cache membership is now **exact** class-token equality (`src/lumos_sync.h`: only `LumosTrigger`/`LumosSparklesTrigger` and `GenericColObj`/`KWBlockingVolume`, no substring anywhere, regression-tested with the exact crash names); (2) a differently-named *subclass* of one of those — the only reason the substring existed — is admitted exclusively by chain pointer proof (`lumosChainProves` walks the receiver's calibrated `UObject::Class` → `UStruct::SuperField` chain with guarded dword reads and pointer-compares against the path-resolved family class objects), at scan admission and at every fire/write verification; (3) the `Trigger()` fire site never replays a function found on a different class again: with the chain verified it fires the most-derived `Trigger` declaration in the **receiver's own** chain (`CgClass::fnTrigger`, already mapped by the castgame index), falling back to `Engine.Actor.Trigger`, and skips + logs `[lumos] v66.4 BLOCKED Trigger()` when neither can be proven — even a future admission bug can no longer run foreign bytecode on a live object.
 - **v66.5** fixes the three findings of the v66.4 field report (P2 Lumos at the gargoyle: “the wand disappears, spell works, but I still can't go through wall” + `UnOctree.cpp:1598` assertion on quit). **One root cause** behind the solid wall *and* the quit crash: the wall replication wrote the `bCollideActors`/`bBlockActors`/`bBlockPlayers` bits directly into wall actors, but this engine resolves collision through the **collision octree**, which only the native `Engine.Actor.SetCollision` updates — a poked wall stayed in the octree and kept blocking, and the cleared flag on an octree member tripped `check(Actor->bCollideActors)` during `FCollisionOctree` teardown at quit. Every wall transition now goes through the engine's own native (`execSetCollision` resolved from Engine.dll exports, driven with the same synthesized bool bytecode tokens the DrawPortal call uses), so an opened wall is genuinely removed from the octree — passable for real, for every player — and the octree/flag pair stays consistent at every instant, which is what removes the quit crash even mid-spell. Pristine per-wall bits are snapshotted at scan time and restored exactly on close and on level travel (`lumosRestoreAllWalls`), only walls **paired to a lumos trigger** (≤900 units, `wallShouldBeOpen` policy) are ever opened, and the feature self-disables if the native is missing. **Satellite fixes:** the per-frame `ShowWeapon` call (a zeroed-parm *hide* in this lineage) is replaced by writing `bHidden=false` directly on each pawn's Wand — P2's wand stays out and lit; the wand-light lookup now matches the exact `LumosLight` class by `Owner == wand` (stock spawns it owned by the wand — the old `Base == wand` fallback could never match, making the whole light sync a silent no-op when `TheLumosLight` was unresolved) and applies the stock `TurnDynamicLightOn` values without ever touching the light's own collision; the state timer follows a genuinely burning light in 1-second extend-only ratchets (tick-wrap safe); and the proven-no-op `Trigger()` fire loop is removed (the stock `OnLumosOn` broadcast already armed the triggers when the gargoyle lit).
 
+- **v67/v68/v69/v70** carry the Lumos replication forward: the stock `LumosLight.TurnOn` script is called on every companion's own `TheLumosLight` (register, glow particles, `OnLumosOn` broadcast, stock 30 s auto-off tick), the wall trigger's `Event` is dispatched through the engine's own script `TriggerEvent`, empty-`Trigger` receivers relay their own `Event` one hop (HP3 chains `LumosTrigger -> LumosSparklesTrigger -> wall`), and every level-side field is resolved by walking the live objects' own class chains with a 1 Hz retry instead of a menu-time one-shot.
+- **v71** fixes the v70 field report ("no pass through walls, light underneath, no wand glow, heavy light stacked on the main character") from the attached v70 log. (1) **Walls**: HP3_InsideHub has no `Event -> wall.Tag` linkage at all — the trigger's Event is carried only by a sparkles trigger whose own Event is empty — so the mod stopped deriving the linkage and instead opens **whatever blocks** near a trigger a player is standing inside (`OpenRadius`, stock's own `fDistanceCheck`) or right next to that player (`PlayerRadius`), class-agnostically through a per-level blocker cache and the octree-safe `SetCollision` native, **latched open for the level** like stock. The scan no longer caches actors of the previous level. (2) **Light**: the companion light and every glow attached to it now ride onto a wand-tip anchor every frame (stock's own wand ride never reaches a companion), standing down automatically if the game's ride is carrying the light; up to four glows per player are tracked and destroyed on teardown (v70 orphaned one per re-cast — the "stacked" report), and a mod-owned light is retired on a hard ceiling (the "stuck spell"). (3) **The lead** is never forced visible any more and only has his light's *position* fixed, when it is provably lost or sitting underfoot. Plus a 1 Hz status line with every player's pawn/wand/light/glow position, named open/blocker logging, and an at-wall dump of everything still blocking.
 
 ## Disclaimer
 
