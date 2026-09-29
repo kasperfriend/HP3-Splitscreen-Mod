@@ -828,6 +828,145 @@ inline bool isSecretWallObject(const char* fullName)
     return isSecretWallClassToken(tok);
 }
 
+// ---------------------------------------------------------------------------
+// v73 policy: the gate is a lumos actor that BLOCKS, "touching" is cylinder
+// vs cylinder, and the glow anchor is where the game itself fires spells
+// from.
+//
+// The v72 hardware log (HP3_InsideHub, P2 = Hermione, light burning) named
+// all three defects precisely:
+//   [pelog] hgame.HPCharacter.Bump other=LumosSparklesTrigger5   (every frame
+//           for 4+ seconds while she pushes into the passage - the ENGINE
+//           itself naming the actor that stops her)
+//   [lumos] v72 at-wall P1: blocker LumosSparklesTrigger5 d=229 bits=0x07
+//           NOT CACHED
+//   [lumos] v72 BUMP P1 ... - 0 actor(s) touching, 0 opened (nothing blocking
+//           is an actor here - ... the blocker is level BSP ...)
+//
+//  (1) THE GATE. The bump rule (and every cache) excluded the whole lumos
+//      trigger FAMILY by name, so the one actor the engine kept reporting as
+//      the blocker could never be opened. A LumosSparklesTrigger /
+//      LumosSparkles whose block flags are up is NOT an event wire: its
+//      Event is empty and its Tag is the wire (0x8D1A in that level). It is
+//      the invisible gate at the secret wall - the very thing stock
+//      SetCollision(False) on to open the passage. actorIsLumosGate()
+//      identifies exactly that shape, and bumpRuleAdmits() lets a BLOCKING
+//      actor of any class through - the engine cannot report a Bump against
+//      an actor it is not physically touching, so a Bump stream is the
+//      evidence v72 wrongly concluded "level BSP" from.
+//
+//  (2) CYLINDER VS CYLINDER. v72 measured "touching" cylinderGap() from the
+//      pawn as a POINT: the pawn's own radius and half-height were never
+//      subtracted. The gate's origin sits 213 units above the floor the
+//      player stands on, so the vertical "gap" measured 85+ units and the
+//      gate read as NOT TOUCHING while her head was inside it.
+//      cylindersTouch() subtracts both collision extents on both axes.
+//
+//  (3) THE WAND TIP. The ride anchor was pawn + 45Z - the head (the pawn's
+//      Location is at its feet, hand height is ~62 and ~88 forward: the
+//      field report's "wand light above Player 2's head, not on the wand").
+//      The game itself measured the wand tip for the mod on every cast: the
+//      v18/v19 spell-spawn learn logs local=(88 -0 62). wandTipForView()
+//      puts the light and every tracked glow there.
+// ---------------------------------------------------------------------------
+
+// The game's own measured cast origin in the pawn's facing frame (v18/v19
+// "spell spawn offset learned: local=(88 -0 62)"): 88 units forward of the
+// origin, 62 above it. Ini-overridable ([lumos] WandForward / WandUp).
+static const float WandTipForward    = 88.0f;
+static const float WandTipUp         = 62.0f;
+// Pitch the wand tip may follow the camera by (+-45deg in UE rotator units):
+// aiming straight up/down must not bury the glow in the floor or the sky.
+static const int   WandTipPitchClamp = 8192;
+
+// Wand tip for a pawn facing yaw/pitch (UE rotator units, 65536 = 360deg).
+inline void wandTipForView(const float pl[3], int yaw65536, int pitch65536,
+                           float fwd, float up, float out[3])
+{
+    if (!out || !pl) return;
+    if (pitch65536 >  WandTipPitchClamp) pitch65536 =  WandTipPitchClamp;
+    if (pitch65536 < -WandTipPitchClamp) pitch65536 = -WandTipPitchClamp;
+    double ry = yaw65536   * (6.283185307179586 / 65536.0);
+    double rp = pitch65536 * (6.283185307179586 / 65536.0);
+    float cp = (float)std::cos(rp);
+    out[0] = pl[0] + (float)std::cos(ry) * cp * fwd;
+    out[1] = pl[1] + (float)std::sin(ry) * cp * fwd;
+    out[2] = pl[2] + (float)std::sin(rp) * fwd + up;
+}
+
+// v73: cylinder-vs-cylinder touching. posRadius/posHalfHeight are the pawn's
+// own collision extents; objRadius/objHeight the candidate's (clamped like
+// cylinderGap, so a brush reporting a huge volume cannot reach across the
+// level). Touching = the horizontal AND vertical separations are both closed
+// to within skin units (skin = ini BumpGap).
+inline bool cylindersTouch(const float pos[3], float posRadius, float posHalfHeight,
+                           const float center[3], float objRadius, float objHeight,
+                           float skin)
+{
+    if (!pos || !center) return false;
+    if (!(posRadius > 0.0f)) posRadius = 0.0f;
+    if (!(posHalfHeight > 0.0f)) posHalfHeight = 0.0f;
+    if (!(objRadius > 0.0f)) objRadius = 0.0f;
+    if (!(objHeight > 0.0f)) objHeight = 0.0f;
+    if (objRadius > BlockerSurfaceMax) objRadius = BlockerSurfaceMax;
+    if (objHeight > BlockerSurfaceMax) objHeight = BlockerSurfaceMax;
+    float dx = pos[0] - center[0];
+    float dy = pos[1] - center[1];
+    float dz = pos[2] - center[2];
+    float horiz = std::sqrt(dx * dx + dy * dy) - objRadius - posRadius;
+    float vert  = std::fabs(dz) - objHeight - posHalfHeight;
+    if (vert < 0.0f) vert = 0.0f;
+    return horiz <= skin && vert <= skin;
+}
+
+// v73: is this actor THE GATE - a lumos-trigger-family actor that physically
+// blocks? An event wire never blocks (its collision shape is overlap-only);
+// a blocking lumos trigger is the door itself. The v72 pelog Bump stream is
+// the engine naming it, frame after frame.
+inline bool actorIsLumosGate(const char *clsTok, bool blocks)
+{
+    return blocks && isLumosTriggerClassToken(clsTok);
+}
+
+// v73: WHO the bump rule may open. A BLOCKING actor (bBlockActors ||
+// bBlockPlayers) admits whatever its class - that is the change from v72,
+// whose lumos-token exclusion is exactly what kept the gate shut. A
+// touch-only actor (the CompanionCorral shape) still needs the ini
+// allowance and is still never a trigger (event wiring stays untouched),
+// matching v72.
+inline bool bumpRuleAdmits(bool blocks, bool touchOnly, bool isTrigger,
+                           bool allowCorral)
+{
+    if (blocks) return true;
+    if (!touchOnly) return false;
+    if (isTrigger) return false;
+    return allowCorral;
+}
+
+// v73: the gate early-open. While Lumos is up and a tracked player stands
+// inside a lumos trigger's own radius (stock's InLumosRadius key - on HP3
+// the gate is itself a cached trigger, so it arms exactly the way stock
+// would arm it), a lumos gate is passable BEFORE any contact: stock's own
+// opening mechanism (its Event) is a no-op on HP3 - the v70/v72 logs show
+// the receiver's Trigger resolves to the empty base - so the door opens the
+// same way the walls around it do: the octree-safe SetCollision native,
+// latched open for the level.
+inline bool gateShouldOpen(bool lumosActive, bool playerAtTrigger, bool blocks)
+{
+    return lumosActive && playerAtTrigger && blocks;
+}
+
+// v73: the mod's ride stands down ONLY when another writer is demonstrably
+// carrying the light AT THE WAND TIP already. v72 stood down whenever the
+// light moved without the mod (g_lumosRideForeignAt) - and on hardware that
+// mover was the +45Z head float itself, so the mod's ride never ran and the
+// glow actors froze wherever the stock spawn had dropped them (P2's glow
+// parked next to the LEAD for the whole cast in the v72 log).
+inline bool rideStandsDown(bool foreignCarried, bool foreignAtTip)
+{
+    return foreignCarried && foreignAtTip;
+}
+
 } // namespace hp3lumos
 
 #endif // HP3_LUMOS_SYNC_H
