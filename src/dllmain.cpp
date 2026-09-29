@@ -166,8 +166,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v73"
-#define MOD_STAMP "build v73 - 2026-09-29 - LUMOS P2/P3 ROUND 7: THE GATE IS THE WALL, AND THE GLOW SITS ON THE WAND. The v72 hardware log named both defects precisely. (1) THE GATE: the pelog shows hgame.HPCharacter.Bump other=LumosSparklesTrigger5 EVERY FRAME for 4+ seconds while P2 pushes into the passage - the engine itself naming the actor that stops her - while the v72 bump rule answered 0 actor(s) touching, because every cache and rule excluded the whole lumos trigger FAMILY by name, and touching was measured from the pawn as a POINT (its own collision radius and half-height were never subtracted, so a gate whose origin sits 213 units above the floor read as NOT TOUCHING while her head was inside it). v73 (a) opens THE GATE directly: a lumos-trigger-family actor whose block flags are up is not an event wire - it is the invisible gate at the secret wall (its Event is empty, its Tag is the wire) - so when a tracked player arms any lumos trigger (stock InLumosRadius fDistanceCheck key), the gate itself is opened through the octree-safe SetCollision native, latched open for the level and restored at level change exactly like the walls (ini GateOpen). (b) THE BUMP RULE v73: touching is now CYLINDER-VS-CYLINDER (pawn radius AND half-height subtracted on both axes, skin = BumpGap), and blocking actors of the lumos gate family are admitted - the engine cannot report a Bump against an actor it is not physically touching, so the Bump stream IS the evidence. (c) THE WAND TIP: the ride anchor was pawn + 45Z - the head (the pawn Location is at its feet), the field report: above Player 2 head, not on the wand. The game itself measures the wand tip on every cast - the spell-spawn learn logs local=(88 -0 62): 88 forward, 62 up. v73 rides the light AND every tracked glow there (frame = pawn facing yaw + camera pitch clamped to +-45 deg; ini WandForward/WandUp); a believable wand-actor Location still wins. (d) THE RIDE STANDS DOWN ONLY WHEN SOMEONE IS ACTUALLY CARRYING THE LIGHT AT THE TIP: v72 stood down whenever the light moved without the mod - and on hardware that mover was the +45Z head float itself, so the mod ride never ran and the glow actors froze wherever the stock spawn dropped them (P2 glow parked next to the LEAD for the whole cast). Glows now always ride alongside the light. (5) STATUS: the per-player line now prints the computed wand tip and dTip (light-to-tip distance) so ride quality is provable from the log, and the at-wall dump resolves gate state. v72 SURFACE MEASURING AND THE BUMP RULE, v71 TRIGGER-KEYED CLASS-AGNOSTIC OPENING AND LATCH, v70 STOCK-TURNON REPLICATION, v69 EVENT DISPATCH, v68 DEFERRED RESOLUTION, v66.5 OCTREE-SAFE SETCOLLISION: ALL KEPT."
+#define MOD_BUILD  "v74"
+#define MOD_STAMP "build v74 - 2026-09-29 - OTHER-SPELL AUDIT AGAINST THE V73 LESSONS: THE PENDING-HIT WATCH NOW SEES TALL TARGETS TOO. v73 fixed three measurement mistakes in the Lumos pipeline (a blocker family excluded by name, touching measured from a point, the wand anchor floating at +45Z); this round audits every OTHER spell path against the same defect classes and VERIFIES them: fireCast spawn/nudge/learn/kick and the aim-glow ray share one origin formula (pawn + camDir*90 + 45Z) end to end; the charged trio bonus fallback reaches the same endpoint through planTargetedLaunch clearance; candidate scans keep trigger-family receivers Touch-eligible; the Ron/Hermione GroundSpeed and AccelRate pins save and restore per slot (no stuck companion); a mature charged hold keeps its target through the ordinary release exactly once. One real same-class flaw: the pending-HIT watch delivered when d <= hitR with hitR = CollisionRadius + 40, ignoring CollisionHeight - a spell passing next to a TALL target (the other gate shape) waited out the whole 0.9..3.5 s flight window for the forced hit. The watch now also tests the target as the cylinder it is (the already-proven hp3lumos::cylindersTouch, skin = 40) and logs [at the target collision surface] when that check is the one that fires; delivery can only arrive EARLIER, never later, and the deadline force is unchanged. A -Wall -Wextra clang pass over the whole 12.9k-line DLL reports zero correctness warnings (five genuinely dead v53-v60 cursor helpers remain, noted for hygiene). The v18/v19 spawn-offset learn carries its true role: evidence only - nothing has consumed it since v20, but the log line is the proof point for both the nudge formula and the v73 wand tip. (v73 GATE AND WAND TIP, v72 SURFACE MEASURING AND THE BUMP RULE, v71 TRIGGER-KEYED CLASS-AGNOSTIC OPENING, v70 STOCK-TURNON, v69 EVENT DISPATCH, v68 DEFERRED RESOLUTION, v66.5 OCTREE-SAFE SETCOLLISION: ALL KEPT.)"
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -3079,10 +3079,41 @@ static void cgTickPending(CgPending *p, DWORD now)
         return;
     }
     if (age < 50) return;               // natural collision gets first go
-    if (d <= p->hitR || now >= p->deadline) {
+    // v74 (audit of the other spells against the v73 lessons): the watch
+    // still tests the CENTRE-distance d <= hitR (CollisionRadius + 40), and
+    // that radius ignores the target's CollisionHeight - the same flaw the
+    // v73 bump rule had against the lumos gate (a tall volume read as NOT
+    // TOUCHING while the actor was physically inside it). A spell homed at
+    // the centre normally converges d -> 0, so this only mattered for a
+    // spell that passes NEXT TO the target surface (veered/bounced but still
+    // inside its cylinder): it then waited out the whole 0.9..3.5 s flight
+    // window for the forced hit. The cylinder test (the same already-tested
+    // hp3lumos::cylindersTouch, skin = the hitR pad of 40) fires on surface
+    // contact on EITHER axis and cannot fire later than d <= hitR for a
+    // point target, so existing behaviour only gets earlier, never later.
+    BOOL surf = FALSE;
+    {
+        static int sOffCR = -2, sOffCH = -2;
+        if (sOffCR == -2) sOffCR = propOffset("Engine.Actor.CollisionRadius");
+        if (sOffCH == -2) sOffCH = propOffset("Engine.Actor.CollisionHeight");
+        float tcr = 60.0f, tch = 0.0f;
+        if (sOffCR > 0 && !IsBadReadPtr((BYTE *)p->target + sOffCR, 4)) {
+            float v = *(float *)((BYTE *)p->target + sOffCR);
+            if (v > 1.0f && v < 1000.0f) tcr = v;
+        }
+        if (sOffCH > 0 && !IsBadReadPtr((BYTE *)p->target + sOffCH, 4)) {
+            float v = *(float *)((BYTE *)p->target + sOffCH);
+            if (v > 1.0f && v < 1000.0f) tch = v;
+        }
+        surf = hp3lumos::cylindersTouch(sl, 0.0f, 0.0f, p->aim, tcr, tch,
+                                        40.0f);   // 40 = the hitR pad
+    }
+    if (d <= p->hitR || surf || now >= p->deadline) {
         logf_("    [castgame] p%d spell reached %s: dist=%.0f (start %.0f) at +%lums%s",
               i, p->targetName, d, p->d0, (unsigned long)age,
-              d <= p->hitR ? "" : " [flight window closed - forcing the hit]");
+              d <= p->hitR ? "" :
+              surf ? " [at the target collision surface]" :
+                     " [flight window closed - forcing the hit]");
         if (g_castAutoHit) cgDeliverHit(p, TRUE);
         else logf_("    [castgame] p%d CastAutoHit=0 - leaving it to the game's collision", i);
         p->active = FALSE;
@@ -4479,11 +4510,16 @@ static void aimFXDiagnose(void *pawn, void *fx, const float at[3]);
 // game's own sparkle texture, and breathe the scale so the marker feels
 // alive. Plain sprite drawing (DrawType=1) is the same path the game's own
 // cursor actor uses - it does not depend on the GameFX particle pipeline.
-// v18: where SpawnSpell actually puts the spell actor, in PAWN-LOCAL space
-// (learned at each fire, applied to the aim glow so the glow rides the exact
-// line the spell will fly). Measured: RictusempraSpell spawns at the pawn
-// ORIGIN (local 0,0,0) - the glow ray starts exactly there; other spells
-// re-learn their own offset after the first cast.
+// v18: where SpawnSpell actually puts the spell actor, in PAWN-LOCAL space,
+// measured at every fire and logged once per spell. v18/v19 APPLIED this to
+// the aim glow's ray origin so the glow rode the exact spell start; v20
+// moved the glow to the exact fireCast nudge formula instead (pawn +
+// camDir*90 + 45Z), and nothing consumes the learned value since - the
+// learn stays on purpose as the field evidence behind that formula and
+// behind the v73 lumos wand-tip anchor (the log line
+// "spell spawn offset learned: local=(88 -0 62)"). v74 audit note: the
+// measure itself must outlive its reader or the next anchor change has no
+// proof point, so keep the learn even though it has no consumer.
 static float g_spellOffLocal[3] = { 0.0f, 0.0f, 0.0f };
 static BOOL  g_spellOffLearned  = FALSE;
 
