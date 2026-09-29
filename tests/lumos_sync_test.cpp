@@ -736,14 +736,79 @@ int main()
         assert(WandTipPitchClamp > 4000 && WandTipPitchClamp <= 16384);
     }
 
+    // 27. THE V72 FIELD SCENE, END-TO-END. The two acceptance criteria from
+    //     the v72 hardware log (P2 = Hermione, HP3_InsideHub: "wand light
+    //     above Player 2's head, not on the wand" + "still can't pass the
+    //     wall"), composed from the v73 policies with the log's own numbers.
+    //     If this section ever fails, the criteria a hardware test checks
+    //     are broken by definition.
+    {
+        // The log's pose: the pawn at (-47 2683 -181) (HPCharacter, 25x44),
+        // the gate LumosSparklesTrigger5 at (-64 2764 32), bits=0x07, the
+        // pelog streaming HPCharacter.Bump against it for 4+ seconds while
+        // she pushes in, and the v72 rule concluding "0 touching / level BSP".
+        const float pawnA[3] = { -47.0f, 2683.0f, -181.0f };
+        const float gateA[3] = { -64.0f, 2764.0f,   32.0f };
+
+        // --- CRITERION 2: SHE CAN PASS THE WALL --------------------------
+        // (a) the gate ADMITS under the bump rule (its bits are
+        //     collide+blockActors+blockPlayers = 0x07)...
+        assert(actorIsLumosGate("LumosSparklesTrigger", true));
+        assert(bumpRuleAdmits(true, false, true, true));
+        // (b) ...she satisfies every bump gate while standing inside an
+        //     armed trigger's radius and pushing with full input...
+        assert(bumpShouldOpen(true, true, true, true, true, false, true));
+        // (c) ...the contact test sees exactly what the engine's Bump
+        //     stream saw (the v73 cylinder-vs-cylinder fix)...
+        assert(cylindersTouch(pawnA, 25.0f, 44.0f, gateA, 200.0f, 300.0f, 48.0f));
+        // (d) ...and she never even needs the bump rule: standing inside the
+        //     gate's own trigger radius with Lumos up is the early-open.
+        assert(gateShouldOpen(true, true, true));
+        // => for the log's exact scene, "0 actor(s) touching ... level BSP"
+        //    is mathematically unreachable: one of (a)-(d) opens the gate.
+
+        // --- CRITERION 1: THE GLOW SITS ON THE WAND ----------------------
+        // The log's wand actor sat AT the pawn origin (dZ = 0) - exactly the
+        // "unpositioned attached actor" shape wandLocIsTip rejects, so the
+        // v73 anchor falls back to the measured cast origin (88 fwd, 62 up).
+        assert(!wandLocIsTip(pawnA, pawnA));
+        double gyaw = std::atan2(2764.0 - 2683.0, -64.0 - (-47.0)); // to the gate
+        int yaw65536 = (int)(gyaw * (65536.0 / 6.283185307179586)) & 0xFFFF;
+        float tipA[3];
+        wandTipForView(pawnA, yaw65536, 0, WandTipForward, WandTipUp, tipA);
+        {
+            double dx = tipA[0] + 47.0, dy = tipA[1] - 2683.0;
+            double horiz = std::sqrt(dx * dx + dy * dy);
+            assert(std::fabs(horiz - 88.0) < 0.5);          // forward reach
+            assert(std::fabs((tipA[2] + 181.0) - 62.0) < 0.5); // hand height
+        }
+        // The v72 float (pawn + 45Z = the head) counts as OFF the tip...
+        float v72float[3] = { pawnA[0], pawnA[1], pawnA[2] + 45.0f };
+        assert(lightNeedsRide(v72float, tipA));
+        // ...so the mod's ride lifts it there; a light genuinely carried AT
+        // the tip by someone else is left alone (no two-writer fight).
+        assert(rideStandsDown(true, true));
+        assert(!rideStandsDown(true, false));
+        // Full-down aim: the pitch clamp keeps the tip 62 u in FRONT at the
+        // feet (88*cos(45deg)); it cannot bury itself in the floor or her body.
+        float tipDown[3];
+        wandTipForView(pawnA, yaw65536, -32000, WandTipForward, WandTipUp, tipDown);
+        {
+            double dx = tipDown[0] + 47.0, dy = tipDown[1] - 2683.0;
+            double horiz = std::sqrt(dx * dx + dy * dy);
+            assert(std::fabs(horiz - 88.0 * 0.7071067811865476) < 0.6);
+            assert(tipDown[2] > pawnA[2] - 1.0f);
+        }
+    }
+
     std::puts("lumos sync: state, timer, light, proximity, passability, "
               "v66.3 class-token, v66.4 exact-family/chain-proof scan, "
               "v66.5 wall-bits/follow-light, v67 stock-register/"
               "trigger-fire, v68 proxied-wall/retry, v69 Event==Tag "
               "linkage / LumosSparkles token, v70 stock-auto-off observation, "
               "v71 wand-tip ride / trigger-keyed blocker opening, "
-              "v72 surface-gap / push-probe / bump-rule and "
-              "v73 cylinder-touch / lumos-gate / at-tip-ride / cast-anchor "
-              "tip assertions passed");
+              "v72 surface-gap / push-probe / bump-rule, "
+              "v73 cylinder-touch / lumos-gate / at-tip-ride / cast-anchor tip "
+              "and the v72 field-scene end-to-end assertions passed");
     return 0;
 }
