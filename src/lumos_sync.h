@@ -87,17 +87,15 @@ static const std::uint32_t LightRideHealMs = 1000;
 static const std::uint32_t ModLightHardOffMs = 33000;
 
 // ---------------------------------------------------------------------------
-// v71: THE WALL-OPEN KEY THAT ACTUALLY MATCHES HP3 (see FINDINGS 28).
-// The v70 hardware log killed the "Event -> wall.Tag" theory for the level
-// under test: HP3_InsideHub's LumosTrigger0 has Event=0x8D1A and the ONLY
-// actor carrying Tag 0x8D1A is LumosSparklesTrigger5 (whose own Event is
-// 0x0, so the chain ends there). The cached secret walls carry Tags
-// 0x3E63 / 0x405A - nothing links them to a trigger by name at all, and the
-// mod's single proximity pick ("wall #63") was not what the player was
-// bumping into. So the open rule no longer tries to derive the stock
-// linkage: it keys on the one thing the level designer DID tune - the
-// trigger's own radius, the stock InLumosRadius check - and then opens
-// whatever actually blocks near it.
+// v75: HP3_InsideHub has two related collision gates. The real
+// LumosTrigger's Event (0x8D20) matches the blocking LumosSparklesTrigger's
+// Tag (0x8D20), while the nearby KWBlockingVolume has an unrelated Tag. The
+// Event->Tag link therefore does NOT identify the brush wall, but it DOES
+// identify the actual blocking sparkles-trigger gate. When a player arms the
+// source LumosTrigger, open any blocking Lumos-trigger receiver with a Tag
+// matching that source Event; do not wait for the receiver's own (often
+// Z-limited) trigger-radius check. The brush / proxy blockers still use the
+// trigger-keyed surface/radius rules below.
 // ---------------------------------------------------------------------------
 // Any blocking actor within this radius of an ARMED trigger (one a tracked
 // player currently stands inside) is opened. Stock's own fDistanceCheck
@@ -445,19 +443,18 @@ inline WallCollisionBits unpackWallBits(unsigned char packed)
     return b;
 }
 
-// v69: THE STOCK TRIGGER->WALL LINKAGE. Stock LumosTrigger fires
+// v69/v75: THE STOCK EVENT->TAG LINKAGE. Stock LumosTrigger fires
 // TriggerEvent(Event, self, None) and the ENGINE dispatches that Event to
 // every live actor whose Tag equals it (Engine.Actor.TriggerEvent walks
-// GObjObjects comparing Name fields). So the DEFINITIVE proof that a wall
-// is the secret wall of a given trigger is the raw name-index equality
-// wall.Tag == trigger.Event - not distance. Both values are plain 4-byte
-// name indexes in this engine (Engine.Actor.Tag / Engine.Actor.Event), so
-// the comparison is two guarded dword reads, no string work. A wall linked
-// by Event is a secret wall no matter how far away its actor Location sits
-// from the trigger (a large wall's centre can sit >900 units out, which
-// silently failed the v66.5 SecretWallPairRadius pairing and left the
-// wall unclassified, hence never opened by the SetCollision fallback).
-// wallTag==0 (NAME_None) never links - an unlinked wall stays ordinary.
+// GObjObjects comparing Name fields). The raw name-index equality
+// receiver.Tag == source.Event is definitive and independent of distance.
+// Both values are plain 4-byte name indexes in this engine (Engine.Actor.Tag /
+// Engine.Actor.Event), so the comparison is two guarded dword reads, no
+// string work. A linked actor can be a brush-wall proxy OR the blocking
+// LumosSparklesTrigger receiver itself (the supplied HP3_InsideHub scene);
+// only the former is paired into the secret-wall cache, while v75 opens a
+// blocking Lumos-trigger receiver through its own gate cache.
+// wallTag==0 (NAME_None) never links.
 inline bool wallEventLinksToTrigger(unsigned wallTag, unsigned trigEvent)
 {
     return wallTag != 0 && trigEvent != 0 && wallTag == trigEvent;
@@ -487,9 +484,11 @@ inline bool wallShouldOpenProxied(bool lumosActive, bool secretCandidate,
 }
 
 // ---------------------------------------------------------------------------
-// v71 policy: the wand-tip anchor and the trigger-keyed wall opening.
+// v75 policy: the exact camera cast-origin anchor and Event-linked gate opening.
 // ---------------------------------------------------------------------------
 
+// Diagnostic legacy predicate only: the v75 runtime no longer uses the wand
+// actor's Location as a cast origin; v74's camera-ray formula is authoritative.
 // Is the wand actor's own Location a believable wand tip for this pawn? A
 // wand actor whose Location was never updated by the game (still at the
 // level's origin, at the pawn's feet, or hundreds of units away - all seen
@@ -507,9 +506,9 @@ inline bool wandLocIsTip(const float pawnLoc[3], const float wandLoc[3])
     return (dx * dx + dy * dy) <= (WandTipMaxHoriz * WandTipMaxHoriz);
 }
 
-// The point a Lumos light (and its Particles glow) must sit at. The wand
-// actor's own Location when it is believable, otherwise hand height above
-// the pawn - the same origin the game fires its own spells from.
+// Legacy diagnostic helper only (not used by the v75 runtime). It illustrates
+// why an unpositioned wand actor was rejected; live Lumos placement uses the
+// exact per-player camera cast origin in wandTipForView() below.
 inline void wandTipFor(const float pawnLoc[3], const float wandLoc[3],
                        float out[3])
 {
@@ -829,9 +828,8 @@ inline bool isSecretWallObject(const char* fullName)
 }
 
 // ---------------------------------------------------------------------------
-// v73 policy: the gate is a lumos actor that BLOCKS, "touching" is cylinder
-// vs cylinder, and the glow anchor is where the game itself fires spells
-// from.
+// v75 Lumos correction, retaining the v73 direct-gate and cylinder-contact
+// policies while adding the Event-linked receiver and exact v74 camera origin.
 //
 // The v72 hardware log (HP3_InsideHub, P2 = Hermione, light burning) named
 // all three defects precisely:
@@ -846,9 +844,10 @@ inline bool isSecretWallObject(const char* fullName)
 //  (1) THE GATE. The bump rule (and every cache) excluded the whole lumos
 //      trigger FAMILY by name, so the one actor the engine kept reporting as
 //      the blocker could never be opened. A LumosSparklesTrigger /
-//      LumosSparkles whose block flags are up is NOT an event wire: its
-//      Event is empty and its Tag is the wire (0x8D1A in that level). It is
-//      the invisible gate at the secret wall - the very thing stock
+//      LumosSparkles whose block flags are up is the blocking gate/receiver.
+//      Its own Event is empty and its Tag receives the source trigger's Event
+//      (the older v72 capture logged 0x8D1A; the supplied v74 capture is
+//      0x8D20). It is the invisible gate at the secret wall - the very thing stock
 //      SetCollision(False) on to open the passage. actorIsLumosGate()
 //      identifies exactly that shape, and bumpRuleAdmits() lets a BLOCKING
 //      actor of any class through - the engine cannot report a Bump against
@@ -862,30 +861,36 @@ inline bool isSecretWallObject(const char* fullName)
 //      gate read as NOT TOUCHING while her head was inside it.
 //      cylindersTouch() subtracts both collision extents on both axes.
 //
-//  (3) THE WAND TIP. The ride anchor was pawn + 45Z - the head (the pawn's
-//      Location is at its feet, hand height is ~62 and ~88 forward: the
-//      field report's "wand light above Player 2's head, not on the wand").
-//      The game itself measured the wand tip for the mod on every cast: the
-//      v18/v19 spell-spawn learn logs local=(88 -0 62). wandTipForView()
-//      puts the light and every tracked glow there.
+//  (3) THE WAND ANCHOR. v74 changed projectile creation to the exact view-ray
+//      origin pawn + camDir*90 + 45Z, but the Lumos ride still used the old
+//      pawn-yaw + 88/62 + pitch-clamp estimate. The user's v74 log measures a
+//      real spawn offset of local=(89,0,33) / world=(-89,10,33), while the old
+//      Lumos tip was (-86,10,50): 17 units too high and not using camera yaw.
+//      Use the same camera yaw, pitch, forward distance and Z bias as fireCast.
 // ---------------------------------------------------------------------------
 
-// The game's own measured cast origin in the pawn's facing frame (v18/v19
-// "spell spawn offset learned: local=(88 -0 62)"): 88 units forward of the
-// origin, 62 above it. Ini-overridable ([lumos] WandForward / WandUp).
-static const float WandTipForward    = 88.0f;
-static const float WandTipUp         = 62.0f;
-// Pitch the wand tip may follow the camera by (+-45deg in UE rotator units):
-// aiming straight up/down must not bury the glow in the floor or the sky.
-static const int   WandTipPitchClamp = 8192;
+// v74 fireCast/nudge origin, in camera coordinates. These defaults are exact:
+// pawn + camDir*90 + 45Z. The INI can still tune the two lengths; old v73
+// defaults (88/62) are migrated at load so an existing INI gets the fix.
+static const float WandTipForward = 90.0f;
+static const float WandTipUp      = 45.0f;
+static const int LinkedGateOpenKey = 7;
+static const int LegacyWandTipForwardV73 = 88;
+static const int LegacyWandTipUpV73      = 62;
 
-// Wand tip for a pawn facing yaw/pitch (UE rotator units, 65536 = 360deg).
+inline bool isLegacyV73WandTipConfig(int fwd, int up)
+{
+    return fwd == LegacyWandTipForwardV73 && up == LegacyWandTipUpV73;
+}
+
+// Exact camera-origin offset in UE rotator units (65536 = 360 degrees).
+// Camera yaw/pitch are supplied by the same per-player view functions used by
+// fireCast; pitch has already been clamped by playerCamPitch, so do not apply a
+// second, different clamp here.
 inline void wandTipForView(const float pl[3], int yaw65536, int pitch65536,
                            float fwd, float up, float out[3])
 {
     if (!out || !pl) return;
-    if (pitch65536 >  WandTipPitchClamp) pitch65536 =  WandTipPitchClamp;
-    if (pitch65536 < -WandTipPitchClamp) pitch65536 = -WandTipPitchClamp;
     double ry = yaw65536   * (6.283185307179586 / 65536.0);
     double rp = pitch65536 * (6.283185307179586 / 65536.0);
     float cp = (float)std::cos(rp);
@@ -943,17 +948,23 @@ inline bool bumpRuleAdmits(bool blocks, bool touchOnly, bool isTrigger,
     return allowCorral;
 }
 
-// v73: the gate early-open. While Lumos is up and a tracked player stands
-// inside a lumos trigger's own radius (stock's InLumosRadius key - on HP3
-// the gate is itself a cached trigger, so it arms exactly the way stock
-// would arm it), a lumos gate is passable BEFORE any contact: stock's own
-// opening mechanism (its Event) is a no-op on HP3 - the v70/v72 logs show
-// the receiver's Trigger resolves to the empty base - so the door opens the
-// same way the walls around it do: the octree-safe SetCollision native,
-// latched open for the level.
+// v73: direct gate opening for a blocking Lumos-trigger actor when a player
+// is inside that actor's own radius. This remains useful when a level places a
+// blocking Lumos trigger directly at the passage.
 inline bool gateShouldOpen(bool lumosActive, bool playerAtTrigger, bool blocks)
 {
     return lumosActive && playerAtTrigger && blocks;
+}
+
+// v75: HP3 also has a separate blocking receiver gate. It is opened when the
+// player's armed SOURCE trigger fires the matching Event -> receiver.Tag wire;
+// the receiver's own Z-limited radius is deliberately not part of this test.
+inline bool linkedGateShouldOpen(bool lumosActive, bool sourceArmed,
+                                 unsigned receiverTag, unsigned sourceEvent,
+                                 bool blocks)
+{
+    return lumosActive && sourceArmed && blocks &&
+           wallEventLinksToTrigger(receiverTag, sourceEvent);
 }
 
 // v73: the mod's ride stands down ONLY when another writer is demonstrably

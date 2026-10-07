@@ -166,8 +166,8 @@ static BOOL keyDown(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
 static BOOL g_splitOn = FALSE;   // runtime toggle (F10 / split_on file)
 
 // ------------------------------- logging -----------------------------------
-#define MOD_BUILD  "v74"
-#define MOD_STAMP "build v74 - 2026-09-29 - OTHER-SPELL AUDIT AGAINST THE V73 LESSONS: THE PENDING-HIT WATCH NOW SEES TALL TARGETS TOO. v73 fixed three measurement mistakes in the Lumos pipeline (a blocker family excluded by name, touching measured from a point, the wand anchor floating at +45Z); this round audits every OTHER spell path against the same defect classes and VERIFIES them: fireCast spawn/nudge/learn/kick and the aim-glow ray share one origin formula (pawn + camDir*90 + 45Z) end to end; the charged trio bonus fallback reaches the same endpoint through planTargetedLaunch clearance; candidate scans keep trigger-family receivers Touch-eligible; the Ron/Hermione GroundSpeed and AccelRate pins save and restore per slot (no stuck companion); a mature charged hold keeps its target through the ordinary release exactly once. One real same-class flaw: the pending-HIT watch delivered when d <= hitR with hitR = CollisionRadius + 40, ignoring CollisionHeight - a spell passing next to a TALL target (the other gate shape) waited out the whole 0.9..3.5 s flight window for the forced hit. The watch now also tests the target as the cylinder it is (the already-proven hp3lumos::cylindersTouch, skin = 40) and logs [at the target collision surface] when that check is the one that fires; delivery can only arrive EARLIER, never later, and the deadline force is unchanged. A -Wall -Wextra clang pass over the whole 12.9k-line DLL reports zero correctness warnings (five genuinely dead v53-v60 cursor helpers remain, noted for hygiene). The v18/v19 spawn-offset learn carries its true role: evidence only - nothing has consumed it since v20, but the log line is the proof point for both the nudge formula and the v73 wand tip. (v73 GATE AND WAND TIP, v72 SURFACE MEASURING AND THE BUMP RULE, v71 TRIGGER-KEYED CLASS-AGNOSTIC OPENING, v70 STOCK-TURNON, v69 EVENT DISPATCH, v68 DEFERRED RESOLUTION, v66.5 OCTREE-SAFE SETCOLLISION: ALL KEPT.)"
+#define MOD_BUILD  "v75"
+#define MOD_STAMP "build v75 - 2026-10-07 - LUMOS ROUND 8, FIXED FROM THE V74 HARDWARE LOG: the armed LumosTrigger0.Event=0x8D20 exactly matches blocking LumosSparklesTrigger5.Tag=0x8D20, but v73 checked only the receiver's own Z-limited radius and left gate[1] solid; any blocking Lumos-trigger receiver linked by Event==Tag now opens as soon as its source trigger is armed, through octree-safe SetCollision, for every player. The v74 spawn learn (-89,10,33) also exposes that the old Lumos anchor (-86,10,50) was 17 units too high and used pawn yaw instead of camera yaw: the light now shares fireCast's exact pawn+camDir*90+45Z origin, old 88/62 INIs migrate automatically, and a companion never rides or destroys another player's ParticleFX - it gets a private glow owned by its own light. A collision-checked Location-only fallback covers SetLocation refusal when all collision flags are off. (v74 TALL-TARGET HIT WATCH, v73 SURFACE GATES AND WAND ANCHOR, v72 BUMP RULE, v71 CLASS-AGNOSTIC BLOCKER CACHE, v70 STOCK TURNON: ALL KEPT.)"
 
 static FILE *g_log = NULL;
 static CRITICAL_SECTION g_logCs;
@@ -9306,15 +9306,12 @@ static int    g_lumosBumpOpen      = 1;
 static float  g_lumosBumpGap       = hp3lumos::BumpGapDefault;
 static int    g_lumosBumpHold      = (int)hp3lumos::BumpHoldMs;
 static int    g_lumosTouchOpen     = 1;
-// v73 ini [lumos] knobs (see hp3mod.ini):
-//   GateOpen    - a blocking member of the lumos trigger family IS the
-//                 invisible gate at the secret wall; open it when a player
-//                 arms it (default 1), and admit it in the bump rule.
-//   WandForward - wand-tip anchor: units in front of the pawn (the game's
-//                 own measured spell-spawn x, 88).
-//   WandUp      - wand-tip anchor: units above the pawn origin (62). The
-//                 v71/v72 flat +45Z anchor is exactly the "light above the
-//                 head" the field report complains about.
+// v75 ini [lumos] knobs (see hp3mod.ini):
+//   GateOpen    - open direct blocking Lumos gates and blocking receivers
+//                 whose Tag matches an armed source trigger's Event.
+//   WandForward - distance along the same per-player camera ray used by
+//                 fireCast (v74 default 90).
+//   WandUp      - fixed Z bias above the pawn origin (v74 default 45).
 static int    g_lumosGateOpen      = 1;
 static float  g_lumosWandForward   = hp3lumos::WandTipForward;
 static float  g_lumosWandUp        = hp3lumos::WandTipUp;
@@ -10526,12 +10523,33 @@ static void *lumosParticlesOf(void *light)
     return fx;
 }
 
-static BOOL lumosAnyGlowLive(int p)
+// A ParticleFX is safe to ride or destroy only when its UObject Owner is the
+// same LumosLight whose Particles field references it. In particular, never
+// let a companion adopt another player's valid-but-foreign effect pointer.
+static BOOL lumosFXOwner(void *fx, void **ownerOut)
 {
-    if (p < 0 || p >= 8) return FALSE;
+    if (ownerOut) *ownerOut = NULL;
+    if (!fx || !cgLiveObject(fx) || g_offOwner <= 0 ||
+        IsBadReadPtr((BYTE *)fx + g_offOwner, 4)) return FALSE;
+    void *owner = *(void **)((BYTE *)fx + g_offOwner);
+    if (ownerOut) *ownerOut = owner;
+    return TRUE;
+}
+
+static BOOL lumosFXOwnedByLight(void *fx, void *light)
+{
+    void *owner = NULL;
+    return light && lumosFXOwner(fx, &owner) && owner == light;
+}
+
+static BOOL lumosAnyGlowLive(int p, void *light)
+{
+    if (p < 0 || p >= 8 || !light) return FALSE;
     for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
         void *fx = g_lumosGlow[p][g];
-        if (fx && cgLiveObject(fx)) return TRUE;
+        if (!fx || !cgLiveObject(fx)) continue;
+        if (lumosFXOwnedByLight(fx, light)) return TRUE;
+        g_lumosGlow[p][g] = NULL;        // never let a foreign FX gate bLumosOn
     }
     return FALSE;
 }
@@ -10549,9 +10567,9 @@ static BOOL lumosGlowSlotsFree(int p)
 // Remember a glow for this player. Idempotent (the same actor is never
 // tracked twice), and it recycles a dead slot before adding - so a re-spawn
 // can never push a live glow out of the list and orphan it.
-static void lumosTrackGlow(int p, void *fx)
+static void lumosTrackGlow(int p, void *fx, void *light)
 {
-    if (p < 0 || p >= 8 || !fx) return;
+    if (p < 0 || p >= 8 || !fx || !lumosFXOwnedByLight(fx, light)) return;
     for (int g = 0; g < LUMOS_MAX_GLOW; g++)
         if (g_lumosGlow[p][g] == fx) return;
     for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
@@ -10561,59 +10579,94 @@ static void lumosTrackGlow(int p, void *fx)
         }
     }
     // Every slot holds a live glow: retire the oldest rather than leak it.
-    if (cgLiveObject(g_lumosGlow[p][0])) destroyActorFX(g_lumosGlow[p][0]);
+    if (lumosFXOwnedByLight(g_lumosGlow[p][0], light))
+        destroyActorFX(g_lumosGlow[p][0]);
     g_lumosGlow[p][0] = fx;
 }
 
 // Forget (and optionally destroy) every glow tracked for this player.
 // destroy = FALSE is the "stock TurnOff already destroyed them" case.
-static void lumosDropGlows(int p, BOOL destroy)
+static void lumosDropGlows(int p, BOOL destroy, void *light)
 {
     if (p < 0 || p >= 8) return;
     for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
         void *fx = g_lumosGlow[p][g];
         g_lumosGlow[p][g] = NULL;
         if (!fx) continue;
-        if (destroy && cgLiveObject(fx)) destroyActorFX(fx);
+        // If the light pointer is missing/recycled, leave the FX alone. A
+        // shared or foreign particle must never be destroyed by this player.
+        if (destroy && lumosFXOwnedByLight(fx, light)) destroyActorFX(fx);
     }
 }
 
-// The point a light must sit at for this player: the wand actor's own
-// Location when it is a believable wand tip, otherwise the TRUE wand tip -
-// the point the game itself fires its spells from. v71/v72 used a flat
-// pawn + 45Z: the pawn's Location is at its feet, and 45 up with no forward
-// reach is the HEAD - the v72 field report ("it puts the wand light above
-// Player 2's head, not on the wand") is that anchor, byte for byte. The
-// v18/v19 spell-spawn learn measures the real cast origin every cast:
-// local=(88 -0 62) - 88 units forward, 62 up (hp3lumos::wandTipForView).
+// The exact camera-relative cast origin shared with fireCast: pawn +
+// camDir*WandForward + WandUp*Z. v75 deliberately does not substitute a
+// plausible-looking Wand.Location or the pawn's facing yaw; both can be stale
+// relative to the actual split-screen camera.
 static BOOL lumosTipOf(int p, void *pawn, void *wand, float out[3])
 {
-    if (!pawn || F.Location <= 0 || !out) return FALSE;
+    (void)wand; // the spell origin is camera-relative, not Wand.Location
+    if (!pawn || F.Location <= 0 || !out || p < 0 || p >= 8) return FALSE;
     if (IsBadReadPtr((BYTE *)pawn + F.Location, 12)) return FALSE;
     float *pl = (float *)((BYTE *)pawn + F.Location);
-    float *wl = NULL;
-    if (wand && cgLiveObject(wand) && !IsBadReadPtr((BYTE *)wand + F.Location, 12))
-        wl = (float *)((BYTE *)wand + F.Location);
-    if (wl && hp3lumos::wandLocIsTip(pl, wl)) {
-        // The wand actor's own Location is believable: trust it above any
-        // estimate (a cutscene or a stock-positioned wand knows best).
-        out[0] = wl[0]; out[1] = wl[1]; out[2] = wl[2];
-        return TRUE;
-    }
-    // v73: the true wand tip in the pawn's facing frame (actor Rotation yaw;
-    // the camera pitch tilts the raised arm, clamped so aiming at the feet
-    // cannot bury the glow). The v72 hardware log's wand Location always
-    // equals the pawn's (dZ=0) - an unpositioned attached actor - so this
-    // estimate is what every ride actually uses.
-    if (F.Rotation > 0 && !IsBadReadPtr((BYTE *)pawn + F.Rotation, 12)) {
-        int yaw   = *(int *)((BYTE *)pawn + F.Rotation + 4);
-        int pitch = (p >= 0 && p < 8) ? playerCamPitch(p) : 0;
-        hp3lumos::wandTipForView(pl, yaw, pitch, g_lumosWandForward,
-                                 g_lumosWandUp, out);
-        return TRUE;
-    }
-    hp3lumos::wandTipFor(pl, wl, out);   // v71 fallback: hand height, no yaw
+    // The very same per-player camera yaw/pitch used by fireCast. Do not fall
+    // back to pawn Rotation or trust a plausible wand Actor.Location: either
+    // can agree with a stale estimate while disagreeing with the actual v74
+    // spell spawn (the supplied log measured (-89,10,33), not (-86,10,50)).
+    hp3lumos::wandTipForView(pl, playerCamYaw(p), playerCamPitch(p),
+                             g_lumosWandForward, g_lumosWandUp, out);
     return TRUE;
+}
+
+// Move a visual Lumos actor, but never leave a failed SetLocation unchecked.
+// First trust the native's bool AND verify its Location. A raw Location write
+// is the last resort only when all three collision flags are resolved and off,
+// so it cannot desynchronise the collision octree for a live blocker.
+static BOOL lumosSetVisualLocation(void *actor, int p, const float tip[3],
+                                   const char *kind)
+{
+    if (!actor || !tip || F.Location <= 0 ||
+        IsBadWritePtr((BYTE *)actor + F.Location, 12)) return FALSE;
+    float *loc = (float *)((BYTE *)actor + F.Location);
+    BOOL nativeOK = g_execSetLocation && nativeSetLocation(actor, tip);
+    if (nativeOK &&
+        fabsf(loc[0] - tip[0]) < 2.0f &&
+        fabsf(loc[1] - tip[1]) < 2.0f &&
+        fabsf(loc[2] - tip[2]) < 2.0f)
+        return TRUE;
+
+    BOOL collide = TRUE, blockActors = TRUE, blockPlayers = TRUE;
+    BOOL allCollisionFieldsResolved =
+        g_offbCollideActors > 0 && g_maskbCollideActors &&
+        g_offbBlockActors > 0 && g_maskbBlockActors &&
+        g_offbBlockPlayers > 0 && g_maskbBlockPlayers;
+    BOOL safeRawWrite = allCollisionFieldsResolved &&
+        readLumosCollisionBits(actor, &collide, &blockActors, &blockPlayers) &&
+        !collide && !blockActors && !blockPlayers;
+    static BOOL sRawSaid[8] = { FALSE, FALSE, FALSE, FALSE,
+                                FALSE, FALSE, FALSE, FALSE };
+    static BOOL sUnsafeSaid[8] = { FALSE, FALSE, FALSE, FALSE,
+                                   FALSE, FALSE, FALSE, FALSE };
+    int slot = (p >= 0 && p < 8) ? p : 0;
+    if (safeRawWrite) {
+        memcpy(loc, tip, 12);
+        if (!sRawSaid[slot]) {
+            sRawSaid[slot] = TRUE;
+            logf_("  [lumos] v75 P%d %s SetLocation %s/readback failed; "
+                  "verified collision-off, using Location-only fallback",
+                  p, kind ? kind : "visual", nativeOK ? "" : "call");
+        }
+        return fabsf(loc[0] - tip[0]) < 2.0f &&
+               fabsf(loc[1] - tip[1]) < 2.0f &&
+               fabsf(loc[2] - tip[2]) < 2.0f;
+    }
+    if (!sUnsafeSaid[slot]) {
+        sUnsafeSaid[slot] = TRUE;
+        logf_("  [lumos] v75 P%d %s SetLocation failed/readback missed "
+              "(native=%d, collision flags unresolved or enabled); no unsafe "
+              "Location write", p, kind ? kind : "visual", nativeOK ? 1 : 0);
+    }
+    return FALSE;
 }
 
 // Stock TurnOn spawns the glow at the light's CURRENT Location, so the light
@@ -10625,7 +10678,7 @@ static void lumosSeedLightAtTip(int p, void *pawn, void *wand, void *light)
     if (IsBadReadPtr((BYTE *)light + F.Location, 12)) return;
     float tip[3];
     if (!lumosTipOf(p, pawn, wand, tip)) return;
-    nativeSetLocation(light, tip);
+    lumosSetVisualLocation(light, p, tip, "light-seed");
 }
 
 // v71: carry the light AND every tracked glow onto the wand tip - the ride
@@ -10661,8 +10714,8 @@ static void lumosRideToTip(int p, void *pawn, void *wand, void *light, DWORD now
             logf_("  [lumos] v73 P%d light is NOT at the wand tip any more - "
                   "the mod's ride resumes", p);
         }
-        if (!atTip && g_execSetLocation) {
-            nativeSetLocation(light, tip);
+        if (!atTip && g_execSetLocation &&
+            lumosSetVisualLocation(light, p, tip, "light-ride")) {
             memcpy(g_lumosRideWrote[p], tip, 12);
             g_lumosRideWroteValid[p] = TRUE;
         }
@@ -10674,10 +10727,122 @@ static void lumosRideToTip(int p, void *pawn, void *wand, void *light, DWORD now
         void *fx = g_lumosGlow[p][g];
         if (!fx || !cgLiveObject(fx) || IsBadReadPtr((BYTE *)fx + F.Location, 12))
             continue;
+        if (!lumosFXOwnedByLight(fx, light)) {
+            g_lumosGlow[p][g] = NULL;    // foreign/stale pointer: never ride it
+            continue;
+        }
         float *fl = (float *)((BYTE *)fx + F.Location);
         if (hp3lumos::lightNeedsRide(fl, tip) && g_execSetLocation)
-            nativeSetLocation(fx, tip);
+            lumosSetVisualLocation(fx, p, tip, "glow-ride");
     }
+}
+
+// Stop only this companion's light before clearing an FX pointer that cannot
+// safely be isolated. This prevents its next stock wand Tick/TurnOff from
+// moving or destroying the other player's particle actor.
+static void lumosQuarantineForeignGlow(int p, void *light, void *fx,
+                                       const char *reason)
+{
+    if (p <= 0 || p >= 8 || !light) return;
+    lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
+                            g_lightBrightIsFloat,
+                            g_lightRadiusInnerIsFloat, FALSE, TRUE);
+    // The old FX may belong to another light; clear only our Particles field.
+    lumosSetLightParticles(light, NULL);
+    lumosDropGlows(p, TRUE, light);     // destroys only FX verified as ours
+    g_lumosLightOn[p] = FALSE;
+    g_lumosLightStock[p] = FALSE;
+    g_lumosLightDead[p] = TRUE;        // one safe attempt per Lumos window
+    logf_("  [lumos] v75 P%d quarantined foreign glow=%p; companion light "
+          "turned off without modifying it (%s)",
+          p, fx, reason ? reason : "ownership could not be verified");
+}
+
+// Validate/repair a companion's Particles pointer before it enters the ride
+// list. If it is shared or owned by another actor, replace it with a same-class
+// FX owned by this light. Never move or destroy the foreign actor; if spawning
+// or ownership verification fails, safely turn this light off and detach it.
+static void *lumosEnsurePrivateGlow(int p, void *pawn, void *wand, void *light,
+                                    void *fx, void *pw[8], int numP)
+{
+    if (p <= 0 || p >= 8 || !light || !fx || !cgLiveObject(fx)) return NULL;
+    void *owner = NULL;
+    BOOL ownerKnown = lumosFXOwner(fx, &owner);
+    BOOL shared = FALSE;
+    for (int q = 0; q < numP && q < 8; q++) {
+        if (q == p || !pw[q]) continue;
+        for (int g = 0; g < LUMOS_MAX_GLOW; g++)
+            if (g_lumosGlow[q][g] == fx) shared = TRUE;
+        void *otherLight = lumosLightOf(q, pw[q]);
+        if (otherLight && otherLight != light &&
+            lumosParticlesOf(otherLight) == fx) shared = TRUE;
+    }
+    if (ownerKnown && owner == light && !shared) return fx;
+
+    // The old pointer may belong to the lead or another companion. Remove it
+    // from this player's private ride/teardown list without touching the actor.
+    for (int g = 0; g < LUMOS_MAX_GLOW; g++)
+        if (g_lumosGlow[p][g] == fx) g_lumosGlow[p][g] = NULL;
+
+    static void *sLastForeign[8] = { NULL };
+    char fxName[96];
+    if (sLastForeign[p] != fx) {
+        sLastForeign[p] = fx;
+        logf_("  [lumos] v75 P%d Particles ownership mismatch: Light=%p "
+              "Particles=%p Owner=%p shared=%d (%s); isolating the glow",
+              p, light, fx, ownerKnown ? owner : NULL, shared ? 1 : 0,
+              objName(fx, fxName, sizeof(fxName)));
+    }
+    if (!g_lumosGlowFX || !g_execSpawn) {
+        lumosQuarantineForeignGlow(p, light, fx, "FX spawning disabled/unavailable");
+        return NULL;
+    }
+
+    void *cls = cgClassOf(fx);
+    CgClass *info = cls ? cgClassInfo(cls) : NULL;
+    if (!cls || !info || !info->isActor) {
+        logf_("  [lumos] v75 P%d cannot clone foreign glow %s: class is not "
+              "verified as an Actor", p, objName(fx, fxName, sizeof(fxName)));
+        lumosQuarantineForeignGlow(p, light, fx, "FX class is not a verified Actor");
+        return NULL;
+    }
+    float tip[3];
+    if (!lumosTipOf(p, pawn, wand, tip)) {
+        lumosQuarantineForeignGlow(p, light, fx, "camera cast origin unavailable");
+        return NULL;
+    }
+    int rot0[3] = { 0, 0, 0 };
+    void *privateFX = spawnFX(light, cls, light, tip, rot0);
+    if (!privateFX || !cgLiveObject(privateFX) ||
+        !lumosFXOwnedByLight(privateFX, light)) {
+        if (lumosFXOwnedByLight(privateFX, light)) destroyActorFX(privateFX);
+        logf_("  [lumos] v75 P%d private glow spawn/Owner verification failed "
+              "(new=%p expected Owner=%p); foreign FX left untouched",
+              p, privateFX, light);
+        lumosQuarantineForeignGlow(p, light, fx, "private spawn/Owner verification failed");
+        return NULL;
+    }
+    BOOL emissionOK = lumosSetFXEmit(privateFX, TRUE);
+    lumosSetLightParticles(light, privateFX);
+    void *assignedFX = lumosParticlesOf(light);
+    if (assignedFX != privateFX || !lumosFXOwnedByLight(assignedFX, light)) {
+        // The property write did not stick. Do not keep a detached actor that
+        // the stock Tick cannot reach.
+        lumosSetLightParticles(light, NULL);
+        if (lumosFXOwnedByLight(privateFX, light)) destroyActorFX(privateFX);
+        logf_("  [lumos] v75 P%d private Particles assignment did not verify "
+              "(expected %p, read %p); foreign FX left untouched",
+              p, privateFX, assignedFX);
+        lumosQuarantineForeignGlow(p, light, fx, "private Particles assignment failed");
+        return NULL;
+    }
+    lumosTrackGlow(p, privateFX, light);
+    sLastForeign[p] = NULL;
+    logf_("  [lumos] v75 P%d private glow attached: FX=%p Owner=%p "
+          "Particles=%p emission=%s tip=(%.0f %.0f %.0f); old FX not modified",
+          p, privateFX, light, lumosParticlesOf(light),
+          emissionOK ? "on" : "unresolved", tip[0], tip[1], tip[2]);
+    return privateFX;
 }
 
 // v71: retire a mod-owned light completely - the stock teardown (TurnOff
@@ -10689,17 +10854,24 @@ static void lumosRetireLight(int p, void *light, DWORD ageMs, const char *why)
 {
     BOOL stock = g_lumosLightStock[p];
     if (light && cgLiveObject(light)) {
-        if (stock && g_fnLumosTurnOff && g_ProcessEvent) {
-            callFn(light, g_fnLumosTurnOff, "LumosLight.TurnOff [v71 retire]");
+        void *particles = lumosParticlesOf(light);
+        BOOL particleOwnerSafe = !particles || lumosFXOwnedByLight(particles, light);
+        if (stock && g_fnLumosTurnOff && g_ProcessEvent && particleOwnerSafe) {
+            callFn(light, g_fnLumosTurnOff, "LumosLight.TurnOff [v75 retire]");
         } else {
             // stock TurnOff order: bLumosOn=False FIRST (the wand Tick
-            // stops riding the light), then the particles are destroyed.
+            // stops riding the light), then this light's own particles retire.
+            // If Particles is foreign, avoid the stock script: it may destroy
+            // the other player's FX. Turn off only this light and clear its
+            // pointer; ownership-safe teardown below handles our own glows.
             lumosApplyLightRegister(light, hp3lumos::stockLumosLightOff(),
                                     g_lightBrightIsFloat,
                                     g_lightRadiusInnerIsFloat, FALSE, TRUE);
+            if (particles && !particleOwnerSafe)
+                lumosSetLightParticles(light, NULL);
         }
     }
-    lumosDropGlows(p, TRUE);
+    lumosDropGlows(p, TRUE, light);
     if (light) lumosSetLightParticles(light, NULL);
     g_lumosLightOn[p]    = FALSE;
     g_lumosLightStock[p] = FALSE;
@@ -10742,13 +10914,14 @@ static void lumosHealLeadLight(int p, void *pawn, void *wand, void *light,
     float tip[3];
     if (!lumosTipOf(p, pawn, wand, tip)) return;
     if (!g_execSetLocation) return;
-    nativeSetLocation(light, tip);
+    if (!lumosSetVisualLocation(light, p, tip, "lead-light-heal")) return;
     g_lumosLightMovedAt[p] = now;
     memcpy(g_lumosRideWrote[p], tip, 12);
     g_lumosRideWroteValid[p] = TRUE;
     void *fx = lumosParticlesOf(light);
-    if (fx && !IsBadReadPtr((BYTE *)fx + F.Location, 12))
-        nativeSetLocation(fx, tip);
+    if (fx && lumosFXOwnedByLight(fx, light) &&
+        !IsBadReadPtr((BYTE *)fx + F.Location, 12))
+        lumosSetVisualLocation(fx, p, tip, "lead-glow-heal");
     static BOOL sSaid[8] = { FALSE, FALSE, FALSE, FALSE,
                              FALSE, FALSE, FALSE, FALSE };
     if (!sSaid[p]) {
@@ -10798,7 +10971,7 @@ static void lumosStatus(int numP, void *pw[8], DWORD now)
     static DWORD sStatusAt = 0;
     if ((DWORD)(now - sStatusAt) < 1000) return;
     sStatusAt = now;
-    logf_("  [lumos] v73 window: %.1fs left, triggers=%d walls=%d blockers=%d",
+    logf_("  [lumos] v75 window: %.1fs left, triggers=%d walls=%d blockers=%d",
           g_lumosState.remainingSeconds(now), g_lumosTriggersN,
           g_lumosWallsN, g_lumosBlockersN);
     for (int p = 0; p < numP; p++) {
@@ -10816,6 +10989,9 @@ static void lumosStatus(int numP, void *pw[8], DWORD now)
                      !IsBadReadPtr((BYTE *)light + F.Location, 12))
                     ? (float *)((BYTE *)light + F.Location) : NULL;
         void *fx = NULL; float *fl = NULL;
+        void *particles = lumosParticlesOf(light);
+        void *fxOwner = NULL;
+        BOOL fxOwnerKnown = FALSE;
         for (int g = 0; g < LUMOS_MAX_GLOW; g++) {
             if (g_lumosGlow[p][g] && cgLiveObject(g_lumosGlow[p][g])) {
                 fx = g_lumosGlow[p][g];
@@ -10824,6 +11000,7 @@ static void lumosStatus(int numP, void *pw[8], DWORD now)
                 break;
             }
         }
+        fxOwnerKnown = lumosFXOwner(fx, &fxOwner);
         float dLight = -1.0f;
         if (ll && pl)
             dLight = (float)sqrt((ll[0]-pl[0])*(ll[0]-pl[0]) +
@@ -10840,14 +11017,16 @@ static void lumosStatus(int numP, void *pw[8], DWORD now)
                                (ll[2]-tip[2])*(ll[2]-tip[2]));
         logf_("    P%d %s pawn=(%.0f %.0f %.0f) wand=%p at (%.0f %.0f %.0f) "
               "light=%p at (%.0f %.0f %.0f) dPawn=%.0f tip=(%.0f %.0f %.0f) "
-              "dTip=%.0f on=%d stock=%d glow=%p at (%.0f %.0f %.0f) riding=%s",
+              "dTip=%.0f on=%d stock=%d Particles=%p glow=%p Owner=%p/%s "
+              "at (%.0f %.0f %.0f) riding=%s",
               p, objName(pawn, nb, sizeof(nb)),
               pl ? pl[0] : 0.f, pl ? pl[1] : 0.f, pl ? pl[2] : 0.f,
               wand, wl ? wl[0] : 0.f, wl ? wl[1] : 0.f, wl ? wl[2] : 0.f,
               light, ll ? ll[0] : 0.f, ll ? ll[1] : 0.f, ll ? ll[2] : 0.f,
               dLight, tip[0], tip[1], tip[2], dTip,
               g_lumosLightOn[p] ? 1 : 0,
-              g_lumosLightStock[p] ? 1 : 0, fx,
+              g_lumosLightStock[p] ? 1 : 0, particles, fx, fxOwner,
+              fxOwnerKnown && fxOwner == light ? "self" : "FOREIGN/unknown",
               fl ? fl[0] : 0.f, fl ? fl[1] : 0.f, fl ? fl[2] : 0.f,
               ((DWORD)(now - g_lumosLightMovedAt[p]) < 1000) ? "yes" : "NO");
     }
@@ -10972,6 +11151,47 @@ static BOOL lumosApplyActorOpen(void *obj, BYTE origBits, signed char *coll,
     logf_("  [lumos] v73 closed %s #%d (pristine collision bits restored)",
           what, idx);
     return TRUE;
+}
+
+// Open a blocking Lumos-trigger receiver when an armed source's Event matches
+// that receiver's Tag. The receiver may be outside its own fDistanceCheck or
+// fZDistanceCheck; the stock event link, not receiver-local proximity, is the
+// relevant gate condition for this HP3 layout.
+static void lumosOpenLinkedGateReceivers(int sourceIndex, void *source,
+                                         BOOL lumosActive)
+{
+    if (!g_lumosGateOpen || !lumosActive || !source ||
+        sourceIndex < 0 || sourceIndex >= g_lumosTriggersN ||
+        sourceIndex >= LUMOS_MAX_ACTORS || g_offEvent <= 0 ||
+        IsBadReadPtr((BYTE *)source + g_offEvent, 4)) return;
+    DWORD sourceEvent = *(DWORD *)((BYTE *)source + g_offEvent);
+    if (!sourceEvent || g_offTag <= 0) return;
+
+    for (int t = 0; t < g_lumosTriggersN && t < LUMOS_MAX_ACTORS; t++) {
+        void *receiver = g_lumosTriggers[t];
+        if (!receiver || receiver == source || !cgLiveObject(receiver) ||
+            cgDeleted(receiver) || !lumosClassVerified(receiver, FALSE) ||
+            IsBadReadPtr((BYTE *)receiver + g_offTag, 4)) continue;
+        DWORD receiverTag = *(DWORD *)((BYTE *)receiver + g_offTag);
+        if (!hp3lumos::linkedGateShouldOpen(lumosActive, TRUE, receiverTag,
+                                            sourceEvent, TRUE)) continue;
+
+        BOOL collide = FALSE, blockActors = FALSE, blockPlayers = FALSE;
+        if (!readLumosCollisionBits(receiver, &collide, &blockActors,
+                                    &blockPlayers)) continue;
+        BOOL blocks = (blockActors || blockPlayers) ? TRUE : FALSE;
+        if (!hp3lumos::linkedGateShouldOpen(lumosActive, TRUE, receiverTag,
+                                            sourceEvent, blocks)) continue;
+        if (g_lumosGateColl[t] == 0) continue;
+
+        if (g_lumosGateColl[t] < 0) {
+            g_lumosGateOrig[t] = hp3lumos::packWallBits(
+                collide != FALSE, blockActors != FALSE, blockPlayers != FALSE);
+            g_lumosGateColl[t] = 1;       // linked receiver, currently solid
+        }
+        lumosApplyActorOpen(receiver, g_lumosGateOrig[t], &g_lumosGateColl[t],
+                            TRUE, "linked gate", t, hp3lumos::LinkedGateOpenKey);
+    }
 }
 
 // v71: at 1 Hz while a player stands at a revealed wall, name every blocking
@@ -11529,7 +11749,7 @@ static void lumosTick(void)
                 g_lumosLightOn[p] = FALSE;
                 g_lumosLightStock[p] = FALSE;
                 g_lumosLightDead[p] = TRUE;
-                lumosDropGlows(p, FALSE);   // stock TurnOff destroyed the FX
+                lumosDropGlows(p, FALSE, light);   // stock TurnOff destroyed the FX
                 logf_("  [lumos] v69 P%d light went cold on its own (stock "
                       "Tick auto-off after fLumosTimeToTurnOff) - one shot "
                       "per cast", p);
@@ -11629,11 +11849,19 @@ static void lumosTick(void)
                         // the light's Particles property, so the ride below
                         // can carry it and the teardown can destroy it (v70
                         // kept ONE pointer per player and orphaned the rest).
-                        lumosTrackGlow(p, lumosParticlesOf(light));
-                        logf_("  [lumos] v69 P%d TheLumosLight turned ON via the "
-                              "STOCK TurnOn script (register + Particles glow + "
-                              "Tick armed by the game's own bytecode) glow=%p",
-                              p, g_lumosGlow[p][0]);
+                        void *fx = lumosEnsurePrivateGlow(p, pawn, wand, light,
+                                                          lumosParticlesOf(light),
+                                                          pw, numP);
+                        lumosTrackGlow(p, fx, light);
+                        if (!fx && g_lumosLightDead[p]) {
+                            logf_("  [lumos] v75 P%d companion light disabled: "
+                                  "its stock FX could not be made private", p);
+                            continue;
+                        }
+                        logf_("  [lumos] v75 P%d TheLumosLight turned ON via the "
+                              "STOCK TurnOn script (register + private Particles "
+                              "glow + Tick armed by game bytecode) glow=%p",
+                              p, fx);
                         continue;   // stock path owns this light from here
                     }
                     // The stock script did NOT engage (its gate variable
@@ -11677,7 +11905,11 @@ static void lumosTick(void)
                 // light + every tracked glow onto the wand tip. This is the
                 // "wand glow" the field report asked for: stock's own ride
                 // never reaches a companion, so the mod carries them.
-                lumosTrackGlow(p, lumosParticlesOf(light));
+                void *fx = lumosEnsurePrivateGlow(p, pawn, wand, light,
+                                                  lumosParticlesOf(light),
+                                                  pw, numP);
+                lumosTrackGlow(p, fx, light);
+                if (!g_lumosLightOn[p]) continue; // ownership quarantine above
                 lumosRideToTip(p, pawn, wand, light, now);
                 // v68: bLumosOn LAST, re-asserted every frame while the mod
                 // owns the light AND a live glow is attached (stock keeps
@@ -11685,7 +11917,7 @@ static void lumosTick(void)
                 // the glow because the stock wand Tick dereferences the
                 // light's Particles in UpdateLocation every frame while it
                 // reads True.
-                BOOL glowLive = lumosAnyGlowLive(p);
+                BOOL glowLive = lumosAnyGlowLive(p, light);
                 if (g_offLumosBOn > 0 && g_maskLumosBOn && !g_lumosLightStock[p] && glowLive)
                     lumosWriteBit(light, g_offLumosBOn, g_maskLumosBOn, TRUE);
                 // v68 fallback: the visible wand glow - stock TurnOn spawns
@@ -11702,12 +11934,21 @@ static void lumosTick(void)
                         int rot0[3] = { 0, 0, 0 };
                         void *fx = spawnFX(light, g_clsLumosLightFX, light, ll, rot0);
                         if (fx) {
-                            lumosSetFXEmit(fx, TRUE);            // EnableEmission(True)
-                            lumosSetLightParticles(light, fx);   // Particles = glow
-                            lumosTrackGlow(p, fx);
+                            BOOL emitOK = lumosSetFXEmit(fx, TRUE); // EnableEmission(True)
+                            lumosSetLightParticles(light, fx);       // Particles = glow
+                            if (lumosParticlesOf(light) == fx &&
+                                lumosFXOwnedByLight(fx, light))
+                                lumosTrackGlow(p, fx, light);
+                            else {
+                                lumosSetLightParticles(light, NULL);
+                                if (lumosFXOwnedByLight(fx, light))
+                                    destroyActorFX(fx);
+                                fx = NULL;
+                            }
                             logf_("  [lumos] v69 P%d wand glow spawned + attached "
-                                  "(fallback) (stock LumosLightFX, owned by the "
-                                  "light, stored in its Particles) -> %p", p, fx);
+                                  "(fallback) (stock LumosLightFX, verified Owner/"
+                                  "Particles=%p emission=%s) -> %p", p,
+                                  lumosParticlesOf(light), emitOK ? "on" : "unresolved", fx);
                         }
                     }
                 }
@@ -11735,7 +11976,7 @@ static void lumosTick(void)
                 lumosWriteBit(pawn, g_offPawnLumosOn, g_maskPawnLumosOn, FALSE);
             if (!g_lumosLightOn[p]) continue;
             void *light = lumosLightOf(p, pawn);
-            lumosTrackGlow(p, light ? lumosParticlesOf(light) : NULL);
+            lumosTrackGlow(p, light ? lumosParticlesOf(light) : NULL, light);
             lumosRetireLight(p, light, (DWORD)(now - g_lumosLightOnAt[p]),
                              "Lumos window closed");
         }
@@ -11848,25 +12089,16 @@ static void lumosTick(void)
             if (nearP < 0) nearP = p;
         }
         if (nearP < 0) continue;
-        trigArmed[t] = TRUE;                    // v71: a player is at this wall
+        trigArmed[t] = TRUE;                    // source Lumos trigger is armed
+        lumosOpenLinkedGateReceivers(t, tr, lumosActive);
         // ---------------------------------------------------------------
-        // v73: THE GATE ITSELF. If this armed lumos trigger ACTOR physically
-        // blocks, it is the invisible gate of its secret - the v72 hardware
-        // pelog proves the shape (HPCharacter.Bump other=...
-        // LumosSparklesTrigger5 every frame while the player pushes into the
-        // passage). Stock single-player turns that collision off when the
-        // player arrives lumos-lit; on HP3 the trigger's own event is a
-        // no-op (the Event chain ends at an empty receiver - the v70/v72
-        // logs), so nothing ever opened it. Open it here, the moment a
-        // tracked player stands inside its own radius (stock's
-        // InLumosRadius key, the designer's "you are at this wall"), with
-        // the same octree-safe SetCollision native and the same latch the
-        // walls around it get. bCollideActors on a gate that IS the wall
-        // carries no event wiring (Event is empty; Tag is the wire's), so
-        // silencing it cannot break the level.
+        // Direct case: a blocking Lumos-trigger actor may itself be the
+        // passage gate. The separate Event->Tag receiver is handled above and
+        // intentionally does not need this receiver's own radius to be armed.
         // ---------------------------------------------------------------
-        if (g_lumosGateOpen && g_lumosGateColl[t] != 0 && t < LUMOS_MAX_ACTORS) {
-            if (g_lumosGateColl[t] == -1) {      // first armed look at it
+        if (g_lumosGateOpen && g_lumosGateColl[t] != 0 &&
+            hp3lumos::gateShouldOpen(lumosActive != FALSE, TRUE, TRUE)) {
+            if (g_lumosGateColl[t] < 0) {      // first armed look at direct gate
                 BOOL gc = FALSE, gba = FALSE, gbp = FALSE;
                 if (readLumosCollisionBits(tr, &gc, &gba, &gbp)) {
                     g_lumosGateOrig[t] = hp3lumos::packWallBits(
@@ -11874,11 +12106,9 @@ static void lumosTick(void)
                     g_lumosGateColl[t] = (gba || gbp) ? 1 : -2;
                 }
             }
-            if (g_lumosGateColl[t] == 1 &&
-                hp3lumos::gateShouldOpen(TRUE, TRUE, TRUE)) {
+            if (g_lumosGateColl[t] == 1)
                 lumosApplyActorOpen(tr, g_lumosGateOrig[t], &g_lumosGateColl[t],
                                     TRUE, "gate", t, 5);
-            }
         }
         if (!g_lumosTriggerEvents) continue;
         if (g_lumosTrigFired[t] == 1) continue;
@@ -12961,9 +13191,17 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             // v73: the gate, and the wand-tip anchor.
             g_lumosGateOpen  = GetPrivateProfileIntA("lumos", "GateOpen", 1, ini) != 0;
             int wf = GetPrivateProfileIntA("lumos", "WandForward", -1, ini);
-            if (wf >= 0)  g_lumosWandForward = (float)(wf > 300 ? 300 : wf);
             int wu = GetPrivateProfileIntA("lumos", "WandUp", -1, ini);
-            if (wu >= 0)  g_lumosWandUp      = (float)(wu > 200 ? 200 : wu);
+            // Existing installs keep their INI when only the DLL is updated.
+            // 88/62 were v73's old actor-yaw estimate, not v74's cast origin;
+            // recognize that exact prior default and migrate to 90/45.
+            if (hp3lumos::isLegacyV73WandTipConfig(wf, wu)) {
+                logf_("[lumos] v75 migrated legacy WandForward=88 WandUp=62 "
+                      "to the v74 camera cast origin (90/45)");
+            } else {
+                if (wf >= 0) g_lumosWandForward = (float)(wf > 300 ? 300 : wf);
+                if (wu >= 0) g_lumosWandUp      = (float)(wu > 200 ? 200 : wu);
+            }
         }
         logf_("hp3mod.ini: lumos TriggerEvents=%d GlowFX=%d OpenRadius=%.0f "
               "PlayerRadius=%.0f LatchOpen=%d WandGlow=%d UnhideLight=%d "

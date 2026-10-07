@@ -24,9 +24,36 @@ A proxy `d3d8.dll` loads alongside the game, hooks the renderer, and drives the 
 
 Windows loads a DLL from the application directory before the one in `System32`, so that is the whole install. Uninstall = delete the two files (plus `hp3mod.log` if present).
 
-> Check the build: open `system\hp3mod.log` — line 2 must say `build v74`.
+> Check the build: open `system\hp3mod.log` — line 2 must say `build v75`.
 
-### v71 Lumos for P2/P3, round 5: the wall is opened by what blocks, and the glow rides the wand
+### v75 Lumos fix: open the linked receiver and put each glow on its own wand
+
+The supplied v74 hardware log shows `LumosTrigger0.Event ==
+LumosSparklesTrigger5.Tag == 0x8D20`. `LumosSparklesTrigger5` is itself a
+blocking gate, but it can sit outside the source trigger's radius and outside
+its own Z-limited trigger check. v75 now opens a blocking Lumos-trigger
+receiver as soon as a player's armed source trigger has an `Event` matching
+the receiver's `Tag`; the receiver does not need local proximity. The direct
+gate and brush/proxy blocker paths remain in place.
+
+The same log measured a cast origin of `pawn + camDir*90 + 45Z` (world offset
+`(-89, 10, 33)` in the logged pose). Lumos now uses `playerCamYaw()` and the
+same full `playerCamPitch()` as `fireCast`, without its former pawn-yaw
+substitution or second pitch clamp. The defaults are `WandForward=90` and
+`WandUp=45`; an existing INI containing the prior `88/62` pair is migrated
+automatically. The light's `Particles` pointer and each FX `Owner` are checked
+before a companion glow is moved or destroyed. A shared/foreign FX is left
+untouched and replaced with a private particle owned by that companion's own
+light. If isolation cannot be verified, only that companion's light is shut
+off for the current Lumos window. `SetLocation`'s return value is verified
+against the actor's read-back position; a raw `Location` fallback is used only
+when all collision bits are resolved and disabled.
+
+Regression tests cover the `0x8D20` Event/Tag link with a receiver outside its
+own radius, source-armed/blocking conditions, camera yaw/pitch, and the exact
+90/45 cast origin. Run them with `bash tests/run.sh`.
+
+### v71 Lumos for P2/P3, round 5: the wall is opened by what blocks, and the glow rides the wand (historical baseline; see v75 above)
 
 The v70 field report (2 players, P2 = Hermione, HP3_InsideHub gargoyle6) with
 the **full v70 log attached**: "Lumos still doesn't let Player 2 and 3 pass
@@ -180,8 +207,10 @@ Three defects, all of them v72's:
    cylinder overlaps the pawn's measured ~85 units out of reach.
 
 3. **The wand tip was pawn + 45Z = the head** (the pawn's Location is at its
-   feet). The game itself measures the true cast origin on every spell:
-   88 forward, 62 up, in the pawn's facing frame (the v18/v19 spawn learn).
+   feet). v73 then used an older v18/v19 `88 forward / 62 up` learn as its
+   estimate, in pawn-facing coordinates. The supplied v74 hardware log later
+   proved the actual cast origin is camera-relative `pawn + camDir*90 + 45Z`;
+   v75 corrects the Lumos anchor to that formula (see the current fix above).
 
 v73 fixes them exactly:
 
@@ -200,15 +229,17 @@ v73 fixes them exactly:
    nearest admitted blocker with its horizontal/vertical separations instead
    of asserting "level BSP".
 
-3. **The glow rides the cast anchor.** Light and glows follow
-   `wandTipForView`: 88 forward / 62 up, pitched with the camera clamped at
-   ±45°, in the pawn's own facing frame (a believable wand-actor Location
-   still wins). The ride stands down only when another writer demonstrably
+3. **The glow rides the cast anchor.** In the v73 baseline, light and glows
+   followed `wandTipForView`: 88 forward / 62 up, pawn-facing, with a second
+   ±45° pitch clamp (and a believable wand-actor Location took precedence).
+   v75 replaces that estimate with the exact per-player camera-origin formula
+   and validates private FX ownership. The ride stands down only when another writer demonstrably
    carries the light *at that tip* — v72 stood down for any foreign movement,
    and the mover was the +45Z float itself, freezing the glows where the
    stock spawn dropped them. Glows now ride even while the light stands down.
 
-New `[lumos]` knobs: `GateOpen=1`, `WandForward=88`, `WandUp=62`. New
+Current `[lumos]` defaults: `GateOpen=1`, `WandForward=90`, `WandUp=45`
+(v75; old `88/62` INIs auto-migrate). New
 diagnostics: the 1 Hz window line gains `tip=(...) dTip=<dist>` per player —
 on-screen proof the light sits on the wand — and the at-wall dump resolves a
 lumos actor against the gate cache (`gate[5] open`) instead of `NOT CACHED`.
@@ -561,8 +592,9 @@ tests/run.sh        host-side recovery, aim geometry, and adapter regression tes
 - **v67/v68/v69/v70** carry the Lumos replication forward: the stock `LumosLight.TurnOn` script is called on every companion's own `TheLumosLight` (register, glow particles, `OnLumosOn` broadcast, stock 30 s auto-off tick), the wall trigger's `Event` is dispatched through the engine's own script `TriggerEvent`, empty-`Trigger` receivers relay their own `Event` one hop (HP3 chains `LumosTrigger -> LumosSparklesTrigger -> wall`), and every level-side field is resolved by walking the live objects' own class chains with a 1 Hz retry instead of a menu-time one-shot.
 - **v71** fixes the v70 field report ("no pass through walls, light underneath, no wand glow, heavy light stacked on the main character") from the attached v70 log. (1) **Walls**: HP3_InsideHub has no `Event -> wall.Tag` linkage at all — the trigger's Event is carried only by a sparkles trigger whose own Event is empty — so the mod stopped deriving the linkage and instead opens **whatever blocks** near a trigger a player is standing inside (`OpenRadius`, stock's own `fDistanceCheck`) or right next to that player (`PlayerRadius`), class-agnostically through a per-level blocker cache and the octree-safe `SetCollision` native, **latched open for the level** like stock. The scan no longer caches actors of the previous level. (2) **Light**: the companion light and every glow attached to it now ride onto a wand-tip anchor every frame (stock's own wand ride never reaches a companion), standing down automatically if the game's ride is carrying the light; up to four glows per player are tracked and destroyed on teardown (v70 orphaned one per re-cast — the "stacked" report), and a mod-owned light is retired on a hard ceiling (the "stuck spell"). (3) **The lead** is never forced visible any more and only has his light's *position* fixed, when it is provably lost or sitting underfoot. Plus a 1 Hz status line with every player's pawn/wand/light/glow position, named open/blocker logging, and an at-wall dump of everything still blocking.
 - **v72** fixes what the v70 log showed about *distance*: a brush blocker's actor origin can sit 290 units from the surface it blocks, so v71's origin-keyed radii both missed the real blocker and had to be too wide to be evidence. Distances are now measured to the **surface** of the actor's collision cylinder; the blocker cache holds every blocking actor of the level (evicting the one furthest from any trigger when full, walked in round-robin slices) instead of pre-filtering by the very test the open rule applies; and the **bump rule** opens whatever a player standing inside an armed Lumos trigger is literally pressed against after 700 ms of pushing without progress — no class token, no cache, no linkage. It also accepts **touch-only volumes** (`TouchOpen`), the `CompanionCorral` shape the v70 pelog shows touching Hermione every frame while the lead walks straight through.
-- **v73** fixes the two v72 symptoms that survived: a lumos-revealed wall still impassable and the companion's light floating above her head. The v72 log itself names the blocking actor while the bump rule claimed "level BSP" — a `LumosSparklesTrigger5` with bit-mask `0x07` streaming `HPCharacter.Bump` events, excluded everywhere by the rule's lumos-family name skip and out of reach of the point-measured "touching" (its origin sits 213 units above the floor). v73 treats a **blocking lumos trigger as the gate of its own secret**: it opens through the octree-safe `SetCollision` native the moment a companion stands inside its trigger radius (`GateOpen`), is admitted by the bump rule (a blocking actor of any class, since the engine cannot Bump air), and is restored exactly like a wall. "Touching" is now **cylinder-vs-cylinder** — the pawn's own radius and half-height count on both axes, so the logged gate measures 0 units away, matching the engine's Bump stream; when nothing touches, the log names the nearest admitted blocker with its separations. And the wand glow anchor becomes the game's own **measured cast origin** (88 forward, 62 up, pawn-faced, camera-pitch clamped at ±45°, `WandForward`/`WandUp` knobs) instead of the head float at +45Z; the ride stands down only when another writer genuinely carries the light at that tip, and the glows ride regardless.
-- **v74** audits every *other* spell path against the v73 defect classes (family excluded by name, point-measured touching, floating anchors, suppressed writers) and verifies them clean end to end: the fire/nudge/aim-glow origin formula is shared, the charged trio's fallback reaches the same endpoint, trigger-family receivers stay Touch-eligible, and per-slot movement pins restore. One genuine same-class flaw fixed: the pending-hit watch delivered at `d <= hitR` with `hitR = CollisionRadius + 40`, ignoring `CollisionHeight` — a spell passing *next to* a tall target (the other "gate shape") waited out the whole 0.9–3.5 s flight window for the forced hit. The watch now also tests the target as the cylinder it is (`hp3lumos::cylindersTouch`, 40-unit skin) and logs `[at the target collision surface]` when that check fires; delivery only arrives earlier, never later, and the deadline force is unchanged. Also: a full `-Wall -Wextra` clang pass over the DLL reports zero correctness warnings, and the v18/v19 spawn-offset learn is documented as evidence-only (the `(88 -0 62)` log remains the proof point for the wand tip).
+- **v73** fixes the two v72 symptoms that survived: a lumos-revealed wall still impassable and the companion's light floating above her head. The v72 log itself names the blocking actor while the bump rule claimed "level BSP" — a `LumosSparklesTrigger5` with bit-mask `0x07` streaming `HPCharacter.Bump` events, excluded everywhere by the rule's lumos-family name skip and out of reach of the point-measured "touching" (its origin sits 213 units above the floor). v73 treats a **blocking lumos trigger as the gate of its own secret**: it opens through the octree-safe `SetCollision` native the moment a companion stands inside its trigger radius (`GateOpen`), is admitted by the bump rule (a blocking actor of any class, since the engine cannot Bump air), and is restored exactly like a wall. "Touching" becomes **cylinder-vs-cylinder** — the pawn's own radius and half-height count on both axes, so the logged gate measures 0 units away, matching the engine's Bump stream; when nothing touches, the log names the nearest admitted blocker with its separations. v73 also *inferred* a wand anchor from the older `(88,0,62)` learn and pawn yaw, adding a second pitch clamp; the supplied v74 hardware log disproved that estimate. v75 replaces it with the camera-relative `pawn + camDir*90 + 45Z` formula and validates per-light glow ownership (see above).
+- **v74** audits every *other* spell path against the v73 defect classes (family excluded by name, point-measured touching, floating anchors, suppressed writers) and verifies them clean end to end: the fire/nudge/aim-glow origin formula is shared, the charged trio's fallback reaches the same endpoint, trigger-family receivers stay Touch-eligible, and per-slot movement pins restore. One genuine same-class flaw fixed: the pending-hit watch delivered at `d <= hitR` with `hitR = CollisionRadius + 40`, ignoring `CollisionHeight` — a spell passing *next to* a tall target (the other "gate shape") waited out the whole 0.9–3.5 s flight window for the forced hit. The watch now also tests the target as the cylinder it is (`hp3lumos::cylindersTouch`, 40-unit skin) and logs `[at the target collision surface]` when that check fires; delivery only arrives earlier, never later, and the deadline force is unchanged. Also: a full `-Wall -Wextra` clang pass over the DLL reports zero correctness warnings, and the v18/v19 spawn-offset learn is evidence-only; v75 corrects the wand-tip evidence to the v74 camera-relative `pawn + camDir*90 + 45Z` cast origin.
+- **v75** fixes both Lumos failures in the supplied v74 log. The armed source trigger's `Event=0x8D20` matches the blocking `LumosSparklesTrigger5.Tag=0x8D20`; that linked receiver now opens through `SetCollision` without requiring a player inside its own radius. The companion wand anchor now matches the actual v74 cast origin `pawn + camDir*90 + 45Z`, using per-player camera yaw/pitch; the shipped `88/62` INIs migrate to `90/45`. Before riding a glow, the code validates that `Light.Particles` is owned by that `Light`; shared/foreign FX are isolated into a private owned effect, and only a verified owner can be moved or destroyed. `SetLocation` is checked both by native return and position read-back, with a raw Location-only fallback gated on all three collision flags being resolved and off. Tests cover the exact `Event==Tag` receiver, source-active/blocking gates, camera-origin math and the v74 scene regression.
 
 ## Disclaimer
 
