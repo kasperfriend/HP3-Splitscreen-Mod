@@ -429,18 +429,23 @@ int main()
     assert(DispatchRetryMs > 0 && DispatchRetryMs <= 5000);
     assert(WallActorNearRadius > 0.0f);
 
-    // 15. v69: the stock Event==Tag linkage is the DEFINITIVE secret-wall
-    //     pairing. LumosTrigger fires TriggerEvent(Event, self, None) and
-    //     the engine dispatches that Event to every actor whose Tag equals
-    //     it - raw 4-byte name-index equality, no distance involved. A
-    //     large wall whose actor centre sits >900 units from its trigger
-    //     failed the v66.5 radius-only pairing and was classified ORDINARY
-    //     (never opened by the SetCollision fallback, silently).
-    assert(wallEventLinksToTrigger(7u, 7u));    // linked
-    assert(!wallEventLinksToTrigger(7u, 8u));   // different names
-    assert(!wallEventLinksToTrigger(0u, 7u));   // wall has no Tag
-    assert(!wallEventLinksToTrigger(7u, 0u));   // trigger has no Event
-    assert(!wallEventLinksToTrigger(0u, 0u));   // neither
+    // 15. v75 regression from the v74 HP3_InsideHub log: the armed source
+    //     LumosTrigger0.Event == 0x8D20 is linked to the BLOCKING receiver
+    //     LumosSparklesTrigger5.Tag == 0x8D20. The receiver sits outside the
+    //     source trigger's radius and its own Z-limited radius is not entered;
+    //     the stock Event->Tag relationship must still make this gate open.
+    const unsigned sourceEvent = 0x8D20u;
+    const unsigned receiverTag = 0x8D20u;
+    assert(wallEventLinksToTrigger(receiverTag, sourceEvent));
+    assert(linkedGateShouldOpen(true, true, receiverTag, sourceEvent, true));
+    assert(!linkedGateShouldOpen(false, true, receiverTag, sourceEvent, true));
+    assert(!linkedGateShouldOpen(true, false, receiverTag, sourceEvent, true));
+    assert(!linkedGateShouldOpen(true, true, receiverTag + 1, sourceEvent, true));
+    assert(!linkedGateShouldOpen(true, true, receiverTag, sourceEvent, false));
+    assert(!linkedGateShouldOpen(true, true, receiverTag, 0u, true));
+    assert(!wallEventLinksToTrigger(0u, sourceEvent));   // receiver has no Tag
+    assert(!wallEventLinksToTrigger(receiverTag, 0u));   // source has no Event
+    assert(!wallEventLinksToTrigger(0u, 0u));
 
     // 16. v69: the exact-token trigger admission gains the decompile's real
     //     placed sparkles class "LumosSparkles" (Triggers/LumosSparkles.uc -
@@ -473,12 +478,9 @@ int main()
     assert(!observedStockAutoOff(false, false, false)); // never lit by mod
     assert(!observedStockAutoOff(false, true, false));  // inconsistent
 
-    // 18. v71: the wand-tip anchor. The field report is "light underneath,
-    //     no wand glow" - v68..v70 parked the light (and its LumosLightFX)
-    //     on the pawn, because stock's baseWand.Tick ride never reached a
-    //     companion wand. The anchor is the wand actor's own Location when
-    //     it is a believable tip, and hand height above the pawn otherwise
-    //     (the game fires its own spells from pawn + 45Z).
+    // 18. v71 diagnostic predicate: an unpositioned/stale wand actor is not
+    //     a reliable anchor. v75 runtime always uses the camera-based v74
+    //     spell origin below, even if a wand Location looks plausible.
     {
         float pawnL[3] = { 100.0f, 200.0f, 300.0f };
         float tip[3] = { 0.0f, 0.0f, 0.0f };
@@ -496,13 +498,10 @@ int main()
         // A wand actor across the level (a stale Location).
         float farAway[3] = { 9000.0f, 9000.0f, 300.0f };
         assert(!wandLocIsTip(pawnL, farAway));
-        // A wand actor at hand height in front of the character: accepted
-        // verbatim - that IS the wand tip.
-        float goodWand[3] = { 118.0f, 196.0f, 344.0f };
-        assert(wandLocIsTip(pawnL, goodWand));
-        wandTipFor(pawnL, goodWand, tip);
-        assert(near(tip[0], 118.0f) && near(tip[1], 196.0f) &&
-               near(tip[2], 344.0f));
+        // A plausible actor location still passes this legacy diagnostic,
+        // but the v75 runtime does NOT treat it as the v74 cast origin.
+        float plausibleWand[3] = { 118.0f, 196.0f, 344.0f };
+        assert(wandLocIsTip(pawnL, plausibleWand));
     }
     // 19. v71: the ride test. Only a light that is actually off the tip is
     //     moved, so a STOCK ride that is working (it keeps the light within
@@ -672,23 +671,30 @@ int main()
         assert(LightRideEpsilon > 1.0f && LightRideEpsilon < 64.0f);
     }
 
-    // 26. v73: POLICY - the gate, the admission rule, the ride, the tip.
+    // 26. v75: POLICY - direct/linked gates, blocker admission, and the
+    //     exact camera-based v74 cast-origin anchor.
     {
-        // THE GATE: a lumos-trigger-family actor only counts as the gate
-        // when it physically BLOCKS (its Event is empty; its Tag is the
-        // wire - the v72 pelog Bump stream names it frame after frame).
+        // DIRECT GATE: a blocking Lumos-trigger actor may itself be opened
+        // by proximity. A linked receiver is tested separately below.
         assert(actorIsLumosGate("LumosSparklesTrigger", true));
         assert(actorIsLumosGate("LumosSparkles", true));
         assert(!actorIsLumosGate("LumosSparklesTrigger", false));
         assert(!actorIsLumosGate("Trigger", true));
         assert(!actorIsLumosGate("GenericColObj", true));
         assert(!actorIsLumosGate("LumosSparklesEmitter", true));
-        // EARLY-OPEN: lumos up AND a player inside the trigger's own
-        // radius AND the actor actually blocking. Anything less stays shut.
+        // EARLY-OPEN: Lumos up AND player in this direct gate's radius AND
+        // actor actually blocking. Anything less stays shut.
         assert(gateShouldOpen(true, true, true));
         assert(!gateShouldOpen(false, true, true));
         assert(!gateShouldOpen(true, false, true));
         assert(!gateShouldOpen(true, true, false));
+        // LINKED RECEIVER GATE: armed source trigger Event == receiver Tag
+        // opens it even without a player inside the receiver's local radius.
+        assert(linkedGateShouldOpen(true, true, 0x8D20u, 0x8D20u, true));
+        assert(!linkedGateShouldOpen(true, false, 0x8D20u, 0x8D20u, true));
+        assert(!linkedGateShouldOpen(true, true, 0x8D20u, 0x8D21u, true));
+        assert(!linkedGateShouldOpen(true, true, 0x8D20u, 0x8D20u, false));
+        assert(LinkedGateOpenKey != 5 && LinkedGateOpenKey != 6);
         // ADMISSION: a BLOCKING actor of ANY class may be opened by the
         // bump rule - the engine cannot Bump against something the pawn is
         // not touching. (This is the whole change: v72 skipped the lumos
@@ -709,96 +715,93 @@ int main()
         assert(!rideStandsDown(true, false));
         assert(!rideStandsDown(false, false));
         assert(!rideStandsDown(false, true));
-        // THE TIP: the game's own measured cast anchor - local (88,0,62).
-        // yaw 0 = +X, yaw 16384 = +Y (UE rotator units, 65536 = 360deg).
+        // THE TIP: v74 fireCast/nudge origin pawn + camDir*90 + 45Z.
+        // yaw 0 = +X, yaw 16384 = +Y; 65536 = 360 degrees.
         float pl[3] = { 100.0f, 200.0f, -300.0f }, tip[3];
         wandTipForView(pl, 0, 0, WandTipForward, WandTipUp, tip);
-        assert(std::fabs(tip[0] - 188.0f) < 0.5f);
+        assert(std::fabs(tip[0] - 190.0f) < 0.5f);
         assert(std::fabs(tip[1] - 200.0f) < 0.5f);
-        assert(std::fabs(tip[2] - (-238.0f)) < 0.5f);
+        assert(std::fabs(tip[2] - (-255.0f)) < 0.5f);
         wandTipForView(pl, 16384, 0, WandTipForward, WandTipUp, tip);
         assert(std::fabs(tip[0] - 100.0f) < 0.5f);
-        assert(std::fabs(tip[1] - 288.0f) < 0.5f);
-        // the v71 anchor (pawn + 45Z = the HEAD) is not this: the tip
-        // reaches 88 forward, 62 up
-        assert(std::fabs((tip[2] - pl[2]) - 62.0f) < 0.5f);
-        // pitch tilts the wand but is clamped at +-45deg so aiming at the
-        // feet can never bury the glow
+        assert(std::fabs(tip[1] - 290.0f) < 0.5f);
+        assert(std::fabs((tip[2] - pl[2]) - 45.0f) < 0.5f);
+        // The full supplied camera pitch is used (no second, stale +/-45
+        // degree clamp inside the tip helper).
         float t2[3];
-        wandTipForView(pl, 0, 30000, WandTipForward, WandTipUp, t2);
-        // at the clamp: fwd*cos(45deg), up + fwd*sin(45deg)
-        const double s45 = 0.7071067811865476;
-        assert(std::fabs(t2[0] - (100.0f + (float)(88.0f * s45))) < 0.7f);
-        assert(std::fabs(t2[2] - (-300.0f + (float)(88.0f * s45) + 62.0f)) < 0.7f);
-        // defaults are the game's own learn
-        assert(WandTipForward > 40.0f && WandTipForward < 200.0f);
-        assert(WandTipUp > 30.0f && WandTipUp < 100.0f);
-        assert(WandTipPitchClamp > 4000 && WandTipPitchClamp <= 16384);
+        const int cameraPitch = -12000;
+        const double rp = cameraPitch * (6.283185307179586 / 65536.0);
+        wandTipForView(pl, 0, cameraPitch, WandTipForward, WandTipUp, t2);
+        assert(std::fabs(t2[0] - (100.0f + 90.0f * (float)std::cos(rp))) < 0.5f);
+        assert(std::fabs(t2[2] - (-300.0f + 45.0f + 90.0f * (float)std::sin(rp))) < 0.5f);
+        // A pitch outside the old local clamp is passed through unchanged.
+        const int largePitch = 30000;
+        const double largeRp = largePitch * (6.283185307179586 / 65536.0);
+        wandTipForView(pl, 0, largePitch, WandTipForward, WandTipUp, t2);
+        assert(std::fabs(t2[0] - (100.0f + 90.0f * (float)std::cos(largeRp))) < 0.5f);
+        assert(std::fabs(t2[2] - (-300.0f + 45.0f + 90.0f * (float)std::sin(largeRp))) < 0.5f);
+        // Defaults are precisely the v74 spawn formula, and the exact previous
+        // v73 defaults are the only pair auto-migrated from an old INI.
+        assert(WandTipForward == 90.0f);
+        assert(WandTipUp == 45.0f);
+        assert(isLegacyV73WandTipConfig(88, 62));
+        assert(!isLegacyV73WandTipConfig(88, 45));
+        assert(!isLegacyV73WandTipConfig(90, 62));
     }
 
-    // 27. THE V72 FIELD SCENE, END-TO-END. The two acceptance criteria from
-    //     the v72 hardware log (P2 = Hermione, HP3_InsideHub: "wand light
-    //     above Player 2's head, not on the wand" + "still can't pass the
-    //     wall"), composed from the v73 policies with the log's own numbers.
-    //     If this section ever fails, the criteria a hardware test checks
-    //     are broken by definition.
+    // 27. THE V74 LOG REGRESSION, END-TO-END. P2/P3 stand inside the armed
+    //     LumosTrigger0 radius; its Event=0x8D20 links to the blocking
+    //     LumosSparklesTrigger5.Tag=0x8D20 receiver, whose own local Z/radius
+    //     test is false. At the same time the old Lumos tip was 17 units high
+    //     and used pawn yaw, while the spell was spawned from camera yaw/pitch.
     {
-        // The log's pose: the pawn at (-47 2683 -181) (HPCharacter, 25x44),
-        // the gate LumosSparklesTrigger5 at (-64 2764 32), bits=0x07, the
-        // pelog streaming HPCharacter.Bump against it for 4+ seconds while
-        // she pushes in, and the v72 rule concluding "0 touching / level BSP".
-        const float pawnA[3] = { -47.0f, 2683.0f, -181.0f };
-        const float gateA[3] = { -64.0f, 2764.0f,   32.0f };
+        const float pawnP2[3] = { 703.0f, 988.0f, 68.0f };
+        const float sourceAt[3] = { 703.0f, 988.0f, 68.0f };
+        const float receiverAt[3] = { 900.0f, 988.0f, 280.0f };
+        const unsigned sourceEvent = 0x8D20u;
+        const unsigned receiverTag = 0x8D20u;
 
-        // --- CRITERION 2: SHE CAN PASS THE WALL --------------------------
-        // (a) the gate ADMITS under the bump rule (its bits are
-        //     collide+blockActors+blockPlayers = 0x07)...
-        assert(actorIsLumosGate("LumosSparklesTrigger", true));
-        assert(bumpRuleAdmits(true, false, true, true));
-        // (b) ...she satisfies every bump gate while standing inside an
-        //     armed trigger's radius and pushing with full input...
-        assert(bumpShouldOpen(true, true, true, true, true, false, true));
-        // (c) ...the contact test sees exactly what the engine's Bump
-        //     stream saw (the v73 cylinder-vs-cylinder fix)...
-        assert(cylindersTouch(pawnA, 25.0f, 44.0f, gateA, 200.0f, 300.0f, 48.0f));
-        // (d) ...and she never even needs the bump rule: standing inside the
-        //     gate's own trigger radius with Lumos up is the early-open.
-        assert(gateShouldOpen(true, true, true));
-        // => for the log's exact scene, "0 actor(s) touching ... level BSP"
-        //    is mathematically unreachable: one of (a)-(d) opens the gate.
+        // Source trigger is armed by a companion who is within its own radius.
+        assert(stockTriggerInRadius(sourceAt, pawnP2, 512.0f, false, 64.0f));
+        const float pawnP3[3] = { 710.0f, 1000.0f, 60.0f };
+        assert(stockTriggerInRadius(sourceAt, pawnP3, 512.0f, false, 64.0f));
+        assert(linkedGateShouldOpen(true, true, receiverTag, sourceEvent, true));
+        // Receiver-local test deliberately fails: it is farther than the
+        // distance/Z window, but its Event->Tag link is sufficient.
+        assert(!stockTriggerInRadius(receiverAt, pawnP2, 512.0f, true, 64.0f));
+        assert(wallEventLinksToTrigger(receiverTag, sourceEvent));
+        assert(linkedGateShouldOpen(true, true, receiverTag, sourceEvent, true));
+        assert(!linkedGateShouldOpen(true, false, receiverTag, sourceEvent, true));
+        assert(!linkedGateShouldOpen(false, true, receiverTag, sourceEvent, true));
 
-        // --- CRITERION 1: THE GLOW SITS ON THE WAND ----------------------
-        // The log's wand actor sat AT the pawn origin (dZ = 0) - exactly the
-        // "unpositioned attached actor" shape wandLocIsTip rejects, so the
-        // v73 anchor falls back to the measured cast origin (88 fwd, 62 up).
-        assert(!wandLocIsTip(pawnA, pawnA));
-        double gyaw = std::atan2(2764.0 - 2683.0, -64.0 - (-47.0)); // to the gate
-        int yaw65536 = (int)(gyaw * (65536.0 / 6.283185307179586)) & 0xFFFF;
-        float tipA[3];
-        wandTipForView(pawnA, yaw65536, 0, WandTipForward, WandTipUp, tipA);
-        {
-            double dx = tipA[0] + 47.0, dy = tipA[1] - 2683.0;
-            double horiz = std::sqrt(dx * dx + dy * dy);
-            assert(std::fabs(horiz - 88.0) < 0.5);          // forward reach
-            assert(std::fabs((tipA[2] + 181.0) - 62.0) < 0.5); // hand height
-        }
-        // The v72 float (pawn + 45Z = the head) counts as OFF the tip...
-        float v72float[3] = { pawnA[0], pawnA[1], pawnA[2] + 45.0f };
-        assert(lightNeedsRide(v72float, tipA));
-        // ...so the mod's ride lifts it there; a light genuinely carried AT
-        // the tip by someone else is left alone (no two-writer fight).
-        assert(rideStandsDown(true, true));
-        assert(!rideStandsDown(true, false));
-        // Full-down aim: the pitch clamp keeps the tip 62 u in FRONT at the
-        // feet (88*cos(45deg)); it cannot bury itself in the floor or her body.
-        float tipDown[3];
-        wandTipForView(pawnA, yaw65536, -32000, WandTipForward, WandTipUp, tipDown);
-        {
-            double dx = tipDown[0] + 47.0, dy = tipDown[1] - 2683.0;
-            double horiz = std::sqrt(dx * dx + dy * dy);
-            assert(std::fabs(horiz - 88.0 * 0.7071067811865476) < 0.6);
-            assert(tipDown[2] > pawnA[2] - 1.0f);
-        }
+        // Same pawn position, but camera yaw differs from pawn yaw. The
+        // runtime uses playerCamYaw/playerCamPitch; it must match fireCast's
+        // pawn + camDir*90 + 45Z, not the stale 88/62 actor-yaw tip.
+        const int playerCamYaw = 16384;  // +Y
+        const int playerCamPitch = -4096;
+        float tipP2[3];
+        wandTipForView(pawnP2, playerCamYaw, playerCamPitch,
+                       WandTipForward, WandTipUp, tipP2);
+        const double camPitch = playerCamPitch * (6.283185307179586 / 65536.0);
+        assert(std::fabs(tipP2[0] - pawnP2[0]) < 0.5f);
+        assert(std::fabs(tipP2[1] - (pawnP2[1] + 90.0f * std::cos(camPitch))) < 0.5f);
+        assert(std::fabs(tipP2[2] - (pawnP2[2] + 45.0f + 90.0f * std::sin(camPitch))) < 0.5f);
+        // Even a plausible wand actor Location must not override this exact
+        // cast origin, so it cannot make dTip look good for the wrong reason.
+        float plausibleWand[3] = { pawnP2[0] + 88.0f, pawnP2[1], pawnP2[2] + 62.0f };
+        assert(wandLocIsTip(pawnP2, plausibleWand));
+        assert(std::fabs(plausibleWand[1] - tipP2[1]) > 20.0f);
+
+        // The v73 head float and the v73 pawn-yaw estimate are both measurably
+        // off; the ride must use the exact computed tip.
+        float headFloat[3] = { pawnP2[0], pawnP2[1], pawnP2[2] + 45.0f };
+        assert(lightNeedsRide(headFloat, tipP2));
+        float oldPawnYawTip[3];
+        wandTipForView(pawnP2, 0, playerCamPitch, 88.0f, 62.0f, oldPawnYawTip);
+        assert(std::fabs(oldPawnYawTip[1] - tipP2[1]) > 20.0f);
+        assert(std::fabs(oldPawnYawTip[2] - tipP2[2]) > 10.0f);
+        assert(!rideStandsDown(true, false));  // foreign movement away from tip
+        assert(rideStandsDown(true, true));   // stock ride at tip may stand down
     }
 
     std::puts("lumos sync: state, timer, light, proximity, passability, "
@@ -806,9 +809,9 @@ int main()
               "v66.5 wall-bits/follow-light, v67 stock-register/"
               "trigger-fire, v68 proxied-wall/retry, v69 Event==Tag "
               "linkage / LumosSparkles token, v70 stock-auto-off observation, "
-              "v71 wand-tip ride / trigger-keyed blocker opening, "
-              "v72 surface-gap / push-probe / bump-rule, "
-              "v73 cylinder-touch / lumos-gate / at-tip-ride / cast-anchor tip "
-              "and the v72 field-scene end-to-end assertions passed");
+              "v71 blocker cache / ride, v72 surface-gap / bump-rule, "
+              "v73 cylinder-touch / direct-gate policy, v75 Event==Tag linked "
+              "receiver gate / exact v74 camera cast-origin and end-to-end "
+              "log-regression assertions passed");
     return 0;
 }
